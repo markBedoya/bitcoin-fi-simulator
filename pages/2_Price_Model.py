@@ -3,6 +3,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from src.data_pipeline import load_coinmetrics
 from src.price_model import fit_price_model, find_most_conservative_training_start
+from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 
 st.title("Price Model v2.0.1")
@@ -251,6 +252,18 @@ diag = result.diagnostics
 hist = daily[daily["row_type"] == "historical_training"]
 proj = daily[daily["row_type"] == "projected"]
 
+last_actual_price = float(hist["actual_price_usd"].iloc[-1])
+anchored_proj = build_rebased_btc_paths(
+    model_daily=daily,
+    latest_actual_price=last_actual_price,
+)
+proj = proj.merge(anchored_proj, on="date", how="left")
+
+raw_first_cycle = float(proj["fitted_or_projected_price_usd"].iloc[0])
+raw_first_center = float(proj["structural_centerline_usd"].iloc[0])
+cycle_anchor_ratio = raw_first_cycle / last_actual_price
+center_anchor_ratio = raw_first_center / last_actual_price
+
 active_model_fingerprint = build_model_fingerprint(
     training_start=training_start,
     training_end=training_end,
@@ -283,8 +296,8 @@ fig = go.Figure()
 fig.add_trace(go.Scatter(x=hist["date"], y=hist["actual_price_usd"], mode="lines", name="Actual price used"))
 fig.add_trace(go.Scatter(x=hist["date"], y=hist["structural_centerline_usd"], mode="lines", name="Structural centerline"))
 fig.add_trace(go.Scatter(x=hist["date"], y=hist["fitted_or_projected_price_usd"], mode="lines", name="Historical fitted path"))
-fig.add_trace(go.Scatter(x=proj["date"], y=proj["fitted_or_projected_price_usd"], mode="lines", name="Future projected price", line={"width": 3}))
-fig.add_trace(go.Scatter(x=proj["date"], y=proj["structural_centerline_usd"], mode="lines", name="Future centerline", line={"dash": "dash"}))
+fig.add_trace(go.Scatter(x=proj["date"], y=proj["btc_cycle_price"], mode="lines", name="Future projected price — anchored to latest actual", line={"width": 3}))
+fig.add_trace(go.Scatter(x=proj["date"], y=proj["btc_centerline_price"], mode="lines", name="Future centerline — anchored to latest actual", line={"dash": "dash"}))
 
 if overlay_excluded and training_end < prices["date"].max():
     excluded = prices[prices["date"] > training_end]
@@ -295,6 +308,18 @@ fig.update_layout(title="Bitcoin historical fit and projected daily path", xaxis
 fig.update_yaxes(type="log" if log_scale else "linear")
 st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
 
+st.caption(
+    "Future paths are anchored to the latest actual Bitcoin price before "
+    "calculating returns. This is the same path used by BTC Financial Independence."
+)
+if abs(cycle_anchor_ratio - 1.0) > 0.05 or abs(center_anchor_ratio - 1.0) > 0.05:
+    st.warning(
+        "The raw fitted model does not begin at the latest actual Bitcoin price. "
+        f"Raw cycle path starts at {cycle_anchor_ratio:.2f}× actual and raw "
+        f"centerline starts at {center_anchor_ratio:.2f}× actual. Those artificial "
+        "starting gaps are excluded from the CAGR table and FI calculations."
+    )
+
 st.subheader("Model diagnostics")
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Cycle peak position", f'{diag["peak_progress"]*100:.1f}%')
@@ -303,15 +328,31 @@ m3.metric("Amplitude retained per cycle", f'{diag["amplitude_retained_per_cycle"
 m4.metric("Terminal exponent", f'{diag["terminal_exponent"]:.3f}')
 
 rows = []
-last_actual = float(hist["actual_price_usd"].iloc[-1])
 for years in range(1, projection_years + 1):
     target = training_end + pd.DateOffset(years=years)
     nearest = proj.iloc[(proj["date"] - target).abs().argsort()[:1]]
-    price = float(nearest["fitted_or_projected_price_usd"].iloc[0])
-    cagr = (price / last_actual) ** (1 / years) - 1
-    rows.append({"horizon_years": years, "projected_price_usd": price, "implied_cagr": cagr})
+    cycle_price = float(nearest["btc_cycle_price"].iloc[0])
+    center_price = float(nearest["btc_centerline_price"].iloc[0])
+    cycle_cagr = (cycle_price / last_actual_price) ** (1 / years) - 1
+    center_cagr = (center_price / last_actual_price) ** (1 / years) - 1
+    rows.append({
+        "horizon_years": years,
+        "cycle_projected_price_usd": cycle_price,
+        "cycle_implied_cagr": cycle_cagr,
+        "centerline_projected_price_usd": center_price,
+        "centerline_implied_cagr": center_cagr,
+    })
 if rows:
-    st.dataframe(pd.DataFrame(rows).style.format({"projected_price_usd": "${:,.0f}", "implied_cagr": "{:.2%}"}), use_container_width=True, hide_index=True)
+    st.dataframe(
+        pd.DataFrame(rows).style.format({
+            "cycle_projected_price_usd": "${:,.0f}",
+            "cycle_implied_cagr": "{:.2%}",
+            "centerline_projected_price_usd": "${:,.0f}",
+            "centerline_implied_cagr": "{:.2%}",
+        }),
+        use_container_width=True,
+        hide_index=True,
+    )
 
 st.subheader("Normalized historical cycle overlays")
 if result.cycle_overlays.empty:
