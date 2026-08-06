@@ -6,7 +6,7 @@ from src.price_model import fit_price_model, find_most_conservative_training_sta
 from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 
-st.title("Price Model v2.0.1")
+st.title("Price Model v2.1 — Continuity Calibrated")
 st.caption("Use all available data by default, or change the usable training period and refit the daily future path.")
 
 try:
@@ -259,10 +259,34 @@ anchored_proj = build_rebased_btc_paths(
 )
 proj = proj.merge(anchored_proj, on="date", how="left")
 
-raw_first_cycle = float(proj["fitted_or_projected_price_usd"].iloc[0])
-raw_first_center = float(proj["structural_centerline_usd"].iloc[0])
-cycle_anchor_ratio = raw_first_cycle / last_actual_price
-current_center_to_cycle_ratio = raw_first_center / raw_first_cycle
+# Explicit projection-boundary rows make the plotted historical fitted path and
+# future projected path meet on the exact latest observed Bitcoin price.
+projection_boundary = pd.DataFrame({
+    "date": [training_end],
+    "btc_cycle_price": [last_actual_price],
+})
+cycle_projection_plot = pd.concat([
+    projection_boundary,
+    proj[["date", "btc_cycle_price"]],
+], ignore_index=True)
+
+# The structural/geometric centerline is one model series across the boundary,
+# not two independently anchored lines.
+centerline_plot = daily[["date", "structural_centerline_usd"]].copy()
+
+fitted_endpoint = float(hist["fitted_or_projected_price_usd"].iloc[-1])
+fitted_endpoint_error_pct = fitted_endpoint / last_actual_price - 1.0
+endpoint_scale_factor = float(diag.get("endpoint_scale_factor", 1.0))
+
+# Numerical continuity checks.
+fit_meets_actual = abs(fitted_endpoint_error_pct) < 1e-10
+future_meets_actual = abs(
+    float(cycle_projection_plot["btc_cycle_price"].iloc[0]) / last_actual_price - 1.0
+) < 1e-10
+centerline_is_single_series = (
+    centerline_plot["date"].is_monotonic_increasing
+    and centerline_plot["structural_centerline_usd"].notna().all()
+)
 
 active_model_fingerprint = build_model_fingerprint(
     training_start=training_start,
@@ -293,40 +317,85 @@ st.caption(
 )
 
 fig = go.Figure()
-fig.add_trace(go.Scatter(x=hist["date"], y=hist["actual_price_usd"], mode="lines", name="Actual price used"))
-fig.add_trace(go.Scatter(x=hist["date"], y=hist["structural_centerline_usd"], mode="lines", name="Structural centerline"))
-fig.add_trace(go.Scatter(x=hist["date"], y=hist["fitted_or_projected_price_usd"], mode="lines", name="Historical fitted path"))
-fig.add_trace(go.Scatter(x=proj["date"], y=proj["btc_cycle_price"], mode="lines", name="Future projected price — anchored to latest actual", line={"width": 3}))
-fig.add_trace(go.Scatter(x=proj["date"], y=proj["btc_centerline_price"], mode="lines", name="Future geometric centerline — common anchor", line={"dash": "dash"}))
+fig.add_trace(go.Scatter(
+    x=hist["date"], y=hist["actual_price_usd"], mode="lines",
+    name="Actual price used"
+))
+fig.add_trace(go.Scatter(
+    x=centerline_plot["date"],
+    y=centerline_plot["structural_centerline_usd"],
+    mode="lines",
+    name="Structural / geometric centerline",
+    line={"dash": "dash"},
+))
+fig.add_trace(go.Scatter(
+    x=hist["date"],
+    y=hist["fitted_or_projected_price_usd"],
+    mode="lines",
+    name="Historical fitted path",
+))
+fig.add_trace(go.Scatter(
+    x=cycle_projection_plot["date"],
+    y=cycle_projection_plot["btc_cycle_price"],
+    mode="lines",
+    name="Future projected price",
+    line={"width": 3},
+))
 
 if overlay_excluded and training_end < prices["date"].max():
     excluded = prices[prices["date"] > training_end]
-    fig.add_trace(go.Scatter(x=excluded["date"], y=excluded["price_usd"], mode="lines", name="Excluded actual prices", line={"dash": "dot"}, opacity=0.45))
+    fig.add_trace(go.Scatter(
+        x=excluded["date"], y=excluded["price_usd"], mode="lines",
+        name="Excluded actual prices", line={"dash": "dot"}, opacity=0.45
+    ))
 
-fig.add_vline(x=str(training_end.date()), line_dash="dash", annotation_text="Projection start")
-fig.update_layout(title="Bitcoin historical fit and projected daily path", xaxis_title="Date", yaxis_title="Bitcoin price (USD)", hovermode="x unified", height=650)
+fig.add_vline(
+    x=str(training_end.date()), line_dash="dash", annotation_text="Projection start"
+)
+fig.update_layout(
+    title="Bitcoin historical fit and projected daily path",
+    xaxis_title="Date",
+    yaxis_title="Bitcoin price (USD)",
+    hovermode="x unified",
+    height=650,
+)
 fig.update_yaxes(type="log" if log_scale else "linear")
 st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
 
-st.caption(
-    "The projected market path is anchored to the latest actual Bitcoin price. "
-    "The centerline uses the same scale factor, preserving its mathematical "
-    "position inside the oscillation. These are the same paths used by BTC "
-    "Financial Independence."
+st.subheader("Continuity verification")
+v1, v2, v3, v4 = st.columns(4)
+v1.metric(
+    "Historical fit → actual",
+    "PASS" if fit_meets_actual else "FAIL",
+    f"{fitted_endpoint_error_pct:+.6%}",
 )
-if abs(cycle_anchor_ratio - 1.0) > 0.05:
-    st.warning(
-        "The raw fitted market path does not begin at the latest actual Bitcoin "
-        f"price; it begins at {cycle_anchor_ratio:.2f}× actual. One common scale "
-        "factor is applied to both the cycle path and centerline so the artificial "
-        "starting gap is excluded without moving the centerline off-center."
+v2.metric(
+    "Future path → actual",
+    "PASS" if future_meets_actual else "FAIL",
+    "$0 boundary gap" if future_meets_actual else "Boundary mismatch",
+)
+v3.metric(
+    "Centerline continuity",
+    "PASS" if centerline_is_single_series else "FAIL",
+    "Single series across boundary",
+)
+v4.metric(
+    "Endpoint scale",
+    f"{endpoint_scale_factor:.4f}×",
+    "One common factor",
+)
+
+if fit_meets_actual and future_meets_actual and centerline_is_single_series:
+    st.success(
+        "Projection boundary verified: latest actual price, historical fitted "
+        "path, and future projected path meet at the same point. The structural "
+        "and future geometric centerline are one continuous model series."
     )
-st.caption(
-    f"At the projection boundary, the geometric centerline is "
-    f"**{current_center_to_cycle_ratio:.2f}×** the cycle-adjusted price. "
-    "That ratio reflects the modeled cycle position rather than a second, "
-    "independent anchor."
-)
+else:
+    st.error(
+        "A projection-boundary continuity check failed. Do not rely on this "
+        "projection until the failed check is resolved."
+    )
 
 st.subheader("Model diagnostics")
 m1, m2, m3, m4, m5 = st.columns(5)

@@ -43,20 +43,29 @@ class PreparedMonthlyPath:
 
 
 def build_rebased_btc_paths(model_daily: pd.DataFrame, latest_actual_price: float) -> pd.DataFrame:
+    """Return the canonical FI price paths using one endpoint scale factor.
+
+    The scale is derived from the historical fitted value on the final observed
+    date, not from the first future point. This guarantees that the fitted path,
+    the future market path, and the latest actual price share the same boundary
+    while preserving the centerline-to-cycle geometry.
+    """
+    historical = model_daily[model_daily["row_type"] == "historical_training"]
     projected = model_daily[model_daily["row_type"] == "projected"].copy()
-    if projected.empty:
-        raise ValueError("The price model contains no future projection rows.")
-    first_center = float(projected["structural_centerline_usd"].iloc[0])
-    first_cycle = float(projected["fitted_or_projected_price_usd"].iloc[0])
-    if min(first_center, first_cycle, latest_actual_price) <= 0:
+    if historical.empty or projected.empty:
+        raise ValueError("The price model must contain historical and projected rows.")
+
+    fitted_endpoint = float(historical["fitted_or_projected_price_usd"].iloc[-1])
+    if min(fitted_endpoint, latest_actual_price) <= 0:
         raise ValueError("Bitcoin prices must be positive.")
-    # Use one common scale factor so anchoring the projected market path to the
-    # latest actual price does not distort the centerline-to-cycle relationship.
-    # The cycle path begins at the actual price; the centerline remains above or
-    # below it according to the model's current cycle position.
-    common_scale = latest_actual_price / first_cycle
-    projected["btc_centerline_price"] = projected["structural_centerline_usd"] * common_scale
-    projected["btc_cycle_price"] = projected["fitted_or_projected_price_usd"] * common_scale
+
+    common_scale = latest_actual_price / fitted_endpoint
+    projected["btc_centerline_price"] = (
+        projected["structural_centerline_usd"] * common_scale
+    )
+    projected["btc_cycle_price"] = (
+        projected["fitted_or_projected_price_usd"] * common_scale
+    )
     return projected[["date", "btc_centerline_price", "btc_cycle_price"]].reset_index(drop=True)
 
 

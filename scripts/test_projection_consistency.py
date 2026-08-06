@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import pandas as pd
 import sys
 from pathlib import Path
+
+import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -20,18 +21,18 @@ def main() -> None:
 
     anchored = build_rebased_btc_paths(daily, latest_actual)
 
-    assert abs(anchored["btc_cycle_price"].iloc[0] - latest_actual) < 1e-9
-
-    # Both lines must use the same anchor factor. The centerline is not forced
-    # independently to the actual price because that would distort geometry.
-    common_scale = latest_actual / 200.0
+    # Canonical anchoring must be derived from the final historical fitted value,
+    # not independently from the first future market or centerline point.
+    common_scale = latest_actual / 95.0
+    assert abs(anchored["btc_cycle_price"].iloc[0] - 200.0 * common_scale) < 1e-9
     assert abs(anchored["btc_centerline_price"].iloc[0] - 150.0 * common_scale) < 1e-9
+    assert abs(anchored["btc_cycle_price"].iloc[-1] - 240.0 * common_scale) < 1e-9
+    assert abs(anchored["btc_centerline_price"].iloc[-1] - 180.0 * common_scale) < 1e-9
 
-    expected_center_last = 180.0 * common_scale
-    expected_cycle_last = 240.0 * common_scale
-
-    assert abs(anchored["btc_centerline_price"].iloc[-1] - expected_center_last) < 1e-9
-    assert abs(anchored["btc_cycle_price"].iloc[-1] - expected_cycle_last) < 1e-9
+    # Both projected lines must have exactly the same scale factor.
+    cycle_scale = anchored["btc_cycle_price"].iloc[-1] / 240.0
+    center_scale = anchored["btc_centerline_price"].iloc[-1] / 180.0
+    assert abs(cycle_scale - center_scale) < 1e-12
 
     print("Projection consistency test passed.")
 
