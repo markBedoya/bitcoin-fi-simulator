@@ -50,8 +50,13 @@ def build_rebased_btc_paths(model_daily: pd.DataFrame, latest_actual_price: floa
     first_cycle = float(projected["fitted_or_projected_price_usd"].iloc[0])
     if min(first_center, first_cycle, latest_actual_price) <= 0:
         raise ValueError("Bitcoin prices must be positive.")
-    projected["btc_centerline_price"] = latest_actual_price * projected["structural_centerline_usd"] / first_center
-    projected["btc_cycle_price"] = latest_actual_price * projected["fitted_or_projected_price_usd"] / first_cycle
+    # Use one common scale factor so anchoring the projected market path to the
+    # latest actual price does not distort the centerline-to-cycle relationship.
+    # The cycle path begins at the actual price; the centerline remains above or
+    # below it according to the model's current cycle position.
+    common_scale = latest_actual_price / first_cycle
+    projected["btc_centerline_price"] = projected["structural_centerline_usd"] * common_scale
+    projected["btc_cycle_price"] = projected["fitted_or_projected_price_usd"] * common_scale
     return projected[["date", "btc_centerline_price", "btc_cycle_price"]].reset_index(drop=True)
 
 

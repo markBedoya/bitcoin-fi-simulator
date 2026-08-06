@@ -262,7 +262,7 @@ proj = proj.merge(anchored_proj, on="date", how="left")
 raw_first_cycle = float(proj["fitted_or_projected_price_usd"].iloc[0])
 raw_first_center = float(proj["structural_centerline_usd"].iloc[0])
 cycle_anchor_ratio = raw_first_cycle / last_actual_price
-center_anchor_ratio = raw_first_center / last_actual_price
+current_center_to_cycle_ratio = raw_first_center / raw_first_cycle
 
 active_model_fingerprint = build_model_fingerprint(
     training_start=training_start,
@@ -297,7 +297,7 @@ fig.add_trace(go.Scatter(x=hist["date"], y=hist["actual_price_usd"], mode="lines
 fig.add_trace(go.Scatter(x=hist["date"], y=hist["structural_centerline_usd"], mode="lines", name="Structural centerline"))
 fig.add_trace(go.Scatter(x=hist["date"], y=hist["fitted_or_projected_price_usd"], mode="lines", name="Historical fitted path"))
 fig.add_trace(go.Scatter(x=proj["date"], y=proj["btc_cycle_price"], mode="lines", name="Future projected price — anchored to latest actual", line={"width": 3}))
-fig.add_trace(go.Scatter(x=proj["date"], y=proj["btc_centerline_price"], mode="lines", name="Future centerline — anchored to latest actual", line={"dash": "dash"}))
+fig.add_trace(go.Scatter(x=proj["date"], y=proj["btc_centerline_price"], mode="lines", name="Future geometric centerline — common anchor", line={"dash": "dash"}))
 
 if overlay_excluded and training_end < prices["date"].max():
     excluded = prices[prices["date"] > training_end]
@@ -309,23 +309,32 @@ fig.update_yaxes(type="log" if log_scale else "linear")
 st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False})
 
 st.caption(
-    "Future paths are anchored to the latest actual Bitcoin price before "
-    "calculating returns. This is the same path used by BTC Financial Independence."
+    "The projected market path is anchored to the latest actual Bitcoin price. "
+    "The centerline uses the same scale factor, preserving its mathematical "
+    "position inside the oscillation. These are the same paths used by BTC "
+    "Financial Independence."
 )
-if abs(cycle_anchor_ratio - 1.0) > 0.05 or abs(center_anchor_ratio - 1.0) > 0.05:
+if abs(cycle_anchor_ratio - 1.0) > 0.05:
     st.warning(
-        "The raw fitted model does not begin at the latest actual Bitcoin price. "
-        f"Raw cycle path starts at {cycle_anchor_ratio:.2f}× actual and raw "
-        f"centerline starts at {center_anchor_ratio:.2f}× actual. Those artificial "
-        "starting gaps are excluded from the CAGR table and FI calculations."
+        "The raw fitted market path does not begin at the latest actual Bitcoin "
+        f"price; it begins at {cycle_anchor_ratio:.2f}× actual. One common scale "
+        "factor is applied to both the cycle path and centerline so the artificial "
+        "starting gap is excluded without moving the centerline off-center."
     )
+st.caption(
+    f"At the projection boundary, the geometric centerline is "
+    f"**{current_center_to_cycle_ratio:.2f}×** the cycle-adjusted price. "
+    "That ratio reflects the modeled cycle position rather than a second, "
+    "independent anchor."
+)
 
 st.subheader("Model diagnostics")
-m1, m2, m3, m4 = st.columns(4)
+m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Cycle peak position", f'{diag["peak_progress"]*100:.1f}%')
 m2.metric("Amplitude scale", f'{diag["amplitude_scale"]:.2f}×')
 m3.metric("Amplitude retained per cycle", f'{diag["amplitude_retained_per_cycle"]*100:.1f}%')
 m4.metric("Terminal exponent", f'{diag["terminal_exponent"]:.3f}')
+m5.metric("Cycle template mean", f'{diag.get("template_log_mean", 0.0):.3f}')
 
 rows = []
 for years in range(1, projection_years + 1):

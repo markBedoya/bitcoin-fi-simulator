@@ -20,11 +20,15 @@ def main() -> None:
 
     anchored = build_rebased_btc_paths(daily, latest_actual)
 
-    assert abs(anchored["btc_centerline_price"].iloc[0] - latest_actual) < 1e-9
     assert abs(anchored["btc_cycle_price"].iloc[0] - latest_actual) < 1e-9
 
-    expected_center_last = latest_actual * 180.0 / 150.0
-    expected_cycle_last = latest_actual * 240.0 / 200.0
+    # Both lines must use the same anchor factor. The centerline is not forced
+    # independently to the actual price because that would distort geometry.
+    common_scale = latest_actual / 200.0
+    assert abs(anchored["btc_centerline_price"].iloc[0] - 150.0 * common_scale) < 1e-9
+
+    expected_center_last = 180.0 * common_scale
+    expected_cycle_last = 240.0 * common_scale
 
     assert abs(anchored["btc_centerline_price"].iloc[-1] - expected_center_last) < 1e-9
     assert abs(anchored["btc_cycle_price"].iloc[-1] - expected_cycle_last) < 1e-9
