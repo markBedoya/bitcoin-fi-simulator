@@ -122,7 +122,7 @@ with st.form("btc_fi_form"):
         monthly_spending = st.number_input(
             "Monthly income needed in today's dollars",
             min_value=0.0,
-            value=8000.0,
+            value=4000.0,
             step=250.0,
         )
     with g2:
@@ -159,14 +159,14 @@ with st.form("btc_fi_form"):
         btc_principal = st.number_input(
             "Current BTC investment ($)",
             min_value=0.0,
-            value=265000.0,
+            value=0.0,
             step=1000.0,
         )
     with b2:
         btc_monthly = st.number_input(
             "Current monthly BTC contribution ($)",
             min_value=0.0,
-            value=3776.0,
+            value=0.0,
             step=25.0,
             disabled=mode != "Find earliest FI age",
         )
@@ -174,14 +174,14 @@ with st.form("btc_fi_form"):
         other_principal = st.number_input(
             "Current other investments ($)",
             min_value=0.0,
-            value=200000.0,
+            value=0.0,
             step=1000.0,
         )
     with o2:
         other_monthly = st.number_input(
             "Current monthly other contribution ($)",
             min_value=0.0,
-            value=3600.0,
+            value=0.0,
             step=25.0,
             disabled=mode != "Find earliest FI age",
         )
