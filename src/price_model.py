@@ -11,6 +11,14 @@ class PriceModelResult:
     cycle_overlays: pd.DataFrame
     cycle_template: pd.DataFrame
 
+def _trapezoid_integral(y, x=None):
+    """NumPy 1.x/2.x compatible trapezoidal integration."""
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is not None:
+        return trapezoid(y, x=x)
+    return np.trapz(y, x=x)
+
+
 def _fit_centerline(train: pd.DataFrame, future_dates: pd.DatetimeIndex):
     days = (train["date"] - GENESIS).dt.days.to_numpy(dtype=float)
     log_days = np.log(days)
@@ -113,13 +121,6 @@ def _cycle_template(train: pd.DataFrame, residual: np.ndarray):
 
     template = pd.Series(template).rolling(11, center=True, min_periods=1).mean().to_numpy(copy=True)
 
-    # The learned cycle template can have a non-zero mean in log space.
-    # A positive mean makes the structural line sit below the visual middle
-    # of the projected oscillations. Keep the mean for an exact algebraic
-    # reparameterization later, then expose a zero-mean template.
-    template_log_mean = float(np.trapz(template, grid) / (grid[-1] - grid[0]))
-    centered_template = template - template_log_mean
-
     if len(trough_idx) >= 2:
         ordinals = [train["date"].iloc[i].toordinal() for i in trough_idx]
         cycle_days = float(np.median(np.diff(ordinals)))
@@ -127,15 +128,12 @@ def _cycle_template(train: pd.DataFrame, residual: np.ndarray):
         cycle_days = 1461.0
 
     overlays = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    if not overlays.empty:
-        overlays["log_deviation"] = overlays["log_deviation"] - template_log_mean
-    template_df = pd.DataFrame({"progress": grid, "log_deviation": centered_template})
+    template_df = pd.DataFrame({"progress": grid, "log_deviation": template})
     diagnostics = {
         "turning_points": tp,
         "complete_cycles": len(cycles),
         "cycle_days": cycle_days,
-        "peak_progress": float(grid[np.argmax(centered_template)]) if len(centered_template) else 0.5,
-        "template_log_mean": template_log_mean,
+        "peak_progress": float(grid[np.argmax(template)]) if len(template) else 0.5,
     }
     return overlays, template_df, diagnostics
 
@@ -157,9 +155,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
 
     overlays, template, cycle_diag = _cycle_template(train, residual)
     grid = template["progress"].to_numpy()
-    centered_shape = template["log_deviation"].to_numpy()
-    template_log_mean = float(cycle_diag.get("template_log_mean", 0.0))
-    raw_shape = centered_shape + template_log_mean
+    shape = template["log_deviation"].to_numpy()
     tp = cycle_diag["turning_points"]
 
     troughs = tp[tp["type"] == "trough"] if not tp.empty else pd.DataFrame()
@@ -174,13 +170,11 @@ def fit_price_model(prices, training_start, training_end, projection_years):
     future_steps = np.arange(1, len(future_dates) + 1)
     future_progress = ((days_since_trough + future_steps) / cycle_days) % 1.0
 
-    raw_hist_shape = np.interp(hist_progress, grid, raw_shape)
-    raw_future_shape = np.interp(future_progress, grid, raw_shape)
-    hist_shape = np.interp(hist_progress, grid, centered_shape)
-    future_shape = np.interp(future_progress, grid, centered_shape)
+    hist_shape = np.interp(hist_progress, grid, shape)
+    future_shape = np.interp(future_progress, grid, shape)
 
-    valid = np.abs(raw_hist_shape) > 0.05
-    amplitude_scale = float(np.median(np.abs(residual[valid] / raw_hist_shape[valid]))) if valid.any() else 1.0
+    valid = np.abs(hist_shape) > 0.05
+    amplitude_scale = float(np.median(np.abs(residual[valid] / hist_shape[valid]))) if valid.any() else 1.0
     amplitude_scale = float(np.clip(amplitude_scale, 0.4, 2.5))
 
     amplitudes = np.abs(tp["value"].to_numpy()) if not tp.empty else np.array([1.0])
@@ -191,19 +185,8 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         retain_per_cycle = 0.85
 
     future_amp = amplitude_scale * np.power(retain_per_cycle, future_steps / cycle_days)
-
-    # Reparameterize without changing fitted/projected prices:
-    # raw_center * exp(raw_shape * amplitude)
-    # == centered_center * exp(centered_shape * amplitude).
-    # This makes structural_centerline_usd the true geometric center of the
-    # oscillation rather than the underlying regression baseline.
-    centered_hist_center = hist_center * np.exp(template_log_mean * amplitude_scale)
-    raw_future_center = centerline[len(train):]
-    centered_future_center = raw_future_center * np.exp(template_log_mean * future_amp)
-    centered_centerline = np.concatenate([centered_hist_center, centered_future_center])
-
-    fitted_hist = centered_hist_center * np.exp(hist_shape * amplitude_scale)
-    projected = centered_future_center * np.exp(future_shape * future_amp)
+    fitted_hist = hist_center * np.exp(hist_shape * amplitude_scale)
+    projected = centerline[len(train):] * np.exp(future_shape * future_amp)
 
     all_dates = pd.DatetimeIndex(train["date"].tolist() + future_dates.tolist())
     daily = pd.DataFrame({
@@ -211,7 +194,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "row_type": ["historical_training"] * len(train) + ["projected"] * len(future_dates),
         "actual_price_usd": list(train["price_usd"]) + [np.nan] * len(future_dates),
         "included_in_training": [True] * len(train) + [False] * len(future_dates),
-        "structural_centerline_usd": centered_centerline,
+        "structural_centerline_usd": centerline,
         "cycle_progress": np.concatenate([hist_progress, future_progress]),
         "cycle_shape_value": np.concatenate([hist_shape, future_shape]),
         "cycle_amplitude": np.concatenate([np.full(len(train), amplitude_scale), future_amp]),
@@ -232,7 +215,6 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "projection_years": projection_years,
         "amplitude_scale": amplitude_scale,
         "amplitude_retained_per_cycle": retain_per_cycle,
-        "template_log_mean": template_log_mean,
         **{k: v for k, v in cycle_diag.items() if k != "turning_points"},
         "turning_points": tp,
     }
