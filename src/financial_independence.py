@@ -291,7 +291,15 @@ def solve_earliest_financial_independence(
     end_age: float,
     **kwargs,
 ) -> FinancialIndependenceResult:
-    """Find the monthly FI boundary without brute-forcing every daily path."""
+    """Find the true earliest sustainable FI month.
+
+    FI sustainability is not monotonic for an oscillating asset path. Starting
+    withdrawals one month later can move the plan into a different drawdown
+    sequence and can therefore turn a previously sustainable plan into an
+    unsustainable one (or vice versa). A binary search is mathematically invalid
+    here. The monthly engine is fast enough to scan every candidate month while
+    still avoiding the former daily brute-force implementation.
+    """
     prepared = prepare_monthly_path(dates, btc_prices, current_age, end_age)
     max_month = max(int(math.floor((end_age - current_age) * 12)) - 1, 0)
 
@@ -308,28 +316,16 @@ def solve_earliest_financial_independence(
             **kwargs,
         )
 
-    # If even the latest possible FI date fails, return that result immediately.
-    latest = run(max_month, build_path=False)
-    if not latest.sustainable:
-        return run(max_month, build_path=True)
+    latest_result = None
+    for month in range(max_month + 1):
+        result = run(month, build_path=False)
+        latest_result = result
+        if result.sustainable:
+            return run(month, build_path=True)
 
-    # Sustainability is expected to be monotonic as FI is delayed: more months
-    # of contributions and fewer months of withdrawals. Find the first success.
-    low, high = 0, max_month
-    while low < high:
-        middle = (low + high) // 2
-        if run(middle, build_path=False).sustainable:
-            high = middle
-        else:
-            low = middle + 1
-
-    # Verify the boundary locally in case rounding places it one month earlier.
-    first_success = low
-    for month in range(max(0, low - 2), low + 1):
-        if run(month, build_path=False).sustainable:
-            first_success = month
-            break
-    return run(first_success, build_path=True)
+    # No sustainable month exists in the requested horizon. Return the latest
+    # candidate with a full path so the UI can explain the failure.
+    return run(max_month, build_path=True) if latest_result is not None else run(0, build_path=True)
 
 
 def solve_required_monthly_contribution(

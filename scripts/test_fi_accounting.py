@@ -9,9 +9,54 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.financial_independence import (
+    _simulate_prepared,
+    prepare_monthly_path,
     solve_earliest_financial_independence,
     validate_result_accounting,
 )
+
+
+def assert_solver_matches_exhaustive_scan(
+    dates: pd.Series,
+    prices: pd.Series,
+    common: dict,
+) -> None:
+    prepared = prepare_monthly_path(
+        dates, prices, common["current_age"], common["end_age"]
+    )
+    kwargs = {
+        key: value
+        for key, value in common.items()
+        if key not in {"current_age", "end_age"}
+    }
+    expected_month = None
+    max_month = int((common["end_age"] - common["current_age"]) * 12) - 1
+    for month in range(max_month + 1):
+        age = common["current_age"] + month / 12
+        result = _simulate_prepared(
+            "exhaustive",
+            prepared,
+            common["current_age"],
+            age,
+            common["end_age"],
+            contribution_end_age=age,
+            build_path=False,
+            **kwargs,
+        )
+        if result.sustainable:
+            expected_month = month
+            break
+
+    solved = solve_earliest_financial_independence(
+        "solver",
+        dates,
+        prices,
+        **common,
+    )
+    solved_month = round(
+        (solved.financial_independence_age - common["current_age"]) * 12
+    )
+    assert solved_month == expected_month
 
 
 def run() -> None:
@@ -58,7 +103,19 @@ def run() -> None:
     # A smooth 15% BTC path should not lose to 12% nominal APR accumulation.
     assert btc.financial_independence_age <= other.financial_independence_age
 
-    print("FI accounting regression checks passed.")
+    # The public solver must return the same earliest month as a direct scan.
+    assert_solver_matches_exhaustive_scan(
+        dates,
+        btc_prices,
+        {
+            **common,
+            "btc_monthly_contribution": 2_000.0,
+            "other_monthly_contribution": 0.0,
+            "withdrawal_source": "BTC first",
+        },
+    )
+
+    print("FI accounting and earliest-age regression checks passed.")
 
 
 if __name__ == "__main__":
