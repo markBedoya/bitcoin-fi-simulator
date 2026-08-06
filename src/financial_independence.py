@@ -159,17 +159,31 @@ def _simulate_prepared(
         financially_independent = index >= fi_index
         contributing = index < contribution_end_index
 
+        btc_contribution = 0.0
+        other_contribution = 0.0
+        btc_units_purchased = 0.0
+        withdrawal_total = 0.0
+        withdrawal_from_btc = 0.0
+        withdrawal_from_other = 0.0
+        btc_units_sold = 0.0
+
         if contributing and additions_at_start:
-            other_balance += other_monthly_contribution
-            btc_units += btc_monthly_contribution / btc_price
-            total_contributions += other_monthly_contribution + btc_monthly_contribution
+            other_contribution = float(other_monthly_contribution)
+            btc_contribution = float(btc_monthly_contribution)
+            btc_units_purchased = btc_contribution / btc_price if btc_price > 0 else 0.0
+            other_balance += other_contribution
+            btc_units += btc_units_purchased
+            total_contributions += other_contribution + btc_contribution
 
         other_balance *= drawing_factor if financially_independent else accumulation_factor
 
         if contributing and not additions_at_start:
-            other_balance += other_monthly_contribution
-            btc_units += btc_monthly_contribution / btc_price
-            total_contributions += other_monthly_contribution + btc_monthly_contribution
+            other_contribution = float(other_monthly_contribution)
+            btc_contribution = float(btc_monthly_contribution)
+            btc_units_purchased = btc_contribution / btc_price if btc_price > 0 else 0.0
+            other_balance += other_contribution
+            btc_units += btc_units_purchased
+            total_contributions += other_contribution + btc_contribution
 
         total_value = other_balance + btc_units * btc_price
         if index == fi_index:
@@ -177,9 +191,15 @@ def _simulate_prepared(
 
         if financially_independent:
             withdrawal = monthly_spending_today * ((1 + inflation_rate) ** prepared.years_from_start[index])
+            withdrawal_total = float(withdrawal)
             if total_value + 1e-9 < withdrawal:
                 insolvent = True
-                total_withdrawals += max(total_value, 0.0)
+                actual_withdrawal = max(total_value, 0.0)
+                withdrawal_total = actual_withdrawal
+                withdrawal_from_other = max(other_balance, 0.0)
+                withdrawal_from_btc = max(btc_units * btc_price, 0.0)
+                btc_units_sold = btc_units
+                total_withdrawals += actual_withdrawal
                 other_balance = 0.0
                 btc_units = 0.0
             else:
@@ -195,9 +215,12 @@ def _simulate_prepared(
                     from_btc = withdrawal - from_other
                 else:
                     raise ValueError(f"Unknown withdrawal source: {withdrawal_source}")
-                other_balance -= from_other
-                btc_units -= from_btc / btc_price
-                total_withdrawals += withdrawal
+                withdrawal_from_other = float(from_other)
+                withdrawal_from_btc = float(from_btc)
+                btc_units_sold = withdrawal_from_btc / btc_price if btc_price > 0 else 0.0
+                other_balance -= withdrawal_from_other
+                btc_units -= btc_units_sold
+                total_withdrawals += withdrawal_total
 
         total_value = max(other_balance + btc_units * btc_price, 0.0)
         if rows is not None:
@@ -211,6 +234,16 @@ def _simulate_prepared(
                 "total_portfolio": total_value,
                 "financially_independent": financially_independent,
                 "contributing": contributing,
+                "btc_contribution": btc_contribution,
+                "other_contribution": other_contribution,
+                "total_contribution": btc_contribution + other_contribution,
+                "btc_units_purchased": btc_units_purchased,
+                "withdrawal_total": withdrawal_total,
+                "withdrawal_from_btc": withdrawal_from_btc,
+                "withdrawal_from_other": withdrawal_from_other,
+                "btc_units_sold": btc_units_sold,
+                "cumulative_contributions": total_contributions,
+                "cumulative_withdrawals": total_withdrawals,
             })
         if insolvent:
             break
@@ -371,3 +404,63 @@ def solve_required_monthly_contribution(
         upper * (1 - bitcoin_conviction),
         final,
     )
+
+
+def build_annual_audit(result: FinancialIndependenceResult) -> pd.DataFrame:
+    """Return one auditable year-end row per age year."""
+    if result.path.empty:
+        return pd.DataFrame()
+    audit = result.path.copy()
+    audit["calendar_year"] = pd.to_datetime(audit["date"]).dt.year
+    annual = audit.groupby("calendar_year", as_index=False).last()
+    flow_columns = [
+        "btc_contribution", "other_contribution", "total_contribution",
+        "btc_units_purchased", "withdrawal_total",
+        "withdrawal_from_btc", "withdrawal_from_other", "btc_units_sold",
+    ]
+    flows = audit.groupby("calendar_year", as_index=False)[flow_columns].sum()
+    annual = annual.drop(columns=flow_columns, errors="ignore").merge(
+        flows, on="calendar_year", how="left"
+    )
+    annual["btc_accounting_difference"] = (
+        annual["btc_value"] - annual["btc_units"] * annual["btc_price"]
+    )
+    annual["portfolio_accounting_difference"] = (
+        annual["total_portfolio"]
+        - annual["btc_value"]
+        - annual["other_investments"]
+    )
+    return annual
+
+
+def validate_result_accounting(result: FinancialIndependenceResult, tolerance: float = 0.01) -> dict:
+    """Validate unit and portfolio identities for every simulated month."""
+    if result.path.empty:
+        return {"passed": False, "reason": "No path was generated."}
+    path = result.path
+    btc_diff = (path["btc_value"] - path["btc_units"] * path["btc_price"]).abs()
+    total_diff = (
+        path["total_portfolio"] - path["btc_value"] - path["other_investments"]
+    ).abs()
+    negatives = (
+        (path["btc_units"] < -tolerance)
+        | (path["btc_value"] < -tolerance)
+        | (path["other_investments"] < -tolerance)
+    )
+    return {
+        "passed": bool(
+            btc_diff.max() <= tolerance
+            and total_diff.max() <= tolerance
+            and not negatives.any()
+        ),
+        "max_btc_identity_error": float(btc_diff.max()),
+        "max_portfolio_identity_error": float(total_diff.max()),
+        "negative_balance_rows": int(negatives.sum()),
+        "months_audited": int(len(path)),
+    }
+
+
+def effective_annual_return(annual_rate: float, compounds_per_year: int) -> float:
+    """Convert the entered nominal APR into its effective annual return."""
+    m = max(int(compounds_per_year), 1)
+    return (1 + annual_rate / m) ** m - 1

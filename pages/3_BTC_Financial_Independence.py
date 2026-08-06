@@ -6,9 +6,12 @@ from src.data_pipeline import load_coinmetrics
 from src.price_model import fit_price_model
 from src.active_model_config import build_model_fingerprint
 from src.financial_independence import (
+    build_annual_audit,
     build_rebased_btc_paths,
+    effective_annual_return,
     solve_earliest_financial_independence,
     solve_required_monthly_contribution,
+    validate_result_accounting,
 )
 
 st.title("BTC Financial Independence")
@@ -340,6 +343,9 @@ if run:
         "target_fi_age": target_fi_age,
         "coast_age": coast_age,
         "conviction": conviction,
+        "other_return_contributing": other_return_contributing,
+        "other_return_drawing": other_return_drawing,
+        "compounds": compounds,
     }
     st.session_state["btc_fi_last_results"] = payload
 
@@ -400,6 +406,111 @@ if results:
             use_container_width=True,
             hide_index=True,
         )
+
+        st.subheader("Return and accounting verification")
+        effective_accumulation = effective_annual_return(
+            results["inputs"]["other_return_contributing"],
+            results["inputs"]["compounds"],
+        )
+        effective_drawing = effective_annual_return(
+            results["inputs"]["other_return_drawing"],
+            results["inputs"]["compounds"],
+        )
+        st.caption(
+            f"The entered other-investment rates are nominal APRs. With "
+            f"{results['inputs']['compounds']} compounding periods, "
+            f"{results['inputs']['other_return_contributing']:.2%} APR equals "
+            f"**{effective_accumulation:.2%} effective annual growth**, and "
+            f"{results['inputs']['other_return_drawing']:.2%} APR equals "
+            f"**{effective_drawing:.2%} effective annual growth** after FI."
+        )
+
+        verification_rows = []
+        for result in scenarios:
+            verification = validate_result_accounting(result)
+            path = result.path
+            if path.empty:
+                continue
+            start_price = float(path["btc_price"].iloc[0])
+            fi_rows = path[path["age"] >= result.financial_independence_age]
+            fi_price = float(fi_rows["btc_price"].iloc[0]) if not fi_rows.empty else float(path["btc_price"].iloc[-1])
+            end_price = float(path["btc_price"].iloc[-1])
+            years_to_fi = max(result.financial_independence_age - results["inputs"]["current_age"], 1 / 12)
+            years_after_fi = max(results["inputs"]["end_age"] - result.financial_independence_age, 1 / 12)
+            btc_cagr_to_fi = (fi_price / start_price) ** (1 / years_to_fi) - 1 if start_price > 0 else None
+            btc_cagr_after_fi = (end_price / fi_price) ** (1 / years_after_fi) - 1 if fi_price > 0 else None
+            verification_rows.append({
+                "scenario": result.scenario,
+                "accounting_passed": verification["passed"],
+                "months_audited": verification["months_audited"],
+                "max_btc_identity_error": verification["max_btc_identity_error"],
+                "max_total_identity_error": verification["max_portfolio_identity_error"],
+                "btc_path_cagr_to_fi": btc_cagr_to_fi,
+                "btc_path_cagr_after_fi": btc_cagr_after_fi,
+            })
+
+        verification_df = pd.DataFrame(verification_rows)
+        st.dataframe(
+            verification_df.style.format({
+                "max_btc_identity_error": "${:,.6f}",
+                "max_total_identity_error": "${:,.6f}",
+                "btc_path_cagr_to_fi": "{:.2%}",
+                "btc_path_cagr_after_fi": "{:.2%}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        with st.expander("Show yearly portfolio audit"):
+            audit_scenario = st.selectbox(
+                "Audit scenario",
+                [result.scenario for result in scenarios],
+                key="fi_audit_scenario",
+            )
+            selected_result = next(
+                result for result in scenarios
+                if result.scenario == audit_scenario
+            )
+            annual_audit = build_annual_audit(selected_result)
+            audit_columns = [
+                "calendar_year", "age", "btc_price", "btc_units", "btc_value",
+                "other_investments", "total_portfolio", "btc_contribution",
+                "other_contribution", "withdrawal_total", "withdrawal_from_btc",
+                "withdrawal_from_other", "cumulative_contributions",
+                "cumulative_withdrawals", "btc_accounting_difference",
+                "portfolio_accounting_difference",
+            ]
+            st.dataframe(
+                annual_audit[audit_columns].style.format({
+                    "age": "{:.2f}",
+                    "btc_price": "${:,.0f}",
+                    "btc_units": "{:,.8f}",
+                    "btc_value": "${:,.0f}",
+                    "other_investments": "${:,.0f}",
+                    "total_portfolio": "${:,.0f}",
+                    "btc_contribution": "${:,.0f}",
+                    "other_contribution": "${:,.0f}",
+                    "withdrawal_total": "${:,.0f}",
+                    "withdrawal_from_btc": "${:,.0f}",
+                    "withdrawal_from_other": "${:,.0f}",
+                    "cumulative_contributions": "${:,.0f}",
+                    "cumulative_withdrawals": "${:,.0f}",
+                    "btc_accounting_difference": "${:,.6f}",
+                    "portfolio_accounting_difference": "${:,.6f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.download_button(
+                "Download yearly audit CSV",
+                annual_audit.to_csv(index=False).encode("utf-8"),
+                file_name=(
+                    audit_scenario.lower().replace(" ", "_").replace("%", "pct")
+                    + "_yearly_audit.csv"
+                ),
+                mime="text/csv",
+                key="download_fi_audit",
+            )
 
         st.subheader("Portfolio paths")
         display_mode = st.radio(
