@@ -352,11 +352,17 @@ fig.add_trace(go.Scatter(
     name="Historical fitted path",
 ))
 
-historical_anchor_plot = diag.get("turning_points")
-if historical_anchor_plot is not None and not historical_anchor_plot.empty:
+historical_anchor_plot = diag.get("cycle_anchor_table")
+required_anchor_columns = {"date", "actual_price_usd", "source"}
+if (
+    historical_anchor_plot is not None
+    and not historical_anchor_plot.empty
+    and required_anchor_columns.issubset(historical_anchor_plot.columns)
+):
     historical_anchor_plot = historical_anchor_plot.copy()
     historical_anchor_plot = historical_anchor_plot[
-        historical_anchor_plot["actual_price_usd"].notna()
+        (historical_anchor_plot["source"] == "historical market anchor")
+        & historical_anchor_plot["actual_price_usd"].notna()
     ]
     if not historical_anchor_plot.empty:
         fig.add_trace(go.Scatter(

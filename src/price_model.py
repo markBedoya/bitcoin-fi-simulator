@@ -181,15 +181,30 @@ def _build_cycle_fit(
         (schedule["date"] >= training_start) & (schedule["date"] <= training_end)
     ].copy()
 
+    anchor_columns = [
+        "date",
+        "type",
+        "cycle",
+        "actual_price_usd",
+        "structural_centerline_usd",
+        "log_deviation",
+        "source",
+    ]
     anchor_rows = []
-    price_lookup = data.set_index("date")["price_usd"]
     for row in hist_schedule.itertuples(index=False):
-        if row.date not in price_lookup.index or row.date not in center_series.index:
+        # Coin Metrics is daily, but use the nearest available observation so a
+        # missing calendar date can never silently remove a requested anchor.
+        nearest = data.iloc[(data["date"] - row.date).abs().argsort()[:1]].iloc[0]
+        actual_date = pd.Timestamp(nearest["date"])
+        if abs((actual_date - row.date).days) > 3:
             continue
-        actual = float(price_lookup.loc[row.date])
-        center = float(center_series.loc[row.date])
+        if actual_date not in center_series.index:
+            continue
+        actual = float(nearest["price_usd"])
+        center = float(center_series.loc[actual_date])
         anchor_rows.append({
-            "date": row.date,
+            "date": actual_date,
+            "requested_anchor_date": row.date,
             "type": row.type,
             "cycle": int(row.cycle),
             "actual_price_usd": actual,
@@ -198,7 +213,17 @@ def _build_cycle_fit(
             "source": "historical market anchor",
         })
 
-    anchors = pd.DataFrame(anchor_rows)
+    anchor_columns_with_requested = [
+        "date",
+        "requested_anchor_date",
+        "type",
+        "cycle",
+        "actual_price_usd",
+        "structural_centerline_usd",
+        "log_deviation",
+        "source",
+    ]
+    anchors = pd.DataFrame(anchor_rows, columns=anchor_columns_with_requested)
 
     # Always force the fitted path to intersect the actual first and last training observations.
     endpoint_rows = []
@@ -209,6 +234,7 @@ def _build_cycle_fit(
         center = float(center_series.loc[actual_d])
         endpoint_rows.append({
             "date": actual_d,
+            "requested_anchor_date": actual_d,
             "type": label,
             "cycle": np.nan,
             "actual_price_usd": actual,
@@ -229,6 +255,7 @@ def _build_cycle_fit(
         center = float(center_series.loc[row.date]) if row.date in center_series.index else np.nan
         future_rows.append({
             "date": row.date,
+            "requested_anchor_date": row.date,
             "type": row.type,
             "cycle": int(row.cycle),
             "actual_price_usd": np.nan,
