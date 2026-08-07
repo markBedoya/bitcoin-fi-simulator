@@ -405,31 +405,113 @@ m3.metric("Amplitude retained per cycle", f'{diag["amplitude_retained_per_cycle"
 m4.metric("Terminal exponent", f'{diag["terminal_exponent"]:.3f}')
 m5.metric("Cycle template mean", f'{diag.get("template_log_mean", 0.0):.3f}')
 
-rows = []
+st.subheader("Projected returns by horizon")
+st.markdown(
+    """
+**Lump Sum CAGR** is the annualized return for a single investment made at the
+latest actual Bitcoin price and held until that future horizon.
+
+**Forward Return 1 Year** is the model's price return over the next 12 months
+starting at that future horizon. This is especially useful for understanding
+the return available to future DCA contributions as Bitcoin matures.
+"""
+)
+
+projection_points = {}
 for years in range(1, projection_years + 1):
     target = training_end + pd.DateOffset(years=years)
     nearest = proj.iloc[(proj["date"] - target).abs().argsort()[:1]]
-    cycle_price = float(nearest["btc_cycle_price"].iloc[0])
-    center_price = float(nearest["btc_centerline_price"].iloc[0])
+    projection_points[years] = {
+        "cycle_price": float(nearest["btc_cycle_price"].iloc[0]),
+        "center_price": float(nearest["btc_centerline_price"].iloc[0]),
+    }
+
+rows = []
+for years in range(1, projection_years + 1):
+    point = projection_points[years]
+    cycle_price = point["cycle_price"]
+    center_price = point["center_price"]
+
     cycle_cagr = (cycle_price / last_actual_price) ** (1 / years) - 1
     center_cagr = (center_price / last_actual_price) ** (1 / years) - 1
+
+    cycle_forward_1y = None
+    center_forward_1y = None
+    if years < projection_years:
+        next_point = projection_points[years + 1]
+        cycle_forward_1y = next_point["cycle_price"] / cycle_price - 1
+        center_forward_1y = next_point["center_price"] / center_price - 1
+
     rows.append({
-        "horizon_years": years,
-        "cycle_projected_price_usd": cycle_price,
-        "cycle_implied_cagr": cycle_cagr,
-        "centerline_projected_price_usd": center_price,
-        "centerline_implied_cagr": center_cagr,
+        "Horizon (Years)": years,
+        "Cycle Projected Price": cycle_price,
+        "Cycle Lump Sum CAGR": cycle_cagr,
+        "Cycle Forward Return 1 Year": cycle_forward_1y,
+        "Centerline Projected Price": center_price,
+        "Centerline Lump Sum CAGR": center_cagr,
+        "Centerline Forward Return 1 Year": center_forward_1y,
     })
+
 if rows:
+    returns_df = pd.DataFrame(rows)
+
     st.dataframe(
-        pd.DataFrame(rows).style.format({
-            "cycle_projected_price_usd": "${:,.0f}",
-            "cycle_implied_cagr": "{:.2%}",
-            "centerline_projected_price_usd": "${:,.0f}",
-            "centerline_implied_cagr": "{:.2%}",
-        }),
+        returns_df.style.format({
+            "Cycle Projected Price": "${:,.0f}",
+            "Cycle Lump Sum CAGR": "{:.2%}",
+            "Cycle Forward Return 1 Year": "{:.2%}",
+            "Centerline Projected Price": "${:,.0f}",
+            "Centerline Lump Sum CAGR": "{:.2%}",
+            "Centerline Forward Return 1 Year": "{:.2%}",
+        }, na_rep="—"),
         use_container_width=True,
         hide_index=True,
+    )
+
+    st.subheader("Forward Return 1 Year")
+    benchmark_pct = st.number_input(
+        "Comparison annual return (%)",
+        min_value=-50.0,
+        max_value=100.0,
+        value=12.0,
+        step=0.25,
+        help=(
+            "Reference line only. Use this to compare Bitcoin's modeled one-year "
+            "forward return with another assumed annual return."
+        ),
+    )
+
+    return_fig = go.Figure()
+    return_fig.add_trace(go.Scatter(
+        x=returns_df["Horizon (Years)"],
+        y=returns_df["Cycle Forward Return 1 Year"] * 100,
+        mode="lines",
+        name="Cycle Forward Return 1 Year",
+    ))
+    return_fig.add_trace(go.Scatter(
+        x=returns_df["Horizon (Years)"],
+        y=returns_df["Centerline Forward Return 1 Year"] * 100,
+        mode="lines",
+        name="Centerline Forward Return 1 Year",
+        line={"dash": "dash"},
+    ))
+    return_fig.add_hline(
+        y=benchmark_pct,
+        line_dash="dot",
+        annotation_text=f"{benchmark_pct:.2f}% comparison",
+        annotation_position="top right",
+    )
+    return_fig.update_layout(
+        xaxis_title="Years into future",
+        yaxis_title="Forward return over next 12 months (%)",
+        hovermode="x unified",
+        height=480,
+    )
+    st.plotly_chart(
+        return_fig,
+        use_container_width=True,
+        config={"displaylogo": False},
+        key="price_model_forward_return_chart",
     )
 
 st.subheader("Normalized historical cycle overlays")
