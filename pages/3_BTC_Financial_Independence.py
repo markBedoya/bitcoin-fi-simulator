@@ -5,6 +5,7 @@ import streamlit as st
 from src.data_pipeline import load_coinmetrics
 from src.price_model import fit_price_model
 from src.active_model_config import build_model_fingerprint
+from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 from src.financial_independence import (
     build_annual_audit,
     build_rebased_btc_paths,
@@ -533,7 +534,15 @@ if results:
                     fig.add_trace(go.Scatter(x=result.path["age"], y=result.path["total_portfolio"], mode="lines", name="Mixed BTC + other portfolio", line={"width": 3}))
                     fig.add_trace(go.Scatter(x=results["all_other"].path["age"], y=results["all_other"].path["total_portfolio"], mode="lines", name="100% other investments", line={"dash": "dash", "width": 3}))
                     fig.add_trace(go.Scatter(x=results["all_btc"].path["age"], y=results["all_btc"].path["total_portfolio"], mode="lines", name="100% Bitcoin", line={"dash": "dot", "width": 3}))
-                fig.add_vline(x=result.financial_independence_age, line_dash="dash", annotation_text="FI")
+                fig.add_vline(x=result.financial_independence_age, line_dash=REFERENCE_LINE_DASH, annotation_text="FI"),
+                line_color=REFERENCE_LINE_COLOR,
+                line_width=REFERENCE_LINE_WIDTH,
+                line_color=REFERENCE_LINE_COLOR,
+                line_width=REFERENCE_LINE_WIDTH,
+                line_color=REFERENCE_LINE_COLOR,
+                line_width=REFERENCE_LINE_WIDTH,
+                line_color=REFERENCE_LINE_COLOR,
+                line_width=REFERENCE_LINE_WIDTH,
                 fig.update_layout(title=f"{result.scenario} — {display_mode}", xaxis_title="Age", yaxis_title="Portfolio value (USD)", hovermode="x unified", height=600)
                 st.plotly_chart(fig, use_container_width=True, config={"displaylogo": False}, key=f"fi_paths_{result.scenario}_{display_mode}")
 

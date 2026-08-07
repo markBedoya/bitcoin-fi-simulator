@@ -5,6 +5,7 @@ from src.data_pipeline import load_coinmetrics
 from src.price_model import fit_price_model, find_most_conservative_training_start
 from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
+from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
 st.title("Price Model v2.1 — Continuity Calibrated")
 st.caption("Use all available data by default, or change the usable training period and refit the daily future path.")
@@ -350,7 +351,11 @@ if overlay_excluded and training_end < prices["date"].max():
     ))
 
 fig.add_vline(
-    x=str(training_end.date()), line_dash="dash", annotation_text="Projection start"
+    x=str(training_end.date()),
+    line_dash=REFERENCE_LINE_DASH,
+    line_color=REFERENCE_LINE_COLOR,
+    line_width=REFERENCE_LINE_WIDTH,
+    annotation_text="Projection start",
 )
 fig.update_layout(
     title="Bitcoin historical fit and projected daily path",
@@ -497,7 +502,9 @@ if rows:
     ))
     return_fig.add_hline(
         y=benchmark_pct,
-        line_dash="dot",
+        line_dash=REFERENCE_LINE_DASH,
+        line_color=REFERENCE_LINE_COLOR,
+        line_width=REFERENCE_LINE_WIDTH,
         annotation_text=f"{benchmark_pct:.2f}% comparison",
         annotation_position="top right",
     )
@@ -528,7 +535,11 @@ else:
 st.subheader("Actual price relative to structural centerline")
 ratio_fig = go.Figure()
 ratio_fig.add_trace(go.Scatter(x=hist["date"], y=hist["actual_price_usd"]/hist["structural_centerline_usd"], mode="lines", name="Actual ÷ centerline"))
-ratio_fig.add_hline(y=1.0, line_dash="dash")
+ratio_fig.add_hline(y=1.0, line_dash=REFERENCE_LINE_DASH),
+line_color=REFERENCE_LINE_COLOR,
+line_width=REFERENCE_LINE_WIDTH,
+line_color=REFERENCE_LINE_COLOR,
+line_width=REFERENCE_LINE_WIDTH,
 ratio_fig.update_layout(xaxis_title="Date", yaxis_title="Price / centerline", height=400)
 st.plotly_chart(ratio_fig, use_container_width=True, config={"displaylogo": False})
 
