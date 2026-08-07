@@ -1,3 +1,4 @@
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -7,8 +8,11 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v2.1 — Continuity Calibrated")
-st.caption("Use all available data by default, or change the usable training period and refit the daily future path.")
+st.title("Price Model v2.2 — Fixed 1428-Day Cycle")
+st.caption(
+    "All Bitcoin price history remains visible. The selected training range controls only the model fit. "
+    "Cycle timing is fixed at 1428 days: 1064 bull days and 364 bear days."
+)
 
 try:
     prices, meta = load_coinmetrics(refresh=False)
@@ -143,7 +147,7 @@ with st.sidebar:
 
     st.caption(
         f"Model training cutoff: **{training_end.date().isoformat()}**. "
-        "Prices after this date are excluded from fitting."
+        "Prices outside the selected range are excluded from fitting but remain visible on the main chart."
     )
 
     summary = st.session_state.get("conservative_search_summary")
@@ -161,7 +165,6 @@ with st.sidebar:
             f"Minimum training history: **{summary.get('search_minimum_years', '—')} years**"
         )
 
-    overlay_excluded = st.toggle("Overlay excluded actual prices", value=True)
     log_scale = st.toggle("Logarithmic price scale", value=True)
 
 
@@ -309,8 +312,8 @@ c1, c2, c3, c4, c5 = st.columns(5)
 c1.metric("Training observations", f'{diag["training_rows"]:,}')
 c2.metric("Training end", training_end.date().isoformat())
 c3.metric("Historical exponent", f'{diag["historical_exponent"]:.3f}')
-c4.metric("Estimated cycle length", f'{diag["cycle_days"]/365.25:.2f} years')
-c5.metric("Complete cycles found", diag["complete_cycles"])
+c4.metric("Fixed cycle length", f'{int(diag["cycle_days"]):,} days')
+c5.metric("Bull / bear days", f'{diag.get("bull_days", 1064)} / {diag.get("bear_days", 364)}')
 
 st.caption(
     f"Active Price Model fingerprint: **{active_model_fingerprint}**. "
@@ -319,8 +322,10 @@ st.caption(
 
 fig = go.Figure()
 fig.add_trace(go.Scatter(
-    x=hist["date"], y=hist["actual_price_usd"], mode="lines",
-    name="Actual price used"
+    x=prices["date"],
+    y=prices["price_usd"],
+    mode="lines",
+    name="Actual Bitcoin price",
 ))
 fig.add_trace(go.Scatter(
     x=centerline_plot["date"],
@@ -343,12 +348,6 @@ fig.add_trace(go.Scatter(
     line={"width": 3},
 ))
 
-if overlay_excluded and training_end < prices["date"].max():
-    excluded = prices[prices["date"] > training_end]
-    fig.add_trace(go.Scatter(
-        x=excluded["date"], y=excluded["price_usd"], mode="lines",
-        name="Excluded actual prices", line={"dash": "dot"}, opacity=0.45
-    ))
 
 fig.add_vline(
     x=str(training_end.date()),
@@ -404,11 +403,43 @@ else:
 
 st.subheader("Model diagnostics")
 m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Cycle peak position", f'{diag["peak_progress"]*100:.1f}%')
-m2.metric("Amplitude scale", f'{diag["amplitude_scale"]:.2f}×')
-m3.metric("Amplitude retained per cycle", f'{diag["amplitude_retained_per_cycle"]*100:.1f}%')
+m1.metric("Bull phase", f'{diag.get("bull_days", 1064):,} days')
+m2.metric("Bear phase", f'{diag.get("bear_days", 364):,} days')
+m3.metric("Peak position", f'{diag["peak_progress"]*100:.1f}%')
 m4.metric("Terminal exponent", f'{diag["terminal_exponent"]:.3f}')
-m5.metric("Cycle template mean", f'{diag.get("template_log_mean", 0.0):.3f}')
+m5.metric("Next modeled trough", diag.get("next_modeled_trough", "2026-10-05"))
+
+st.subheader("Cycle anchor verification")
+anchor_table = diag.get("cycle_anchor_table")
+if anchor_table is not None and not anchor_table.empty:
+    anchor_display = anchor_table.copy()
+    anchor_display["date"] = pd.to_datetime(anchor_display["date"]).dt.date
+    anchor_display["modeled_price_usd"] = (
+        anchor_display["structural_centerline_usd"]
+        * np.exp(anchor_display["log_deviation"])
+    )
+    anchor_display["intersection_error_pct"] = np.where(
+        anchor_display["actual_price_usd"].notna(),
+        anchor_display["modeled_price_usd"] / anchor_display["actual_price_usd"] - 1.0,
+        np.nan,
+    )
+    st.dataframe(
+        anchor_display[[
+            "date", "type", "source", "actual_price_usd",
+            "modeled_price_usd", "intersection_error_pct"
+        ]].style.format({
+            "actual_price_usd": "${:,.0f}",
+            "modeled_price_usd": "${:,.0f}",
+            "intersection_error_pct": "{:+.4%}",
+        }, na_rep="—"),
+        use_container_width=True,
+        hide_index=True,
+    )
+    historical_anchor_errors = anchor_display.loc[
+        anchor_display["actual_price_usd"].notna(), "intersection_error_pct"
+    ].abs()
+    if len(historical_anchor_errors) and historical_anchor_errors.max() < 1e-9:
+        st.success("Historical market anchors intersect the fitted path exactly.")
 
 st.subheader("Projected returns by horizon")
 st.markdown(
@@ -521,15 +552,15 @@ if rows:
         key="price_model_forward_return_chart",
     )
 
-st.subheader("Normalized historical cycle overlays")
+st.subheader("Fixed 1428-day historical cycle overlays")
 if result.cycle_overlays.empty:
     st.warning("The selected training range does not contain enough complete trough-to-trough cycles.")
 else:
-    st.subheader("Learned historical cycle shape")
+    st.subheader("Fixed asymmetric cycle shape")
     cycle_fig = go.Figure()
     for cycle_no, grp in result.cycle_overlays.groupby("cycle"):
         cycle_fig.add_trace(go.Scatter(x=grp["progress"]*100, y=grp["log_deviation"], mode="lines", name=f"Cycle {cycle_no}", opacity=0.45))
-    cycle_fig.add_trace(go.Scatter(x=result.cycle_template["progress"]*100, y=result.cycle_template["log_deviation"], mode="lines", name="Learned empirical template", line={"width": 4}))
+    cycle_fig.add_trace(go.Scatter(x=result.cycle_template["progress"]*100, y=result.cycle_template["log_deviation"], mode="lines", name="1428-day asymmetric template", line={"width": 4}))
     cycle_fig.update_layout(xaxis_title="Cycle progress (%)", yaxis_title="Log deviation from centerline", height=450)
     st.plotly_chart(cycle_fig, use_container_width=True, config={"displaylogo": False})
 

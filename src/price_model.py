@@ -3,6 +3,13 @@ import numpy as np
 import pandas as pd
 
 GENESIS = pd.Timestamp("2009-01-03")
+FIXED_CYCLE_DAYS = 1428
+FIXED_BULL_DAYS = 1064
+FIXED_BEAR_DAYS = 364
+REFERENCE_TROUGH = pd.Timestamp("2022-11-07")
+REFERENCE_PEAK = pd.Timestamp("2025-10-06")
+NEXT_TROUGH = pd.Timestamp("2026-10-05")
+
 
 @dataclass
 class PriceModelResult:
@@ -10,6 +17,7 @@ class PriceModelResult:
     diagnostics: dict
     cycle_overlays: pd.DataFrame
     cycle_template: pd.DataFrame
+
 
 def _fit_centerline(train: pd.DataFrame, future_dates: pd.DatetimeIndex):
     days = (train["date"] - GENESIS).dt.days.to_numpy(dtype=float)
@@ -23,7 +31,6 @@ def _fit_centerline(train: pd.DataFrame, future_dates: pd.DatetimeIndex):
     intercept, exponent = map(float, beta)
     hist = np.exp(intercept + exponent * log_days)
 
-    # Estimate exponent maturity from expanding historical fits.
     checkpoints = np.linspace(max(700, len(train) // 4), len(train), 10, dtype=int)
     exp_history = []
     for n in checkpoints:
@@ -57,95 +64,232 @@ def _fit_centerline(train: pd.DataFrame, future_dates: pd.DatetimeIndex):
         "expanding_exponents": exp_history,
     }
 
-def _turning_points(residual: np.ndarray, dates: pd.Series):
-    smooth = pd.Series(residual).rolling(121, center=True, min_periods=1).median().to_numpy()
-    raw = []
-    for i in range(2, len(smooth) - 2):
-        if smooth[i] >= smooth[i-1] and smooth[i] >= smooth[i+1]:
-            raw.append((i, "peak", float(smooth[i])))
-        elif smooth[i] <= smooth[i-1] and smooth[i] <= smooth[i+1]:
-            raw.append((i, "trough", float(smooth[i])))
 
-    selected = []
-    min_separation = 500
-    for idx, typ, value in raw:
-        if not selected:
-            selected.append([idx, typ, value])
-            continue
-        if idx - selected[-1][0] < min_separation:
-            if typ == selected[-1][1]:
-                better = value > selected[-1][2] if typ == "peak" else value < selected[-1][2]
-                if better:
-                    selected[-1] = [idx, typ, value]
-            continue
-        if typ == selected[-1][1]:
-            better = value > selected[-1][2] if typ == "peak" else value < selected[-1][2]
-            if better:
-                selected[-1] = [idx, typ, value]
-        else:
-            selected.append([idx, typ, value])
+def _fixed_cycle_anchors(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Return the deterministic 1428-day trough/peak schedule covering a date range."""
+    rows = []
 
-    return pd.DataFrame(
-        [{"idx": i, "date": dates.iloc[i], "type": t, "value": v} for i, t, v in selected]
+    # Trough anchored at 2022-11-07. Each cycle is 1064 bull days + 364 bear days.
+    k_min = int(np.floor((start - REFERENCE_TROUGH).days / FIXED_CYCLE_DAYS)) - 2
+    k_max = int(np.ceil((end - REFERENCE_TROUGH).days / FIXED_CYCLE_DAYS)) + 2
+    for k in range(k_min, k_max + 1):
+        trough = REFERENCE_TROUGH + pd.Timedelta(days=k * FIXED_CYCLE_DAYS)
+        peak = trough + pd.Timedelta(days=FIXED_BULL_DAYS)
+        rows.append({"date": trough, "type": "trough", "cycle": k})
+        rows.append({"date": peak, "type": "peak", "cycle": k})
+
+    return (
+        pd.DataFrame(rows)
+        .drop_duplicates(subset=["date", "type"])
+        .sort_values("date")
+        .reset_index(drop=True)
     )
 
-def _cycle_template(train: pd.DataFrame, residual: np.ndarray):
-    tp = _turning_points(residual, train["date"])
-    trough_idx = tp.loc[tp["type"] == "trough", "idx"].astype(int).tolist() if not tp.empty else []
-    grid = np.linspace(0, 1, 301)
-    cycles, frames = [], []
 
-    for num, (a, b) in enumerate(zip(trough_idx[:-1], trough_idx[1:]), start=1):
-        if b - a < 700:
+def _smoothstep(x: np.ndarray) -> np.ndarray:
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def _interp_knots(dates: pd.DatetimeIndex, knot_dates, knot_values):
+    ords = np.array([pd.Timestamp(d).toordinal() for d in dates], dtype=float)
+    kd = np.array([pd.Timestamp(d).toordinal() for d in knot_dates], dtype=float)
+    kv = np.asarray(knot_values, dtype=float)
+    out = np.empty(len(ords), dtype=float)
+
+    for i, x in enumerate(ords):
+        if x <= kd[0]:
+            out[i] = kv[0]
             continue
-        segment = residual[a:b+1]
-        interp = np.interp(grid, np.linspace(0, 1, len(segment)), segment)
-        cycles.append(interp)
-        frames.append(pd.DataFrame({"cycle": num, "progress": grid, "log_deviation": interp}))
+        if x >= kd[-1]:
+            out[i] = kv[-1]
+            continue
+        j = np.searchsorted(kd, x) - 1
+        span = kd[j + 1] - kd[j]
+        t = 0.0 if span <= 0 else (x - kd[j]) / span
+        s = float(_smoothstep(np.array([t]))[0])
+        out[i] = kv[j] + (kv[j + 1] - kv[j]) * s
+    return out
 
-    if cycles:
-        matrix = np.vstack(cycles)
-        weights = np.arange(1, len(cycles) + 1, dtype=float)
-        weights /= weights.sum()
-        template = np.average(matrix, axis=0, weights=weights)
+
+def _forecast_anchor_deviation(history: pd.DataFrame, anchor_type: str, future_cycle: int) -> float:
+    typed = history[history["type"] == anchor_type].sort_values("cycle")
+    if typed.empty:
+        return 0.0
+
+    # Use actual signed log deviations and extrapolate gradual amplitude damping.
+    vals = typed["log_deviation"].to_numpy(dtype=float)
+    cycles = typed["cycle"].to_numpy(dtype=float)
+    sign = 1.0 if anchor_type == "peak" else -1.0
+    amps = np.maximum(np.abs(vals), 1e-6)
+
+    if len(amps) >= 2:
+        # Fit recent amplitude decay in log space; never allow future amplitude growth.
+        use = min(3, len(amps))
+        slope, intercept = np.polyfit(cycles[-use:], np.log(amps[-use:]), 1)
+        slope = min(float(slope), 0.0)
+        amp = float(np.exp(intercept + slope * future_cycle))
     else:
-        template = np.zeros_like(grid)
+        amp = float(amps[-1])
 
-    template = pd.Series(template).rolling(11, center=True, min_periods=1).mean().to_numpy(copy=True)
+    # Avoid abrupt collapse or explosion from sparse history.
+    last_amp = float(amps[-1])
+    amp = float(np.clip(amp, last_amp * 0.35, last_amp * 1.0))
+    return sign * amp
 
-    # The learned cycle template can have a non-zero mean in log space.
-    # A positive mean makes the structural line sit below the visual middle
-    # of the projected oscillations. Keep the mean for an exact algebraic
-    # reparameterization later, then expose a zero-mean template.
-    trapezoid = getattr(np, "trapezoid", None)
-    if trapezoid is not None:
-        template_area = trapezoid(template, x=grid)
-    else:
-        template_area = np.trapz(template, x=grid)
-    template_log_mean = float(template_area / (grid[-1] - grid[0]))
-    centered_template = template - template_log_mean
 
-    if len(trough_idx) >= 2:
-        ordinals = [train["date"].iloc[i].toordinal() for i in trough_idx]
-        cycle_days = float(np.median(np.diff(ordinals)))
-    else:
-        cycle_days = 1461.0
+def _build_cycle_fit(
+    data: pd.DataFrame,
+    train: pd.DataFrame,
+    all_dates: pd.DatetimeIndex,
+    structural_centerline: np.ndarray,
+    training_start: pd.Timestamp,
+    training_end: pd.Timestamp,
+):
+    center_series = pd.Series(structural_centerline, index=all_dates)
+    schedule = _fixed_cycle_anchors(training_start, all_dates.max())
 
-    overlays = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
-    if not overlays.empty:
-        overlays["log_deviation"] = overlays["log_deviation"] - template_log_mean
-    template_df = pd.DataFrame({"progress": grid, "log_deviation": centered_template})
-    diagnostics = {
-        "turning_points": tp,
-        "complete_cycles": len(cycles),
-        "cycle_days": cycle_days,
-        "peak_progress": float(grid[np.argmax(centered_template)]) if len(centered_template) else 0.5,
-        "template_log_mean": template_log_mean,
+    # Historical anchor intersections are only learned from prices inside the selected training range.
+    hist_schedule = schedule[
+        (schedule["date"] >= training_start) & (schedule["date"] <= training_end)
+    ].copy()
+
+    anchor_rows = []
+    price_lookup = data.set_index("date")["price_usd"]
+    for row in hist_schedule.itertuples(index=False):
+        if row.date not in price_lookup.index or row.date not in center_series.index:
+            continue
+        actual = float(price_lookup.loc[row.date])
+        center = float(center_series.loc[row.date])
+        anchor_rows.append({
+            "date": row.date,
+            "type": row.type,
+            "cycle": int(row.cycle),
+            "actual_price_usd": actual,
+            "structural_centerline_usd": center,
+            "log_deviation": float(np.log(actual / center)),
+            "source": "historical market anchor",
+        })
+
+    anchors = pd.DataFrame(anchor_rows)
+
+    # Always force the fitted path to intersect the actual first and last training observations.
+    endpoint_rows = []
+    for d, label in [(training_start, "training_start"), (training_end, "latest_actual")]:
+        nearest = train.iloc[(train["date"] - d).abs().argsort()[:1]].iloc[0]
+        actual_d = pd.Timestamp(nearest["date"])
+        actual = float(nearest["price_usd"])
+        center = float(center_series.loc[actual_d])
+        endpoint_rows.append({
+            "date": actual_d,
+            "type": label,
+            "cycle": np.nan,
+            "actual_price_usd": actual,
+            "structural_centerline_usd": center,
+            "log_deviation": float(np.log(actual / center)),
+            "source": "boundary anchor",
+        })
+
+    history_for_forecast = anchors.copy()
+
+    # Future peak/trough anchor deviations are extrapolated separately from historical peaks and troughs.
+    future_schedule = schedule[schedule["date"] > training_end].copy()
+    future_rows = []
+    for row in future_schedule.itertuples(index=False):
+        if row.date > all_dates.max():
+            continue
+        dev = _forecast_anchor_deviation(history_for_forecast, row.type, int(row.cycle))
+        center = float(center_series.loc[row.date]) if row.date in center_series.index else np.nan
+        future_rows.append({
+            "date": row.date,
+            "type": row.type,
+            "cycle": int(row.cycle),
+            "actual_price_usd": np.nan,
+            "structural_centerline_usd": center,
+            "log_deviation": dev,
+            "source": "projected cycle anchor",
+        })
+
+    knots = pd.concat(
+        [pd.DataFrame(endpoint_rows), anchors, pd.DataFrame(future_rows)],
+        ignore_index=True,
+    )
+    knots = (
+        knots.sort_values(["date", "source"])
+        .drop_duplicates(subset=["date"], keep="last")
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
+
+    if len(knots) < 2:
+        raise ValueError("Not enough cycle anchors exist for the selected training range.")
+
+    deviation_path = _interp_knots(
+        all_dates,
+        knots["date"].tolist(),
+        knots["log_deviation"].to_numpy(dtype=float),
+    )
+    cycle_price = structural_centerline * np.exp(deviation_path)
+
+    # Fixed phase: trough=0, peak=1064/1428, next trough=1.
+    elapsed = np.array([(d - REFERENCE_TROUGH).days for d in all_dates], dtype=float)
+    cycle_progress = np.mod(elapsed, FIXED_CYCLE_DAYS) / FIXED_CYCLE_DAYS
+    peak_progress = FIXED_BULL_DAYS / FIXED_CYCLE_DAYS
+
+    # Build normalized cycle overlays from actual residuals for visualization only.
+    overlays = []
+    grid = np.linspace(0, 1, 301)
+    complete_cycles = 0
+    for trough in schedule[schedule["type"] == "trough"].itertuples(index=False):
+        next_trough = trough.date + pd.Timedelta(days=FIXED_CYCLE_DAYS)
+        if trough.date < training_start or next_trough > training_end:
+            continue
+        seg = train[(train["date"] >= trough.date) & (train["date"] <= next_trough)].copy()
+        if len(seg) < 1000:
+            continue
+        centers = center_series.reindex(pd.DatetimeIndex(seg["date"])).to_numpy(dtype=float)
+        residual = np.log(seg["price_usd"].to_numpy(dtype=float) / centers)
+        progress = ((seg["date"] - trough.date).dt.days / FIXED_CYCLE_DAYS).to_numpy(dtype=float)
+        interp = np.interp(grid, progress, residual)
+        complete_cycles += 1
+        overlays.append(pd.DataFrame({
+            "cycle": complete_cycles,
+            "progress": grid,
+            "log_deviation": interp,
+        }))
+
+    overlay_df = pd.concat(overlays, ignore_index=True) if overlays else pd.DataFrame()
+
+    # Template is the deterministic asymmetric bull/bear geometry, scaled to observed median anchor amplitudes.
+    peak_amp = float(np.median(np.abs(anchors.loc[anchors["type"] == "peak", "log_deviation"]))) if not anchors.empty and (anchors["type"] == "peak").any() else 0.6
+    trough_amp = float(np.median(np.abs(anchors.loc[anchors["type"] == "trough", "log_deviation"]))) if not anchors.empty and (anchors["type"] == "trough").any() else 0.6
+    template_vals = np.empty_like(grid)
+    for i, p in enumerate(grid):
+        if p <= peak_progress:
+            t = p / peak_progress
+            s = float(_smoothstep(np.array([t]))[0])
+            template_vals[i] = -trough_amp + (peak_amp + trough_amp) * s
+        else:
+            t = (p - peak_progress) / (1.0 - peak_progress)
+            s = float(_smoothstep(np.array([t]))[0])
+            template_vals[i] = peak_amp + (-trough_amp - peak_amp) * s
+    template_df = pd.DataFrame({"progress": grid, "log_deviation": template_vals})
+
+    return cycle_price, deviation_path, cycle_progress, knots, overlay_df, template_df, {
+        "cycle_days": float(FIXED_CYCLE_DAYS),
+        "bull_days": int(FIXED_BULL_DAYS),
+        "bear_days": int(FIXED_BEAR_DAYS),
+        "peak_progress": float(peak_progress),
+        "complete_cycles": int(complete_cycles),
+        "turning_points": anchors.copy(),
+        "next_modeled_trough": NEXT_TROUGH.date().isoformat(),
     }
-    return overlays, template_df, diagnostics
+
 
 def fit_price_model(prices, training_start, training_end, projection_years):
     data = prices.sort_values("date").copy()
+    training_start = pd.Timestamp(training_start)
+    training_end = pd.Timestamp(training_end)
     train = data[(data["date"] >= training_start) & (data["date"] <= training_end)].copy()
     if len(train) < 1000:
         raise ValueError("Select at least 1,000 daily training observations.")
@@ -156,93 +300,38 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         freq="D",
     )
 
-    centerline, trend_diag = _fit_centerline(train, future_dates)
-    hist_center = centerline[:len(train)]
-    residual = np.log(train["price_usd"].to_numpy() / hist_center)
-
-    overlays, template, cycle_diag = _cycle_template(train, residual)
-    grid = template["progress"].to_numpy()
-    centered_shape = template["log_deviation"].to_numpy()
-    template_log_mean = float(cycle_diag.get("template_log_mean", 0.0))
-    raw_shape = centered_shape + template_log_mean
-    tp = cycle_diag["turning_points"]
-
-    troughs = tp[tp["type"] == "trough"] if not tp.empty else pd.DataFrame()
-    if not troughs.empty:
-        last_trough_idx = int(troughs.iloc[-1]["idx"])
-        days_since_trough = (training_end - train["date"].iloc[last_trough_idx]).days
-    else:
-        days_since_trough = 0
-
-    cycle_days = max(cycle_diag["cycle_days"], 365.0)
-    hist_progress = ((np.arange(len(train)) - (len(train)-1-days_since_trough)) / cycle_days) % 1.0
-    future_steps = np.arange(1, len(future_dates) + 1)
-    future_progress = ((days_since_trough + future_steps) / cycle_days) % 1.0
-
-    raw_hist_shape = np.interp(hist_progress, grid, raw_shape)
-    raw_future_shape = np.interp(future_progress, grid, raw_shape)
-    hist_shape = np.interp(hist_progress, grid, centered_shape)
-    future_shape = np.interp(future_progress, grid, centered_shape)
-
-    valid = np.abs(raw_hist_shape) > 0.05
-    amplitude_scale = float(np.median(np.abs(residual[valid] / raw_hist_shape[valid]))) if valid.any() else 1.0
-    amplitude_scale = float(np.clip(amplitude_scale, 0.4, 2.5))
-
-    amplitudes = np.abs(tp["value"].to_numpy()) if not tp.empty else np.array([1.0])
-    if len(amplitudes) >= 4:
-        slope = np.polyfit(np.arange(len(amplitudes)), np.log(np.maximum(amplitudes, 1e-6)), 1)[0]
-        retain_per_cycle = float(np.exp(min(slope, 0.0)))
-    else:
-        retain_per_cycle = 0.85
-
-    future_amp = amplitude_scale * np.power(retain_per_cycle, future_steps / cycle_days)
-
-    # Reparameterize without changing fitted/projected prices:
-    # raw_center * exp(raw_shape * amplitude)
-    # == centered_center * exp(centered_shape * amplitude).
-    # This makes structural_centerline_usd the true geometric center of the
-    # oscillation rather than the underlying regression baseline.
-    centered_hist_center = hist_center * np.exp(template_log_mean * amplitude_scale)
-    raw_future_center = centerline[len(train):]
-    centered_future_center = raw_future_center * np.exp(template_log_mean * future_amp)
-    centered_centerline = np.concatenate([centered_hist_center, centered_future_center])
-
-    fitted_hist = centered_hist_center * np.exp(hist_shape * amplitude_scale)
-    projected = centered_future_center * np.exp(future_shape * future_amp)
-
-    # Boundary calibration: use ONE multiplicative price-level adjustment for
-    # every model series. This preserves all log-space geometry and returns,
-    # while forcing the historical fitted path to terminate at the latest
-    # observed Bitcoin price. The future projection therefore continues from
-    # the same boundary and the structural centerline remains one uninterrupted
-    # series across history and projection.
-    latest_actual_price = float(train["price_usd"].iloc[-1])
-    raw_endpoint_fit = float(fitted_hist[-1])
-    if latest_actual_price <= 0 or raw_endpoint_fit <= 0:
-        raise ValueError("Latest actual and fitted endpoint prices must be positive.")
-    endpoint_scale_factor = latest_actual_price / raw_endpoint_fit
-
-    centered_centerline = centered_centerline * endpoint_scale_factor
-    fitted_hist = fitted_hist * endpoint_scale_factor
-    projected = projected * endpoint_scale_factor
-
+    structural_centerline, trend_diag = _fit_centerline(train, future_dates)
     all_dates = pd.DatetimeIndex(train["date"].tolist() + future_dates.tolist())
+
+    fitted_or_projected, deviation_path, cycle_progress, knots, overlays, template, cycle_diag = _build_cycle_fit(
+        data=data,
+        train=train,
+        all_dates=all_dates,
+        structural_centerline=structural_centerline,
+        training_start=training_start,
+        training_end=training_end,
+    )
+
+    latest_actual_price = float(train["price_usd"].iloc[-1])
+    fitted_endpoint = float(fitted_or_projected[len(train) - 1])
+    endpoint_error = fitted_endpoint / latest_actual_price - 1.0
+
     daily = pd.DataFrame({
         "date": all_dates,
         "row_type": ["historical_training"] * len(train) + ["projected"] * len(future_dates),
         "actual_price_usd": list(train["price_usd"]) + [np.nan] * len(future_dates),
         "included_in_training": [True] * len(train) + [False] * len(future_dates),
-        "structural_centerline_usd": centered_centerline,
-        "cycle_progress": np.concatenate([hist_progress, future_progress]),
-        "cycle_shape_value": np.concatenate([hist_shape, future_shape]),
-        "cycle_amplitude": np.concatenate([np.full(len(train), amplitude_scale), future_amp]),
-        "fitted_or_projected_price_usd": np.concatenate([fitted_hist, projected]),
-        "model_version": "price-model-v2.1.0",
+        "structural_centerline_usd": structural_centerline,
+        "cycle_progress": cycle_progress,
+        "cycle_shape_value": deviation_path,
+        "cycle_amplitude": np.abs(deviation_path),
+        "fitted_or_projected_price_usd": fitted_or_projected,
+        "model_version": "price-model-v2.2-fixed-1428-cycle",
         "training_start_date": training_start.date().isoformat(),
         "training_end_date": training_end.date().isoformat(),
     })
     daily["cycle_phase"] = np.where(
-        daily["cycle_progress"] <= cycle_diag["peak_progress"], "rising", "falling"
+        daily["cycle_progress"] <= cycle_diag["peak_progress"], "bull", "bear"
     )
 
     diagnostics = {
@@ -251,15 +340,15 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "training_start": training_start.date().isoformat(),
         "training_end": training_end.date().isoformat(),
         "projection_years": projection_years,
-        "amplitude_scale": amplitude_scale,
-        "amplitude_retained_per_cycle": retain_per_cycle,
-        "template_log_mean": template_log_mean,
-        "endpoint_scale_factor": endpoint_scale_factor,
+        "amplitude_scale": 1.0,
+        "amplitude_retained_per_cycle": np.nan,
+        "template_log_mean": 0.0,
+        "endpoint_scale_factor": 1.0,
         "latest_actual_price": latest_actual_price,
-        "fitted_endpoint_price": float(fitted_hist[-1]),
-        "fitted_endpoint_error_pct": float(fitted_hist[-1] / latest_actual_price - 1.0),
-        **{k: v for k, v in cycle_diag.items() if k != "turning_points"},
-        "turning_points": tp,
+        "fitted_endpoint_price": fitted_endpoint,
+        "fitted_endpoint_error_pct": float(endpoint_error),
+        "cycle_anchor_table": knots,
+        **cycle_diag,
     }
     return PriceModelResult(daily, diagnostics, overlays, template)
 
@@ -328,5 +417,4 @@ def find_most_conservative_training_start(
         ["implied_cagr", "projected_ending_price_usd", "training_start"],
         ascending=[True, True, False],
     ).reset_index(drop=True)
-
     return results.iloc[0].to_dict(), results
