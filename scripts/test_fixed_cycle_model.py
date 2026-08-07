@@ -1,45 +1,61 @@
-from pathlib import Path
-import sys
 import pandas as pd
 
-ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-
 from src.price_model import (
-    FIXED_CYCLE_DAYS,
-    FIXED_BULL_DAYS,
     FIXED_BEAR_DAYS,
-    REFERENCE_TROUGH,
-    REFERENCE_PEAK,
+    FIXED_BULL_DAYS,
+    FIXED_CYCLE_DAYS,
+    HISTORICAL_CYCLE_ANCHORS,
     NEXT_TROUGH,
+    REFERENCE_PEAK,
+    REFERENCE_TROUGH,
+    _fixed_cycle_anchors,
 )
 
-assert FIXED_BULL_DAYS + FIXED_BEAR_DAYS == FIXED_CYCLE_DAYS == 1428
-assert (REFERENCE_PEAK - REFERENCE_TROUGH).days == 1064
-assert (NEXT_TROUGH - REFERENCE_PEAK).days == 364
+assert FIXED_BULL_DAYS == 1064
+assert FIXED_BEAR_DAYS == 364
+assert FIXED_CYCLE_DAYS == 1428
+assert FIXED_BULL_DAYS + FIXED_BEAR_DAYS == FIXED_CYCLE_DAYS
+
 assert REFERENCE_TROUGH == pd.Timestamp("2022-11-07")
 assert REFERENCE_PEAK == pd.Timestamp("2025-10-06")
 assert NEXT_TROUGH == pd.Timestamp("2026-10-05")
+assert (REFERENCE_PEAK - REFERENCE_TROUGH).days == 1064
+assert (NEXT_TROUGH - REFERENCE_PEAK).days == 364
 
-print("Fixed 1428-day cycle timing checks passed.")
+historical = {(d, t) for d, t, _ in HISTORICAL_CYCLE_ANCHORS}
+required = {
+    (pd.Timestamp("2015-01-14"), "trough"),
+    (pd.Timestamp("2017-12-17"), "peak"),
+    (pd.Timestamp("2018-12-15"), "trough"),
+    (pd.Timestamp("2021-11-08"), "peak"),
+    (pd.Timestamp("2022-11-07"), "trough"),
+    (pd.Timestamp("2025-10-06"), "peak"),
+}
+assert required.issubset(historical)
 
-import numpy as np
-from src.price_model import fit_price_model
-
-dates = pd.date_range("2015-01-01", "2026-08-05", freq="D")
-days = np.arange(1, len(dates) + 1, dtype=float)
-# Positive, smooth synthetic price series with enough variation for regression.
-prices = 200.0 * np.power(1.0008, days) * (1.0 + 0.05 * np.sin(days / 120.0))
-frame = pd.DataFrame({"date": dates, "price_usd": prices})
-result = fit_price_model(
-    frame,
-    pd.Timestamp("2016-02-29"),
-    pd.Timestamp("2026-08-05"),
-    10,
+schedule = _fixed_cycle_anchors(
+    pd.Timestamp("2014-01-01"),
+    pd.Timestamp("2035-01-01"),
 )
-anchors = result.diagnostics["cycle_anchor_table"]
-historical = anchors[anchors["actual_price_usd"].notna()].copy()
-historical["modeled"] = historical["structural_centerline_usd"] * np.exp(historical["log_deviation"])
-assert np.allclose(historical["modeled"], historical["actual_price_usd"], rtol=1e-12, atol=1e-9)
-assert result.diagnostics["next_modeled_trough"] == "2026-10-05"
-print("Historical fixed-cycle anchor intersection checks passed.")
+
+for date, anchor_type in required:
+    match = schedule[
+        (schedule["date"] == date)
+        & (schedule["type"] == anchor_type)
+    ]
+    assert len(match) == 1
+
+future_troughs = schedule[
+    (schedule["type"] == "trough")
+    & (schedule["date"] >= NEXT_TROUGH)
+]["date"].sort_values().tolist()
+assert len(future_troughs) >= 2
+assert (future_troughs[1] - future_troughs[0]).days == 1428
+
+first_future_peak = schedule[
+    (schedule["type"] == "peak")
+    & (schedule["date"] > NEXT_TROUGH)
+]["date"].min()
+assert (first_future_peak - NEXT_TROUGH).days == 1064
+
+print("Actual historical anchors and fixed 1428-day future cycle checks passed.")

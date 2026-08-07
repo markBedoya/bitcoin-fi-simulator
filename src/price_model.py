@@ -10,6 +10,19 @@ REFERENCE_TROUGH = pd.Timestamp("2022-11-07")
 REFERENCE_PEAK = pd.Timestamp("2025-10-06")
 NEXT_TROUGH = pd.Timestamp("2026-10-05")
 
+# Historical turning points are actual market dates used as price-intersection
+# anchors when they fall inside the selected training range. Older cycles were
+# close to, but not exactly, 1428 days. The future schedule is fixed at
+# 1064 bull days + 364 bear days.
+HISTORICAL_CYCLE_ANCHORS = [
+    (pd.Timestamp("2015-01-14"), "trough", -2),
+    (pd.Timestamp("2017-12-17"), "peak", -2),
+    (pd.Timestamp("2018-12-15"), "trough", -1),
+    (pd.Timestamp("2021-11-08"), "peak", -1),
+    (pd.Timestamp("2022-11-07"), "trough", 0),
+    (pd.Timestamp("2025-10-06"), "peak", 0),
+]
+
 
 @dataclass
 class PriceModelResult:
@@ -66,24 +79,38 @@ def _fit_centerline(train: pd.DataFrame, future_dates: pd.DatetimeIndex):
 
 
 def _fixed_cycle_anchors(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    """Return the deterministic 1428-day trough/peak schedule covering a date range."""
-    rows = []
+    """
+    Return historical actual turning-point dates plus the deterministic future
+    1428-day schedule.
 
-    # Trough anchored at 2022-11-07. Each cycle is 1064 bull days + 364 bear days.
-    k_min = int(np.floor((start - REFERENCE_TROUGH).days / FIXED_CYCLE_DAYS)) - 2
-    k_max = int(np.ceil((end - REFERENCE_TROUGH).days / FIXED_CYCLE_DAYS)) + 2
-    for k in range(k_min, k_max + 1):
-        trough = REFERENCE_TROUGH + pd.Timedelta(days=k * FIXED_CYCLE_DAYS)
+    Historical anchors intentionally use observed market dates. Future cycles
+    begin with the 2026-10-05 trough and use exactly 1064 bull days followed by
+    364 bear days.
+    """
+    rows = [
+        {"date": date, "type": anchor_type, "cycle": cycle}
+        for date, anchor_type, cycle in HISTORICAL_CYCLE_ANCHORS
+    ]
+
+    cycle = 1
+    trough = NEXT_TROUGH
+    while trough <= end + pd.Timedelta(days=FIXED_CYCLE_DAYS):
         peak = trough + pd.Timedelta(days=FIXED_BULL_DAYS)
-        rows.append({"date": trough, "type": "trough", "cycle": k})
-        rows.append({"date": peak, "type": "peak", "cycle": k})
+        rows.append({"date": trough, "type": "trough", "cycle": cycle})
+        rows.append({"date": peak, "type": "peak", "cycle": cycle})
+        trough = trough + pd.Timedelta(days=FIXED_CYCLE_DAYS)
+        cycle += 1
 
-    return (
+    schedule = (
         pd.DataFrame(rows)
         .drop_duplicates(subset=["date", "type"])
         .sort_values("date")
         .reset_index(drop=True)
     )
+    return schedule[
+        (schedule["date"] >= start - pd.Timedelta(days=FIXED_CYCLE_DAYS))
+        & (schedule["date"] <= end + pd.Timedelta(days=FIXED_CYCLE_DAYS))
+    ].reset_index(drop=True)
 
 
 def _smoothstep(x: np.ndarray) -> np.ndarray:
@@ -240,16 +267,33 @@ def _build_cycle_fit(
     overlays = []
     grid = np.linspace(0, 1, 301)
     complete_cycles = 0
-    for trough in schedule[schedule["type"] == "trough"].itertuples(index=False):
-        next_trough = trough.date + pd.Timedelta(days=FIXED_CYCLE_DAYS)
-        if trough.date < training_start or next_trough > training_end:
+    historical_troughs = (
+        schedule[
+            (schedule["type"] == "trough")
+            & (schedule["date"] <= training_end)
+        ]["date"]
+        .sort_values()
+        .tolist()
+    )
+    for trough_date, next_trough in zip(historical_troughs[:-1], historical_troughs[1:]):
+        if trough_date < training_start or next_trough > training_end:
             continue
-        seg = train[(train["date"] >= trough.date) & (train["date"] <= next_trough)].copy()
-        if len(seg) < 1000:
+        seg = train[
+            (train["date"] >= trough_date)
+            & (train["date"] <= next_trough)
+        ].copy()
+        if len(seg) < 900:
             continue
-        centers = center_series.reindex(pd.DatetimeIndex(seg["date"])).to_numpy(dtype=float)
-        residual = np.log(seg["price_usd"].to_numpy(dtype=float) / centers)
-        progress = ((seg["date"] - trough.date).dt.days / FIXED_CYCLE_DAYS).to_numpy(dtype=float)
+        centers = center_series.reindex(
+            pd.DatetimeIndex(seg["date"])
+        ).to_numpy(dtype=float)
+        residual = np.log(
+            seg["price_usd"].to_numpy(dtype=float) / centers
+        )
+        cycle_days_actual = max((next_trough - trough_date).days, 1)
+        progress = (
+            (seg["date"] - trough_date).dt.days / cycle_days_actual
+        ).to_numpy(dtype=float)
         interp = np.interp(grid, progress, residual)
         complete_cycles += 1
         overlays.append(pd.DataFrame({
@@ -326,7 +370,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "cycle_shape_value": deviation_path,
         "cycle_amplitude": np.abs(deviation_path),
         "fitted_or_projected_price_usd": fitted_or_projected,
-        "model_version": "price-model-v2.2-fixed-1428-cycle",
+        "model_version": "price-model-v2.3-actual-anchors-fixed-future-cycle",
         "training_start_date": training_start.date().isoformat(),
         "training_end_date": training_end.date().isoformat(),
     })

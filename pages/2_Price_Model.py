@@ -8,10 +8,11 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v2.2 — Fixed 1428-Day Cycle")
+st.title("Price Model v2.3 — Actual Anchors + Fixed 1428-Day Future Cycle")
 st.caption(
-    "All Bitcoin price history remains visible. The selected training range controls only the model fit. "
-    "Cycle timing is fixed at 1428 days: 1064 bull days and 364 bear days."
+    "All Bitcoin price history is always visible. The selected range controls only model fitting. "
+    "Historical fitted-cycle anchors use observed market turning points; future timing is fixed at "
+    "1428 days: 1064 bull days + 364 bear days."
 )
 
 try:
@@ -75,12 +76,22 @@ def run_conservative_search(minimum_years: int):
 if "pending_training_range" in st.session_state:
     st.session_state.price_model_training_range = st.session_state.pop("pending_training_range")
 
-default_training_start = max(min_date, pd.Timestamp("2018-12-31").date())
+PRICE_MODEL_DEFAULTS_VERSION = "v2.3-all-data-10y"
+
+# Reset once after this release so existing Streamlit sessions receive the new
+# defaults as well as new sessions.
+if st.session_state.get("price_model_defaults_version") != PRICE_MODEL_DEFAULTS_VERSION:
+    st.session_state.price_model_training_range = (min_date, max_date)
+    st.session_state.price_model_projection_years = 10
+    st.session_state.price_model_defaults_version = PRICE_MODEL_DEFAULTS_VERSION
+    st.session_state.pop("conservative_search_summary", None)
+    st.session_state.pop("conservative_search_leaderboard", None)
+    st.session_state.pop("leaderboard_selected_row", None)
 
 if "price_model_training_range" not in st.session_state:
-    st.session_state.price_model_training_range = (default_training_start, max_date)
+    st.session_state.price_model_training_range = (min_date, max_date)
 if "price_model_projection_years" not in st.session_state:
-    st.session_state.price_model_projection_years = 80
+    st.session_state.price_model_projection_years = 10
 
 with st.sidebar:
     st.header("Usable data")
@@ -340,6 +351,30 @@ fig.add_trace(go.Scatter(
     mode="lines",
     name="Historical fitted path",
 ))
+
+historical_anchor_plot = diag.get("turning_points")
+if historical_anchor_plot is not None and not historical_anchor_plot.empty:
+    historical_anchor_plot = historical_anchor_plot.copy()
+    historical_anchor_plot = historical_anchor_plot[
+        historical_anchor_plot["actual_price_usd"].notna()
+    ]
+    if not historical_anchor_plot.empty:
+        fig.add_trace(go.Scatter(
+            x=historical_anchor_plot["date"],
+            y=historical_anchor_plot["actual_price_usd"],
+            mode="markers",
+            name="Historical cycle intersections",
+            marker={
+                "size": 10,
+                "color": REFERENCE_LINE_COLOR,
+                "symbol": "circle-open",
+                "line": {"width": 2, "color": REFERENCE_LINE_COLOR},
+            },
+            hovertemplate=(
+                "%{x|%Y-%m-%d}<br>"
+                "Anchor price: $%{y:,.0f}<extra></extra>"
+            ),
+        ))
 fig.add_trace(go.Scatter(
     x=cycle_projection_plot["date"],
     y=cycle_projection_plot["btc_cycle_price"],
@@ -410,6 +445,10 @@ m4.metric("Terminal exponent", f'{diag["terminal_exponent"]:.3f}')
 m5.metric("Next modeled trough", diag.get("next_modeled_trough", "2026-10-05"))
 
 st.subheader("Cycle anchor verification")
+st.caption(
+    "Historical anchors inside the selected training range are actual Bitcoin turning-point dates. "
+    "The fitted path is constrained to intersect the observed Bitcoin price at every listed historical anchor."
+)
 anchor_table = diag.get("cycle_anchor_table")
 if anchor_table is not None and not anchor_table.empty:
     anchor_display = anchor_table.copy()
