@@ -525,6 +525,7 @@ st.subheader("Normalized historical cycle overlays")
 if result.cycle_overlays.empty:
     st.warning("The selected training range does not contain enough complete trough-to-trough cycles.")
 else:
+    st.subheader("Learned historical cycle shape")
     cycle_fig = go.Figure()
     for cycle_no, grp in result.cycle_overlays.groupby("cycle"):
         cycle_fig.add_trace(go.Scatter(x=grp["progress"]*100, y=grp["log_deviation"], mode="lines", name=f"Cycle {cycle_no}", opacity=0.45))
@@ -533,15 +534,35 @@ else:
     st.plotly_chart(cycle_fig, use_container_width=True, config={"displaylogo": False})
 
 st.subheader("Actual price relative to structural centerline")
+st.caption(
+    "A value of 1.0 means actual Bitcoin price equals the structural centerline."
+)
 ratio_fig = go.Figure()
-ratio_fig.add_trace(go.Scatter(x=hist["date"], y=hist["actual_price_usd"]/hist["structural_centerline_usd"], mode="lines", name="Actual ÷ centerline"))
-ratio_fig.add_hline(y=1.0, line_dash=REFERENCE_LINE_DASH),
-line_color=REFERENCE_LINE_COLOR,
-line_width=REFERENCE_LINE_WIDTH,
-line_color=REFERENCE_LINE_COLOR,
-line_width=REFERENCE_LINE_WIDTH,
-ratio_fig.update_layout(xaxis_title="Date", yaxis_title="Price / centerline", height=400)
-st.plotly_chart(ratio_fig, use_container_width=True, config={"displaylogo": False})
+ratio_fig.add_trace(go.Scatter(
+    x=hist["date"],
+    y=hist["actual_price_usd"] / hist["structural_centerline_usd"],
+    mode="lines",
+    name="Actual ÷ centerline",
+))
+ratio_fig.add_hline(
+    y=1.0,
+    line_dash=REFERENCE_LINE_DASH,
+    line_color=REFERENCE_LINE_COLOR,
+    line_width=REFERENCE_LINE_WIDTH,
+    annotation_text="Centerline = 1.0",
+    annotation_position="top right",
+)
+ratio_fig.update_layout(
+    xaxis_title="Date",
+    yaxis_title="Price / centerline",
+    height=400,
+)
+st.plotly_chart(
+    ratio_fig,
+    use_container_width=True,
+    config={"displaylogo": False},
+    key="price_model_actual_vs_centerline",
+)
 
 st.download_button(
     "Download complete historical + future daily CSV",
