@@ -8,7 +8,7 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v2.7 — Conditioned Partial Cycle + Empirical Shape")
+st.title("Price Model v2.8 — Empirical Shape + Decaying Cycle Amplitudes")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
@@ -25,6 +25,12 @@ except Exception as exc:
 
 min_date = prices["date"].min().date()
 max_date = prices["date"].max().date()
+
+# Exact endpoint scores are reusable across the 4/5/6/7/8-year minimum searches.
+# The cache key includes the data endpoint, horizon, model version, and candidate
+# start, so reuse never changes ranking accuracy.
+if "conservative_candidate_score_cache" not in st.session_state:
+    st.session_state.conservative_candidate_score_cache = {}
 
 
 def run_conservative_search(minimum_years: int):
@@ -48,6 +54,7 @@ def run_conservative_search(minimum_years: int):
             projection_years=projection_years,
             minimum_training_years=minimum_years,
             progress_callback=update_progress,
+            score_cache=st.session_state.conservative_candidate_score_cache,
         )
         best_start = pd.Timestamp(best["training_start"]).date()
         st.session_state.price_model_training_range = (
@@ -142,6 +149,13 @@ with st.sidebar:
         use_container_width=True,
     ):
         run_conservative_search(7)
+
+    st.caption(
+        "Conservative-start searches use an exact endpoint-only scorer instead of "
+        "building the full future daily chart for every monthly candidate. Results "
+        "are mathematically identical at the selected horizon, and candidate scores "
+        "are reused across the 4–8 year minimum searches."
+    )
 
 
     selected = st.slider(
@@ -481,13 +495,70 @@ m4.metric("Terminal exponent", f'{diag["terminal_exponent"]:.3f}')
 m5.metric("Next modeled trough", diag.get("next_modeled_trough", "2026-10-05"))
 
 st.caption(
-    "Future-cycle centering: **PASS** — each projected peak uses +A and its paired "
-    "trough uses -A in log-price space around the same structural centerline. "
+    "Future-cycle amplitude: peaks and troughs now use **separate data-fitted decay rates**. "
+    "The live Oct-2026 trough conditions downside amplitude only; it no longer forces an "
+    "equally large 2029 upside move. The structural centerline remains between positive "
+    "peak deviations and negative trough deviations. "
     f"Bull shape: {diag.get('bull_curve', 'empirical')}. "
-    f"Bear shape: {diag.get('bear_curve', 'empirical')}. "
-    "The learned phase shape now controls the **entire trough-to-peak / peak-to-trough "
-    "log-price move**, rather than only the residual around the rising centerline."
+    f"Bear shape: {diag.get('bear_curve', 'empirical')}."
 )
+
+peak_decay = diag.get("peak_amplitude_decay", {})
+trough_decay = diag.get("trough_amplitude_decay", {})
+if peak_decay or trough_decay:
+    st.subheader("Cycle amplitude decay")
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric(
+        "Historical peaks used",
+        int(peak_decay.get("observations", 0)),
+    )
+    a2.metric(
+        "Peak amplitude retained / cycle",
+        f"{float(peak_decay.get('retention_per_cycle', float('nan'))):.1%}",
+        help="Robust data-fitted retention of peak log-deviation from the structural centerline from one cycle to the next.",
+    )
+    a3.metric(
+        "Historical troughs used",
+        int(trough_decay.get("observations", 0)),
+    )
+    a4.metric(
+        "Trough amplitude retained / cycle",
+        f"{float(trough_decay.get('retention_per_cycle', float('nan'))):.1%}",
+        help="Robust data-fitted retention of trough log-deviation from the structural centerline from one cycle to the next.",
+    )
+
+    amplitude_knots = diag.get("cycle_anchor_table")
+    if amplitude_knots is not None and not amplitude_knots.empty:
+        amplitude_view = amplitude_knots[
+            amplitude_knots["type"].isin(["peak", "trough"])
+        ].copy()
+        if not amplitude_view.empty:
+            amplitude_view["Deviation vs centerline"] = np.where(
+                amplitude_view["type"] == "peak",
+                np.exp(amplitude_view["log_deviation"]) - 1.0,
+                1.0 - np.exp(amplitude_view["log_deviation"]),
+            )
+            amplitude_view["Observed / projected"] = np.where(
+                amplitude_view["actual_price_usd"].notna(),
+                "Observed",
+                "Projected",
+            )
+            st.dataframe(
+                amplitude_view[[
+                    "date",
+                    "type",
+                    "Observed / projected",
+                    "knot_price_usd",
+                    "structural_centerline_usd",
+                    "Deviation vs centerline",
+                ]].style.format({
+                    "knot_price_usd": "${:,.0f}",
+                    "structural_centerline_usd": "${:,.0f}",
+                    "Deviation vs centerline": "{:.1%}",
+                }),
+                hide_index=True,
+                use_container_width=True,
+            )
 
 current_partial_phase = diag.get("current_partial_phase")
 if current_partial_phase:
@@ -684,7 +755,9 @@ st.caption(
     "0% to 100% of its actual historical log-price move. The individual paths are shown below; the "
     "bold learned template is their smoothed median. Future phases apply this shape "
     "directly to the full log-price move between projected trough and peak prices, "
-    "while keeping the fixed 1064/364-day timing."
+    "while keeping the fixed 1064/364-day timing. Historical fitted segments are "
+    "now smoothed from their **own observed phase shape**, so an older bull market "
+    "is not forced to look like the median of later bull markets."
 )
 
 bull_shape_diag = diag.get("bull_shape_diagnostics", {})
