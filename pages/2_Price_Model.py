@@ -8,12 +8,13 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v2.6 — Empirical Total-Price Cycle Shape")
+st.title("Price Model v2.7 — Conditioned Partial Cycle + Empirical Shape")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
-    "(1064 bull + 364 bear). The shape inside each phase is learned from completed historical "
-    "bull and bear phases instead of being hand-tuned."
+    "(1064 bull + 364 bear). The phase shape is learned from completed historical total-price "
+    "moves. When the latest date is inside an unfinished cycle phase, the projection continues "
+    "from that exact phase progress instead of restarting the phase."
 )
 
 try:
@@ -382,6 +383,34 @@ if (
                 "Anchor price: $%{y:,.0f}<extra></extra>"
             ),
         ))
+projected_anchor_plot = diag.get("cycle_anchor_table")
+if projected_anchor_plot is not None and not projected_anchor_plot.empty:
+    projected_anchor_plot = projected_anchor_plot.copy()
+    projected_anchor_plot = projected_anchor_plot[
+        projected_anchor_plot["source"].astype(str).str.contains("projected", case=False, na=False)
+        | projected_anchor_plot["source"].astype(str).str.contains("conditioned", case=False, na=False)
+    ]
+    projected_anchor_plot = projected_anchor_plot[
+        pd.to_datetime(projected_anchor_plot["date"]) >= training_end
+    ]
+    if not projected_anchor_plot.empty:
+        fig.add_trace(go.Scatter(
+            x=projected_anchor_plot["date"],
+            y=projected_anchor_plot["knot_price_usd"],
+            mode="markers",
+            name="Projected cycle turning points",
+            marker={
+                "size": 9,
+                "color": REFERENCE_LINE_COLOR,
+                "symbol": "diamond-open",
+                "line": {"width": 2, "color": REFERENCE_LINE_COLOR},
+            },
+            hovertemplate=(
+                "%{x|%Y-%m-%d}<br>"
+                "Projected turning point: $%{y:,.0f}<extra></extra>"
+            ),
+        ))
+
 fig.add_trace(go.Scatter(
     x=cycle_projection_plot["date"],
     y=cycle_projection_plot["btc_cycle_price"],
@@ -459,6 +488,48 @@ st.caption(
     "The learned phase shape now controls the **entire trough-to-peak / peak-to-trough "
     "log-price move**, rather than only the residual around the rising centerline."
 )
+
+current_partial_phase = diag.get("current_partial_phase")
+if current_partial_phase:
+    st.subheader("Current partial-cycle verification")
+    pc1, pc2, pc3, pc4, pc5 = st.columns(5)
+    pc1.metric("Current phase", str(current_partial_phase.get("phase", "—")).title())
+    pc2.metric(
+        "Phase elapsed",
+        f"{float(current_partial_phase.get('current_progress', 0.0)) * 100:.1f}%",
+    )
+    pc3.metric(
+        "Learned decline completed",
+        f"{float(current_partial_phase.get('learned_completion', 0.0)) * 100:.1f}%",
+    )
+    pc4.metric(
+        "Oct 5, 2026 trough",
+        f"${float(current_partial_phase.get('projected_trough_price_usd', float('nan'))):,.0f}",
+    )
+    pc5.metric(
+        "Remaining modeled move",
+        f"{float(current_partial_phase.get('remaining_change_pct', float('nan'))):+.1%}",
+    )
+    partial_declines = (
+        float(current_partial_phase.get("projected_trough_price_usd", float("nan")))
+        <= float(current_partial_phase.get("current_price_usd", float("nan")))
+    )
+    if partial_declines:
+        st.success(
+            "Partial bear continuation: PASS — the projection starts at the latest actual "
+            "Bitcoin price, enters the learned bear template at the current phase progress, "
+            "and continues downward to the Oct 5, 2026 modeled trough before the next bull phase begins."
+        )
+    else:
+        st.error(
+            "Partial bear continuation: FAIL — the modeled Oct 5, 2026 trough is above the "
+            "latest actual Bitcoin price. Review the partial-phase fit before using this projection."
+        )
+    st.caption(
+        f"Partial-bear fit uses {int(current_partial_phase.get('observations', 0)):,} daily observations "
+        f"from the Oct 6, 2025 peak through the selected training end. Log-price fit RMSE: "
+        f"{float(current_partial_phase.get('fit_rmse_log', float('nan'))):.4f}."
+    )
 
 st.subheader("Cycle anchor verification")
 st.caption(
@@ -610,7 +681,7 @@ if rows:
 st.subheader("Empirical phase-shape learning")
 st.caption(
     "Each completed bull and bear phase is normalized from 0% to 100% in time and "
-    "0% to 100% of its historical move. The individual paths are shown below; the "
+    "0% to 100% of its actual historical log-price move. The individual paths are shown below; the "
     "bold learned template is their smoothed median. Future phases apply this shape "
     "directly to the full log-price move between projected trough and peak prices, "
     "while keeping the fixed 1064/364-day timing."

@@ -289,9 +289,11 @@ def _learn_empirical_phase_templates(
 ):
     """Learn bull and bear timing shapes from completed historical phases.
 
-    Each phase is normalized in time (0..1) and in log deviation from the
-    structural centerline (0..1 move from the phase's starting anchor to its
-    ending anchor). Noise/corrections are handled with an isotonic fit, then the
+    Each completed historical phase is normalized in time (0..1) and by its
+    *total log-price move* from the actual starting turning point to the actual
+    ending turning point. This makes the learned template describe the visible
+    Bitcoin price trajectory itself rather than a residual around the structural
+    centerline. Noise/corrections are handled with an isotonic fit, then the
     completed phases are median-combined and shape-preserving cubic interpolation
     is used when projecting future paths.
     """
@@ -319,21 +321,23 @@ def _learn_empirical_phase_templates(
         if len(seg) < 180:
             continue
 
-        seg_dates = pd.DatetimeIndex(seg["date"])
-        centers = center_series.reindex(seg_dates).to_numpy(dtype=float)
-        if np.isnan(centers).any():
-            continue
-        residual = np.log(seg["price_usd"].to_numpy(dtype=float) / centers)
-        start_dev = float(residual[0])
-        end_dev = float(residual[-1])
+        log_price = np.log(seg["price_usd"].to_numpy(dtype=float))
+        start_log_price = float(log_price[0])
+        end_log_price = float(log_price[-1])
         phase = "bull" if start_type == "trough" else "bear"
 
         if phase == "bull":
-            denom = end_dev - start_dev
-            normalized = (residual - start_dev) / denom if abs(denom) > 1e-9 else None
+            denom = end_log_price - start_log_price
+            normalized = (
+                (log_price - start_log_price) / denom
+                if abs(denom) > 1e-9 else None
+            )
         else:
-            denom = start_dev - end_dev
-            normalized = (start_dev - residual) / denom if abs(denom) > 1e-9 else None
+            denom = start_log_price - end_log_price
+            normalized = (
+                (start_log_price - log_price) / denom
+                if abs(denom) > 1e-9 else None
+            )
         if normalized is None:
             continue
 
@@ -442,6 +446,115 @@ def _estimate_future_cycle_amplitude(history: pd.DataFrame, future_cycle: int) -
 
 def _template_value(grid: np.ndarray, template: np.ndarray, t: float) -> float:
     return _monotone_cubic_eval(grid, template, float(np.clip(t, 0.0, 1.0)))
+
+
+def _fit_current_partial_bear(
+    data: pd.DataFrame,
+    training_end: pd.Timestamp,
+    phase_grid: np.ndarray,
+    bear_template: np.ndarray,
+):
+    """Estimate the Oct-2026 trough from the current partial bear market.
+
+    The current fixed bear phase runs from the observed 2025-10-06 peak to the
+    modeled 2026-10-05 trough. The learned historical bear template determines
+    how much of a full bear decline is normally complete at each phase-progress
+    point. We fit the full log decline to all observed daily prices in the
+    current bear phase, then constrain it so the projected trough cannot sit
+    above a decline already observed. The future path still begins at the exact
+    latest actual price, preserving projection-boundary continuity.
+    """
+    training_end = pd.Timestamp(training_end)
+    if not (REFERENCE_PEAK < training_end < NEXT_TROUGH):
+        return None
+
+    peak_lookup = _lookup_price_near(data, REFERENCE_PEAK)
+    current_lookup = _lookup_price_near(data, training_end, tolerance_days=3)
+    if peak_lookup is None or current_lookup is None:
+        return None
+
+    peak_date, peak_price = peak_lookup
+    current_date, current_price = current_lookup
+    seg = data[(data["date"] >= peak_date) & (data["date"] <= current_date)].copy()
+    if len(seg) < 30:
+        return None
+
+    phase_progress = np.clip(
+        (seg["date"] - REFERENCE_PEAK).dt.days.to_numpy(dtype=float)
+        / FIXED_BEAR_DAYS,
+        0.0,
+        1.0,
+    )
+    shape = np.array([
+        _template_value(phase_grid, bear_template, value)
+        for value in phase_progress
+    ], dtype=float)
+
+    # Smooth only for estimating the eventual trough; the displayed projection
+    # itself always starts from the exact latest actual price.
+    log_prices = np.log(seg["price_usd"].to_numpy(dtype=float))
+    smooth_log_prices = (
+        pd.Series(log_prices)
+        .rolling(14, min_periods=1)
+        .mean()
+        .to_numpy(dtype=float)
+    )
+    observed_decline = np.log(peak_price) - smooth_log_prices
+    weights = np.linspace(0.5, 1.0, len(seg))
+    valid = shape > 1e-4
+    denom = float(np.sum(weights[valid] * shape[valid] ** 2))
+    if denom <= 1e-12:
+        return None
+    fitted_total_decline = float(
+        np.sum(weights[valid] * shape[valid] * observed_decline[valid]) / denom
+    )
+
+    current_progress = float(np.clip(
+        (current_date - REFERENCE_PEAK).days / FIXED_BEAR_DAYS, 0.0, 1.0
+    ))
+    learned_completion = _template_value(phase_grid, bear_template, current_progress)
+
+    # Endpoint-conditioned decline keeps the current observation aligned with
+    # the learned phase progress without using a hand-selected remaining drop.
+    recent = seg.tail(min(14, len(seg)))
+    recent_geometric_price = float(
+        np.exp(np.mean(np.log(recent["price_usd"].to_numpy(dtype=float))))
+    )
+    recent_decline = max(float(np.log(peak_price / recent_geometric_price)), 0.0)
+    endpoint_implied_decline = (
+        recent_decline / learned_completion
+        if learned_completion > 1e-4 else recent_decline
+    )
+
+    # A future trough cannot be above the lowest price already observed during
+    # this bear phase. This is a logical trough constraint, not a tuned percent.
+    minimum_observed_price = float(seg["price_usd"].min())
+    minimum_total_decline = max(float(np.log(peak_price / minimum_observed_price)), 0.0)
+    total_decline = max(
+        fitted_total_decline, endpoint_implied_decline, minimum_total_decline
+    )
+    projected_trough_price = float(peak_price * np.exp(-total_decline))
+
+    fitted_decline_path = total_decline * shape
+    rmse_log = float(np.sqrt(np.average(
+        (observed_decline - fitted_decline_path) ** 2, weights=weights
+    )))
+
+    return {
+        "phase": "bear",
+        "phase_start": REFERENCE_PEAK,
+        "phase_end": NEXT_TROUGH,
+        "current_date": current_date,
+        "current_progress": current_progress,
+        "learned_completion": float(learned_completion),
+        "peak_price_usd": float(peak_price),
+        "current_price_usd": float(current_price),
+        "projected_trough_price_usd": projected_trough_price,
+        "remaining_change_pct": projected_trough_price / current_price - 1.0,
+        "fitted_total_log_decline": float(total_decline),
+        "fit_rmse_log": rmse_log,
+        "observations": int(len(seg)),
+    }
 
 
 def _phase_interpolate(
@@ -580,6 +693,13 @@ def _build_cycle_fit(
         training_end=training_end,
     )
 
+    current_partial_phase = _fit_current_partial_bear(
+        data=data,
+        training_end=training_end,
+        phase_grid=phase_grid,
+        bear_template=bear_template,
+    )
+
     # Historical anchor intersections are only learned from prices inside the selected training range.
     hist_schedule = schedule[
         (schedule["date"] >= training_start) & (schedule["date"] <= training_end)
@@ -653,23 +773,56 @@ def _build_cycle_fit(
 
     history_for_forecast = anchors.copy()
 
-    # Future peak/trough anchors use one symmetric log-amplitude per cycle.
-    # This guarantees peak = centerline * exp(+A) and trough = centerline * exp(-A),
-    # so the centerline cannot drift above or below the projected cycle geometry.
+    # Future peak/trough anchors use one symmetric log-amplitude per complete
+    # future cycle. The current partial 2025-2026 bear phase is handled specially:
+    # its Oct-2026 trough is conditioned on the actual bear-market path observed
+    # so far and the learned historical bear template. The following peak then
+    # uses the same absolute log deviation around the structural centerline.
     future_schedule = schedule[schedule["date"] > training_end].copy()
     future_rows = []
     amplitude_by_cycle = {}
+
+    expected_cycle1_amp = _estimate_future_cycle_amplitude(history_for_forecast, 1)
+    conditioned_cycle1_amp = None
+    if current_partial_phase is not None and NEXT_TROUGH in center_series.index:
+        trough_center = float(center_series.loc[NEXT_TROUGH])
+        trough_price = float(current_partial_phase["projected_trough_price_usd"])
+        conditioned_cycle1_amp = max(
+            abs(float(np.log(trough_price / trough_center))), 0.05
+        )
+        amplitude_by_cycle[1] = conditioned_cycle1_amp
+
     for row in future_schedule.itertuples(index=False):
         if row.date > all_dates.max():
             continue
         cycle_id = int(row.cycle)
-        if cycle_id not in amplitude_by_cycle:
-            amplitude_by_cycle[cycle_id] = _estimate_future_cycle_amplitude(
-                history_for_forecast, cycle_id
-            )
-        amp = amplitude_by_cycle[cycle_id]
-        dev = amp if row.type == "peak" else -amp
         center = float(center_series.loc[row.date]) if row.date in center_series.index else np.nan
+
+        if (
+            current_partial_phase is not None
+            and row.date == NEXT_TROUGH
+            and row.type == "trough"
+        ):
+            knot_price = float(current_partial_phase["projected_trough_price_usd"])
+            dev = float(np.log(knot_price / center))
+            amplitude_by_cycle[cycle_id] = abs(dev)
+            source = "current bear-conditioned projected trough"
+        else:
+            if cycle_id not in amplitude_by_cycle:
+                expected_amp = _estimate_future_cycle_amplitude(
+                    history_for_forecast, cycle_id
+                )
+                if conditioned_cycle1_amp is not None and expected_cycle1_amp > 1e-9:
+                    # Preserve the empirically estimated amplitude-decay pattern,
+                    # but start it from the trough amplitude implied by the live
+                    # 2025-2026 bear market.
+                    expected_amp *= conditioned_cycle1_amp / expected_cycle1_amp
+                amplitude_by_cycle[cycle_id] = max(float(expected_amp), 0.05)
+            amp = amplitude_by_cycle[cycle_id]
+            dev = amp if row.type == "peak" else -amp
+            knot_price = center * np.exp(dev)
+            source = "projected centered cycle anchor"
+
         future_rows.append({
             "date": row.date,
             "requested_anchor_date": row.date,
@@ -678,8 +831,8 @@ def _build_cycle_fit(
             "actual_price_usd": np.nan,
             "structural_centerline_usd": center,
             "log_deviation": dev,
-            "knot_price_usd": center * np.exp(dev),
-            "source": "projected centered cycle anchor",
+            "knot_price_usd": knot_price,
+            "source": source,
         })
 
     knots = pd.concat(
@@ -780,6 +933,8 @@ def _build_cycle_fit(
         "bear_shape_diagnostics": bear_shape_diag,
         "bull_phases_used": int(phase_overlays.loc[phase_overlays["phase"] == "bull", "phase_id"].nunique()) if not phase_overlays.empty else 0,
         "bear_phases_used": int(phase_overlays.loc[phase_overlays["phase"] == "bear", "phase_id"].nunique()) if not phase_overlays.empty else 0,
+        "phase_shape_basis": "total log-price move",
+        "current_partial_phase": current_partial_phase,
     }
 
 
@@ -823,7 +978,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "cycle_shape_value": deviation_path,
         "cycle_amplitude": np.abs(deviation_path),
         "fitted_or_projected_price_usd": fitted_or_projected,
-        "model_version": "price-model-v2.6-total-price-empirical-shape",
+        "model_version": "price-model-v2.7-conditioned-partial-cycle",
         "training_start_date": training_start.date().isoformat(),
         "training_end_date": training_end.date().isoformat(),
     })

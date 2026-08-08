@@ -28,7 +28,9 @@ assert not diag["phase_shape_templates"].empty
 # Future peak/trough deviations must use the same absolute amplitude within each
 # projected cycle so the structural centerline remains the geometric midpoint.
 anchors = diag["cycle_anchor_table"]
-future = anchors[anchors["source"] == "projected centered cycle anchor"]
+future = anchors[
+    anchors["source"].astype(str).str.contains("projected|conditioned", case=False, regex=True)
+]
 for cycle_id, grp in future.groupby("cycle"):
     peak = grp.loc[grp["type"] == "peak", "log_deviation"]
     trough = grp.loc[grp["type"] == "trough", "log_deviation"]
