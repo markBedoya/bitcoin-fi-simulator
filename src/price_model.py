@@ -513,6 +513,48 @@ def _interp_cycle_knots(
     return out
 
 
+def _interp_cycle_price_knots(
+    dates: pd.DatetimeIndex,
+    knots: pd.DataFrame,
+    phase_grid: np.ndarray,
+    bull_template: np.ndarray,
+    bear_template: np.ndarray,
+) -> np.ndarray:
+    """Interpolate the *total log-price move* between cycle turning points.
+
+    This is intentionally different from interpolating only the residual around
+    the structural centerline. The empirical bull/bear template therefore
+    controls the visible trough-to-peak and peak-to-trough price trajectory.
+    """
+    ords = np.array([pd.Timestamp(d).toordinal() for d in dates], dtype=float)
+    knot_dates = [pd.Timestamp(d) for d in knots["date"]]
+    kd = np.array([d.toordinal() for d in knot_dates], dtype=float)
+    kp = knots["knot_price_usd"].to_numpy(dtype=float)
+    if np.any(~np.isfinite(kp)) or np.any(kp <= 0):
+        raise ValueError("Cycle knot prices must be finite and positive.")
+    log_kp = np.log(kp)
+    kt = knots["type"].astype(str).tolist()
+    out_log = np.empty(len(ords), dtype=float)
+
+    for i, x in enumerate(ords):
+        if x <= kd[0]:
+            out_log[i] = log_kp[0]
+            continue
+        if x >= kd[-1]:
+            out_log[i] = log_kp[-1]
+            continue
+        j = np.searchsorted(kd, x) - 1
+        span = kd[j + 1] - kd[j]
+        t = 0.0 if span <= 0 else (x - kd[j]) / span
+        s = _phase_interpolate(
+            kt[j], kt[j + 1], t,
+            phase_grid, bull_template, bear_template,
+            start_date=knot_dates[j], end_date=knot_dates[j + 1],
+        )
+        out_log[i] = log_kp[j] + (log_kp[j + 1] - log_kp[j]) * s
+    return np.exp(out_log)
+
+
 def _build_cycle_fit(
     data: pd.DataFrame,
     train: pd.DataFrame,
@@ -550,6 +592,7 @@ def _build_cycle_fit(
         "actual_price_usd",
         "structural_centerline_usd",
         "log_deviation",
+        "knot_price_usd",
         "source",
     ]
     anchor_rows = []
@@ -572,6 +615,7 @@ def _build_cycle_fit(
             "actual_price_usd": actual,
             "structural_centerline_usd": center,
             "log_deviation": float(np.log(actual / center)),
+            "knot_price_usd": actual,
             "source": "historical market anchor",
         })
 
@@ -583,6 +627,7 @@ def _build_cycle_fit(
         "actual_price_usd",
         "structural_centerline_usd",
         "log_deviation",
+        "knot_price_usd",
         "source",
     ]
     anchors = pd.DataFrame(anchor_rows, columns=anchor_columns_with_requested)
@@ -602,6 +647,7 @@ def _build_cycle_fit(
             "actual_price_usd": actual,
             "structural_centerline_usd": center,
             "log_deviation": float(np.log(actual / center)),
+            "knot_price_usd": actual,
             "source": "boundary anchor",
         })
 
@@ -632,6 +678,7 @@ def _build_cycle_fit(
             "actual_price_usd": np.nan,
             "structural_centerline_usd": center,
             "log_deviation": dev,
+            "knot_price_usd": center * np.exp(dev),
             "source": "projected centered cycle anchor",
         })
 
@@ -649,10 +696,10 @@ def _build_cycle_fit(
     if len(knots) < 2:
         raise ValueError("Not enough cycle anchors exist for the selected training range.")
 
-    deviation_path = _interp_cycle_knots(
+    cycle_price = _interp_cycle_price_knots(
         all_dates, knots, phase_grid, bull_template, bear_template
     )
-    cycle_price = structural_centerline * np.exp(deviation_path)
+    deviation_path = np.log(cycle_price / structural_centerline)
 
     # Fixed phase: trough=0, peak=1064/1428, next trough=1.
     elapsed = np.array([(d - REFERENCE_TROUGH).days for d in all_dates], dtype=float)
@@ -724,6 +771,7 @@ def _build_cycle_fit(
         "next_modeled_trough": NEXT_TROUGH.date().isoformat(),
         "future_cycle_amplitudes": amplitude_by_cycle,
         "future_cycle_centered": True,
+        "phase_shape_applied_to": "total log-price path",
         "bull_curve": f"empirical median from {int(phase_overlays.loc[phase_overlays['phase'] == 'bull', 'phase_id'].nunique()) if not phase_overlays.empty else 0} completed bull phases",
         "bear_curve": f"empirical median from {int(phase_overlays.loc[phase_overlays['phase'] == 'bear', 'phase_id'].nunique()) if not phase_overlays.empty else 0} completed bear phases",
         "phase_shape_overlays": phase_overlays,
@@ -775,7 +823,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "cycle_shape_value": deviation_path,
         "cycle_amplitude": np.abs(deviation_path),
         "fitted_or_projected_price_usd": fitted_or_projected,
-        "model_version": "price-model-v2.5-empirical-phase-shape",
+        "model_version": "price-model-v2.6-total-price-empirical-shape",
         "training_start_date": training_start.date().isoformat(),
         "training_end_date": training_end.date().isoformat(),
     })

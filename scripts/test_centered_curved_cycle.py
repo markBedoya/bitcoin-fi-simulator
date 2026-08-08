@@ -20,6 +20,7 @@ result = fit_price_model(
 
 diag = result.diagnostics
 assert diag["future_cycle_centered"] is True
+assert diag["phase_shape_applied_to"] == "total log-price path"
 assert diag["bull_phases_used"] >= 2
 assert diag["bear_phases_used"] >= 1
 assert not diag["phase_shape_templates"].empty

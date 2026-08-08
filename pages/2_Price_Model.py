@@ -8,7 +8,7 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v2.5 — Empirical 1428-Day Cycle Shape")
+st.title("Price Model v2.6 — Empirical Total-Price Cycle Shape")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
@@ -456,8 +456,8 @@ st.caption(
     "trough uses -A in log-price space around the same structural centerline. "
     f"Bull shape: {diag.get('bull_curve', 'empirical')}. "
     f"Bear shape: {diag.get('bear_curve', 'empirical')}. "
-    "The phase curves are learned from normalized historical log-price deviations and "
-    "smoothed with monotone, shape-preserving interpolation."
+    "The learned phase shape now controls the **entire trough-to-peak / peak-to-trough "
+    "log-price move**, rather than only the residual around the rising centerline."
 )
 
 st.subheader("Cycle anchor verification")
@@ -610,9 +610,10 @@ if rows:
 st.subheader("Empirical phase-shape learning")
 st.caption(
     "Each completed bull and bear phase is normalized from 0% to 100% in time and "
-    "0% to 100% of its log-deviation move. The individual historical paths are "
-    "shown below; the bold learned template is their smoothed median. Future phases "
-    "use this learned shape while keeping the fixed 1064/364-day timing."
+    "0% to 100% of its historical move. The individual paths are shown below; the "
+    "bold learned template is their smoothed median. Future phases apply this shape "
+    "directly to the full log-price move between projected trough and peak prices, "
+    "while keeping the fixed 1064/364-day timing."
 )
 
 bull_shape_diag = diag.get("bull_shape_diagnostics", {})
