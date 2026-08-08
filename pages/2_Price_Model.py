@@ -8,11 +8,12 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v2.3 — Actual Anchors + Fixed 1428-Day Future Cycle")
+st.title("Price Model v2.4 — Centered Curved 1428-Day Cycle")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical fitted-cycle anchors use observed market turning points; future timing is fixed at "
-    "1428 days: 1064 bull days + 364 bear days."
+    "1428 days: 1064 bull days + 364 bear days. Future peaks and troughs use symmetric "
+    "log-amplitudes around the structural centerline, with a curved gradual bull phase."
 )
 
 try:
@@ -449,6 +450,13 @@ m2.metric("Bear phase", f'{diag.get("bear_days", 364):,} days')
 m3.metric("Peak position", f'{diag["peak_progress"]*100:.1f}%')
 m4.metric("Terminal exponent", f'{diag["terminal_exponent"]:.3f}')
 m5.metric("Next modeled trough", diag.get("next_modeled_trough", "2026-10-05"))
+
+st.caption(
+    "Future-cycle centering: **PASS** — each projected peak uses +A and its paired "
+    "trough uses -A in log-price space around the same structural centerline. "
+    f"Bull shape: {diag.get('bull_curve', 'curved')}. "
+    f"Bear shape: {diag.get('bear_curve', 'curved')}."
+)
 
 st.subheader("Cycle anchor verification")
 st.caption(

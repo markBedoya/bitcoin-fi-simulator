@@ -139,30 +139,111 @@ def _interp_knots(dates: pd.DatetimeIndex, knot_dates, knot_values):
     return out
 
 
-def _forecast_anchor_deviation(history: pd.DataFrame, anchor_type: str, future_cycle: int) -> float:
-    typed = history[history["type"] == anchor_type].sort_values("cycle")
-    if typed.empty:
-        return 0.0
+def _estimate_future_cycle_amplitude(history: pd.DataFrame, future_cycle: int) -> float:
+    """Estimate one symmetric log-amplitude for a future cycle.
 
-    # Use actual signed log deviations and extrapolate gradual amplitude damping.
-    vals = typed["log_deviation"].to_numpy(dtype=float)
-    cycles = typed["cycle"].to_numpy(dtype=float)
-    sign = 1.0 if anchor_type == "peak" else -1.0
-    amps = np.maximum(np.abs(vals), 1e-6)
+    Using one amplitude for both the peak (+A) and trough (-A) keeps the
+    structural centerline as the geometric midpoint of every projected cycle.
+    Historical cycles may be asymmetric because they are forced through actual
+    market turning points; only the future projection is symmetrically centered.
+    """
+    if history.empty:
+        return 0.6
 
+    cycle_amplitudes = []
+    for cycle, grp in history.dropna(subset=["cycle"]).groupby("cycle"):
+        peaks = grp.loc[grp["type"] == "peak", "log_deviation"]
+        troughs = grp.loc[grp["type"] == "trough", "log_deviation"]
+        if peaks.empty or troughs.empty:
+            continue
+        peak_amp = float(np.median(np.abs(peaks.to_numpy(dtype=float))))
+        trough_amp = float(np.median(np.abs(troughs.to_numpy(dtype=float))))
+        cycle_amplitudes.append((float(cycle), 0.5 * (peak_amp + trough_amp)))
+
+    if not cycle_amplitudes:
+        amp = float(np.median(np.abs(history["log_deviation"].to_numpy(dtype=float))))
+        return max(amp, 0.05)
+
+    cycle_amplitudes.sort(key=lambda item: item[0])
+    cycles = np.array([item[0] for item in cycle_amplitudes], dtype=float)
+    amps = np.array([item[1] for item in cycle_amplitudes], dtype=float)
+    latest_cycle = float(cycles[-1])
+    latest_amp = float(amps[-1])
+
+    # Learn only amplitude decay; never let projected volatility expand.
     if len(amps) >= 2:
-        # Fit recent amplitude decay in log space; never allow future amplitude growth.
         use = min(3, len(amps))
-        slope, intercept = np.polyfit(cycles[-use:], np.log(amps[-use:]), 1)
-        slope = min(float(slope), 0.0)
-        amp = float(np.exp(intercept + slope * future_cycle))
+        slope, _ = np.polyfit(cycles[-use:], np.log(np.maximum(amps[-use:], 1e-6)), 1)
+        retention = float(np.clip(np.exp(min(float(slope), 0.0)), 0.78, 1.0))
     else:
-        amp = float(amps[-1])
+        retention = 0.92
 
-    # Avoid abrupt collapse or explosion from sparse history.
-    last_amp = float(amps[-1])
-    amp = float(np.clip(amp, last_amp * 0.35, last_amp * 1.0))
-    return sign * amp
+    steps = max(float(future_cycle) - latest_cycle, 0.0)
+    amp = latest_amp * (retention ** steps)
+    return float(max(amp, 0.05))
+
+
+def _bull_ease(t: float) -> float:
+    """Curved 1064-day bull path: gradual early rise, faster middle, soft peak.
+
+    The symmetric power-logistic form has an average of 0.5 over the phase,
+    helping the projected cycle remain centered on the structural line.
+    """
+    t = float(np.clip(t, 0.0, 1.0))
+    power = 2.35
+    a = t ** power
+    b = (1.0 - t) ** power
+    return 0.0 if a + b == 0 else a / (a + b)
+
+
+def _bear_ease(t: float) -> float:
+    """Shorter bear path with a faster initial decline and slower bottoming.
+
+    This form is also symmetric around 0.5 in aggregate, so it does not create
+    a persistent upward/downward bias relative to the structural centerline.
+    """
+    t = float(np.clip(t, 0.0, 1.0))
+    power = 0.72
+    a = t ** power
+    b = (1.0 - t) ** power
+    return 0.0 if a + b == 0 else a / (a + b)
+
+
+def _phase_interpolate(start_type: str, end_type: str, t: float) -> float:
+    if start_type == "trough" and end_type == "peak":
+        return _bull_ease(t)
+    if start_type == "peak" and end_type == "trough":
+        return _bear_ease(t)
+    # A boundary anchor can sit partway through a bull/bear leg. Use the
+    # destination turning point to preserve the expected phase character.
+    if end_type == "peak":
+        return _bull_ease(t)
+    if end_type == "trough":
+        return _bear_ease(t)
+    return float(_smoothstep(np.array([t]))[0])
+
+
+def _interp_cycle_knots(dates: pd.DatetimeIndex, knots: pd.DataFrame) -> np.ndarray:
+    ords = np.array([pd.Timestamp(d).toordinal() for d in dates], dtype=float)
+    knot_dates = [pd.Timestamp(d) for d in knots["date"]]
+    kd = np.array([d.toordinal() for d in knot_dates], dtype=float)
+    kv = knots["log_deviation"].to_numpy(dtype=float)
+    kt = knots["type"].astype(str).tolist()
+    out = np.empty(len(ords), dtype=float)
+
+    for i, x in enumerate(ords):
+        if x <= kd[0]:
+            out[i] = kv[0]
+            continue
+        if x >= kd[-1]:
+            out[i] = kv[-1]
+            continue
+        j = np.searchsorted(kd, x) - 1
+        span = kd[j + 1] - kd[j]
+        t = 0.0 if span <= 0 else (x - kd[j]) / span
+        s = _phase_interpolate(kt[j], kt[j + 1], t)
+        out[i] = kv[j] + (kv[j + 1] - kv[j]) * s
+    return out
 
 
 def _build_cycle_fit(
@@ -245,23 +326,32 @@ def _build_cycle_fit(
 
     history_for_forecast = anchors.copy()
 
-    # Future peak/trough anchor deviations are extrapolated separately from historical peaks and troughs.
+    # Future peak/trough anchors use one symmetric log-amplitude per cycle.
+    # This guarantees peak = centerline * exp(+A) and trough = centerline * exp(-A),
+    # so the centerline cannot drift above or below the projected cycle geometry.
     future_schedule = schedule[schedule["date"] > training_end].copy()
     future_rows = []
+    amplitude_by_cycle = {}
     for row in future_schedule.itertuples(index=False):
         if row.date > all_dates.max():
             continue
-        dev = _forecast_anchor_deviation(history_for_forecast, row.type, int(row.cycle))
+        cycle_id = int(row.cycle)
+        if cycle_id not in amplitude_by_cycle:
+            amplitude_by_cycle[cycle_id] = _estimate_future_cycle_amplitude(
+                history_for_forecast, cycle_id
+            )
+        amp = amplitude_by_cycle[cycle_id]
+        dev = amp if row.type == "peak" else -amp
         center = float(center_series.loc[row.date]) if row.date in center_series.index else np.nan
         future_rows.append({
             "date": row.date,
             "requested_anchor_date": row.date,
             "type": row.type,
-            "cycle": int(row.cycle),
+            "cycle": cycle_id,
             "actual_price_usd": np.nan,
             "structural_centerline_usd": center,
             "log_deviation": dev,
-            "source": "projected cycle anchor",
+            "source": "projected centered cycle anchor",
         })
 
     knots = pd.concat(
@@ -278,11 +368,7 @@ def _build_cycle_fit(
     if len(knots) < 2:
         raise ValueError("Not enough cycle anchors exist for the selected training range.")
 
-    deviation_path = _interp_knots(
-        all_dates,
-        knots["date"].tolist(),
-        knots["log_deviation"].to_numpy(dtype=float),
-    )
+    deviation_path = _interp_cycle_knots(all_dates, knots)
     cycle_price = structural_centerline * np.exp(deviation_path)
 
     # Fixed phase: trough=0, peak=1064/1428, next trough=1.
@@ -331,19 +417,19 @@ def _build_cycle_fit(
 
     overlay_df = pd.concat(overlays, ignore_index=True) if overlays else pd.DataFrame()
 
-    # Template is the deterministic asymmetric bull/bear geometry, scaled to observed median anchor amplitudes.
-    peak_amp = float(np.median(np.abs(anchors.loc[anchors["type"] == "peak", "log_deviation"]))) if not anchors.empty and (anchors["type"] == "peak").any() else 0.6
-    trough_amp = float(np.median(np.abs(anchors.loc[anchors["type"] == "trough", "log_deviation"]))) if not anchors.empty and (anchors["type"] == "trough").any() else 0.6
+    # Deterministic future template: one symmetric amplitude around the structural
+    # centerline, with a curved bull phase and faster bear phase.
+    template_amp = _estimate_future_cycle_amplitude(anchors, 1) if not anchors.empty else 0.6
     template_vals = np.empty_like(grid)
     for i, p in enumerate(grid):
         if p <= peak_progress:
             t = p / peak_progress
-            s = float(_smoothstep(np.array([t]))[0])
-            template_vals[i] = -trough_amp + (peak_amp + trough_amp) * s
+            s = _bull_ease(t)
+            template_vals[i] = -template_amp + (2.0 * template_amp) * s
         else:
             t = (p - peak_progress) / (1.0 - peak_progress)
-            s = float(_smoothstep(np.array([t]))[0])
-            template_vals[i] = peak_amp + (-trough_amp - peak_amp) * s
+            s = _bear_ease(t)
+            template_vals[i] = template_amp - (2.0 * template_amp) * s
     template_df = pd.DataFrame({"progress": grid, "log_deviation": template_vals})
 
     return cycle_price, deviation_path, cycle_progress, knots, overlay_df, template_df, {
@@ -354,6 +440,10 @@ def _build_cycle_fit(
         "complete_cycles": int(complete_cycles),
         "turning_points": anchors.copy(),
         "next_modeled_trough": NEXT_TROUGH.date().isoformat(),
+        "future_cycle_amplitudes": amplitude_by_cycle,
+        "future_cycle_centered": True,
+        "bull_curve": "power-logistic 2.35 (gradual / accelerating)",
+        "bear_curve": "power-logistic 0.72 (faster initial decline)",
     }
 
 
@@ -397,7 +487,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "cycle_shape_value": deviation_path,
         "cycle_amplitude": np.abs(deviation_path),
         "fitted_or_projected_price_usd": fitted_or_projected,
-        "model_version": "price-model-v2.3-actual-anchors-fixed-future-cycle",
+        "model_version": "price-model-v2.4-centered-curved-cycle",
         "training_start_date": training_start.date().isoformat(),
         "training_end_date": training_end.date().isoformat(),
     })
