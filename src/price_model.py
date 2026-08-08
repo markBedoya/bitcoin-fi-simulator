@@ -118,35 +118,293 @@ def _smoothstep(x: np.ndarray) -> np.ndarray:
     return x * x * (3.0 - 2.0 * x)
 
 
-def _interp_knots(dates: pd.DatetimeIndex, knot_dates, knot_values):
-    ords = np.array([pd.Timestamp(d).toordinal() for d in dates], dtype=float)
-    kd = np.array([pd.Timestamp(d).toordinal() for d in knot_dates], dtype=float)
-    kv = np.asarray(knot_values, dtype=float)
-    out = np.empty(len(ords), dtype=float)
+def _isotonic_increasing(values: np.ndarray) -> np.ndarray:
+    """Least-squares nondecreasing fit using the pool-adjacent-violators algorithm."""
+    y = np.asarray(values, dtype=float)
+    if len(y) <= 1:
+        return y.copy()
 
-    for i, x in enumerate(ords):
-        if x <= kd[0]:
-            out[i] = kv[0]
-            continue
-        if x >= kd[-1]:
-            out[i] = kv[-1]
-            continue
-        j = np.searchsorted(kd, x) - 1
-        span = kd[j + 1] - kd[j]
-        t = 0.0 if span <= 0 else (x - kd[j]) / span
-        s = float(_smoothstep(np.array([t]))[0])
-        out[i] = kv[j] + (kv[j + 1] - kv[j]) * s
+    block_values = []
+    block_weights = []
+    block_counts = []
+    for value in y:
+        block_values.append(float(value))
+        block_weights.append(1.0)
+        block_counts.append(1)
+        while len(block_values) >= 2 and block_values[-2] > block_values[-1]:
+            w1, w2 = block_weights[-2], block_weights[-1]
+            merged_weight = w1 + w2
+            merged_value = (
+                block_values[-2] * w1 + block_values[-1] * w2
+            ) / merged_weight
+            merged_count = block_counts[-2] + block_counts[-1]
+            block_values[-2:] = [merged_value]
+            block_weights[-2:] = [merged_weight]
+            block_counts[-2:] = [merged_count]
+
+    out = np.empty(len(y), dtype=float)
+    pos = 0
+    for value, count in zip(block_values, block_counts):
+        out[pos:pos + count] = value
+        pos += count
     return out
 
 
-def _estimate_future_cycle_amplitude(history: pd.DataFrame, future_cycle: int) -> float:
-    """Estimate one symmetric log-amplitude for a future cycle.
+def _smooth_monotone_curve(values: np.ndarray, window: int = 11) -> np.ndarray:
+    """Smooth a normalized phase curve and enforce 0 -> 1 monotonicity."""
+    y = np.asarray(values, dtype=float)
+    if len(y) == 0:
+        return y.copy()
+    window = max(3, int(window))
+    if window % 2 == 0:
+        window += 1
+    smooth = (
+        pd.Series(y)
+        .rolling(window, center=True, min_periods=1)
+        .median()
+        .rolling(window, center=True, min_periods=1)
+        .mean()
+        .to_numpy(dtype=float)
+    )
+    smooth = np.clip(smooth, 0.0, 1.0)
+    smooth[0] = 0.0
+    smooth[-1] = 1.0
+    smooth = _isotonic_increasing(smooth)
+    lo, hi = float(smooth[0]), float(smooth[-1])
+    if hi - lo > 1e-12:
+        smooth = (smooth - lo) / (hi - lo)
+    smooth[0] = 0.0
+    smooth[-1] = 1.0
+    return np.clip(smooth, 0.0, 1.0)
 
-    Using one amplitude for both the peak (+A) and trough (-A) keeps the
-    structural centerline as the geometric midpoint of every projected cycle.
-    Historical cycles may be asymmetric because they are forced through actual
-    market turning points; only the future projection is symmetrically centered.
+
+def _pchip_slopes(x: np.ndarray, y: np.ndarray) -> np.ndarray:
+    """Fritsch-Carlson/PCHIP-style slopes for monotone shape-preserving cubic interpolation."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    n = len(x)
+    if n < 2:
+        return np.zeros_like(y)
+    h = np.diff(x)
+    delta = np.diff(y) / h
+    if n == 2:
+        return np.array([delta[0], delta[0]], dtype=float)
+
+    m = np.zeros(n, dtype=float)
+    for k in range(1, n - 1):
+        d0, d1 = delta[k - 1], delta[k]
+        if d0 == 0.0 or d1 == 0.0 or np.sign(d0) != np.sign(d1):
+            m[k] = 0.0
+        else:
+            w1 = 2.0 * h[k] + h[k - 1]
+            w2 = h[k] + 2.0 * h[k - 1]
+            m[k] = (w1 + w2) / (w1 / d0 + w2 / d1)
+
+    # Endpoint slopes from the standard PCHIP one-sided estimate, then limit
+    # them to preserve monotonicity.
+    m[0] = ((2.0 * h[0] + h[1]) * delta[0] - h[0] * delta[1]) / (h[0] + h[1])
+    if np.sign(m[0]) != np.sign(delta[0]):
+        m[0] = 0.0
+    elif np.sign(delta[0]) != np.sign(delta[1]) and abs(m[0]) > abs(3.0 * delta[0]):
+        m[0] = 3.0 * delta[0]
+
+    m[-1] = ((2.0 * h[-1] + h[-2]) * delta[-1] - h[-1] * delta[-2]) / (h[-1] + h[-2])
+    if np.sign(m[-1]) != np.sign(delta[-1]):
+        m[-1] = 0.0
+    elif np.sign(delta[-1]) != np.sign(delta[-2]) and abs(m[-1]) > abs(3.0 * delta[-1]):
+        m[-1] = 3.0 * delta[-1]
+    return m
+
+
+def _monotone_cubic_eval(x: np.ndarray, y: np.ndarray, value: float) -> float:
+    """Evaluate a monotone cubic Hermite interpolation at one normalized point."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    value = float(np.clip(value, x[0], x[-1]))
+    if value <= x[0]:
+        return float(y[0])
+    if value >= x[-1]:
+        return float(y[-1])
+    j = int(np.searchsorted(x, value) - 1)
+    h = x[j + 1] - x[j]
+    t = (value - x[j]) / h
+    m = _pchip_slopes(x, y)
+    h00 = 2 * t**3 - 3 * t**2 + 1
+    h10 = t**3 - 2 * t**2 + t
+    h01 = -2 * t**3 + 3 * t**2
+    h11 = t**3 - t**2
+    return float(
+        h00 * y[j]
+        + h10 * h * m[j]
+        + h01 * y[j + 1]
+        + h11 * h * m[j + 1]
+    )
+
+
+def _combine_phase_curves(curves: list[np.ndarray], grid: np.ndarray) -> np.ndarray:
+    """Median-combine historical normalized phase curves into one empirical template."""
+    if not curves:
+        return np.asarray(grid, dtype=float)
+    matrix = np.vstack(curves)
+    median_curve = np.nanmedian(matrix, axis=0)
+    return _smooth_monotone_curve(median_curve, window=max(9, len(grid) // 35))
+
+
+def _phase_curve_diagnostics(grid: np.ndarray, template: np.ndarray) -> dict:
+    grid = np.asarray(grid, dtype=float)
+    template = np.asarray(template, dtype=float)
+    velocity = np.gradient(template, grid)
+    acceleration = np.gradient(velocity, grid)
+    interior = (grid >= 0.05) & (grid <= 0.95)
+    interior_idx = np.where(interior)[0]
+    if len(interior_idx):
+        max_velocity_idx = interior_idx[int(np.argmax(velocity[interior]))]
+        max_accel_idx = interior_idx[int(np.argmax(acceleration[interior]))]
+    else:
+        max_velocity_idx = int(np.argmax(velocity))
+        max_accel_idx = int(np.argmax(acceleration))
+    half_progress = float(np.interp(0.5, template, grid))
+    return {
+        "half_move_progress": half_progress,
+        "max_velocity_progress": float(grid[max_velocity_idx]),
+        "max_acceleration_progress": float(grid[max_accel_idx]),
+        "max_velocity": float(velocity[max_velocity_idx]),
+        "max_acceleration": float(acceleration[max_accel_idx]),
+    }
+
+
+def _lookup_price_near(data: pd.DataFrame, date: pd.Timestamp, tolerance_days: int = 3):
+    nearest = data.iloc[(data["date"] - date).abs().argsort()[:1]].iloc[0]
+    actual_date = pd.Timestamp(nearest["date"])
+    if abs((actual_date - date).days) > tolerance_days:
+        return None
+    return actual_date, float(nearest["price_usd"])
+
+
+def _learn_empirical_phase_templates(
+    data: pd.DataFrame,
+    center_series: pd.Series,
+    training_start: pd.Timestamp,
+    training_end: pd.Timestamp,
+):
+    """Learn bull and bear timing shapes from completed historical phases.
+
+    Each phase is normalized in time (0..1) and in log deviation from the
+    structural centerline (0..1 move from the phase's starting anchor to its
+    ending anchor). Noise/corrections are handled with an isotonic fit, then the
+    completed phases are median-combined and shape-preserving cubic interpolation
+    is used when projecting future paths.
     """
+    grid = np.linspace(0.0, 1.0, 401)
+    schedule = sorted(HISTORICAL_CYCLE_ANCHORS, key=lambda item: item[0])
+    bull_curves = []
+    bear_curves = []
+    overlay_rows = []
+
+    for (start_date, start_type, _), (end_date, end_type, _) in zip(schedule[:-1], schedule[1:]):
+        if (start_type, end_type) not in [("trough", "peak"), ("peak", "trough")]:
+            continue
+        if start_date < training_start or end_date > training_end:
+            continue
+        start_lookup = _lookup_price_near(data, start_date)
+        end_lookup = _lookup_price_near(data, end_date)
+        if start_lookup is None or end_lookup is None:
+            continue
+        actual_start_date, _ = start_lookup
+        actual_end_date, _ = end_lookup
+        seg = data[
+            (data["date"] >= actual_start_date)
+            & (data["date"] <= actual_end_date)
+        ].copy()
+        if len(seg) < 180:
+            continue
+
+        seg_dates = pd.DatetimeIndex(seg["date"])
+        centers = center_series.reindex(seg_dates).to_numpy(dtype=float)
+        if np.isnan(centers).any():
+            continue
+        residual = np.log(seg["price_usd"].to_numpy(dtype=float) / centers)
+        start_dev = float(residual[0])
+        end_dev = float(residual[-1])
+        phase = "bull" if start_type == "trough" else "bear"
+
+        if phase == "bull":
+            denom = end_dev - start_dev
+            normalized = (residual - start_dev) / denom if abs(denom) > 1e-9 else None
+        else:
+            denom = start_dev - end_dev
+            normalized = (start_dev - residual) / denom if abs(denom) > 1e-9 else None
+        if normalized is None:
+            continue
+
+        # Smooth daily noise before learning the underlying monotone move.
+        day_window = max(9, int(round(len(seg) * 0.025)))
+        if day_window % 2 == 0:
+            day_window += 1
+        normalized = (
+            pd.Series(normalized)
+            .rolling(day_window, center=True, min_periods=1)
+            .median()
+            .rolling(day_window, center=True, min_periods=1)
+            .mean()
+            .to_numpy(dtype=float)
+        )
+        normalized = np.clip(normalized, 0.0, 1.0)
+        normalized[0] = 0.0
+        normalized[-1] = 1.0
+        normalized = _isotonic_increasing(normalized)
+        elapsed = (seg["date"] - actual_start_date).dt.days.to_numpy(dtype=float)
+        duration = max((actual_end_date - actual_start_date).days, 1)
+        phase_progress = np.clip(elapsed / duration, 0.0, 1.0)
+        curve = np.interp(grid, phase_progress, normalized)
+        curve = _smooth_monotone_curve(curve, window=11)
+
+        if phase == "bull":
+            bull_curves.append(curve)
+        else:
+            bear_curves.append(curve)
+
+        phase_id = f"{actual_start_date.date()} → {actual_end_date.date()}"
+        overlay_rows.extend({
+            "phase": phase,
+            "phase_id": phase_id,
+            "start_date": actual_start_date,
+            "end_date": actual_end_date,
+            "progress": float(g),
+            "normalized_move": float(v),
+        } for g, v in zip(grid, curve))
+
+    # Use historical data whenever available. The fallbacks only prevent model
+    # failure when a user selects a training window containing no complete phase.
+    if bull_curves:
+        bull_template = _combine_phase_curves(bull_curves, grid)
+    else:
+        bull_template = _smooth_monotone_curve(grid ** 2.7, window=9)
+    if bear_curves:
+        bear_template = _combine_phase_curves(bear_curves, grid)
+    else:
+        bear_template = _smooth_monotone_curve(1.0 - (1.0 - grid) ** 2.2, window=9)
+
+    bull_diag = _phase_curve_diagnostics(grid, bull_template)
+    bear_diag = _phase_curve_diagnostics(grid, bear_template)
+    overlay_df = pd.DataFrame(overlay_rows)
+    template_df = pd.concat([
+        pd.DataFrame({
+            "phase": "bull",
+            "progress": grid,
+            "normalized_move": bull_template,
+        }),
+        pd.DataFrame({
+            "phase": "bear",
+            "progress": grid,
+            "normalized_move": bear_template,
+        }),
+    ], ignore_index=True)
+    return grid, bull_template, bear_template, overlay_df, template_df, bull_diag, bear_diag
+
+
+def _estimate_future_cycle_amplitude(history: pd.DataFrame, future_cycle: int) -> float:
+    """Estimate one symmetric log-amplitude for a future cycle."""
     if history.empty:
         return 0.6
 
@@ -170,7 +428,6 @@ def _estimate_future_cycle_amplitude(history: pd.DataFrame, future_cycle: int) -
     latest_cycle = float(cycles[-1])
     latest_amp = float(amps[-1])
 
-    # Learn only amplitude decay; never let projected volatility expand.
     if len(amps) >= 2:
         use = min(3, len(amps))
         slope, _ = np.polyfit(cycles[-use:], np.log(np.maximum(amps[-use:], 1e-6)), 1)
@@ -183,47 +440,53 @@ def _estimate_future_cycle_amplitude(history: pd.DataFrame, future_cycle: int) -
     return float(max(amp, 0.05))
 
 
-def _bull_ease(t: float) -> float:
-    """Curved 1064-day bull path: gradual early rise, faster middle, soft peak.
+def _template_value(grid: np.ndarray, template: np.ndarray, t: float) -> float:
+    return _monotone_cubic_eval(grid, template, float(np.clip(t, 0.0, 1.0)))
 
-    The symmetric power-logistic form has an average of 0.5 over the phase,
-    helping the projected cycle remain centered on the structural line.
-    """
+
+def _phase_interpolate(
+    start_type: str,
+    end_type: str,
+    t: float,
+    bull_grid: np.ndarray,
+    bull_template: np.ndarray,
+    bear_template: np.ndarray,
+    start_date: pd.Timestamp | None = None,
+    end_date: pd.Timestamp | None = None,
+) -> float:
     t = float(np.clip(t, 0.0, 1.0))
-    power = 2.35
-    a = t ** power
-    b = (1.0 - t) ** power
-    return 0.0 if a + b == 0 else a / (a + b)
-
-
-def _bear_ease(t: float) -> float:
-    """Shorter bear path with a faster initial decline and slower bottoming.
-
-    This form is also symmetric around 0.5 in aggregate, so it does not create
-    a persistent upward/downward bias relative to the structural centerline.
-    """
-    t = float(np.clip(t, 0.0, 1.0))
-    power = 0.72
-    a = t ** power
-    b = (1.0 - t) ** power
-    return 0.0 if a + b == 0 else a / (a + b)
-
-
-def _phase_interpolate(start_type: str, end_type: str, t: float) -> float:
     if start_type == "trough" and end_type == "peak":
-        return _bull_ease(t)
+        return _template_value(bull_grid, bull_template, t)
     if start_type == "peak" and end_type == "trough":
-        return _bear_ease(t)
-    # A boundary anchor can sit partway through a bull/bear leg. Use the
-    # destination turning point to preserve the expected phase character.
-    if end_type == "peak":
-        return _bull_ease(t)
-    if end_type == "trough":
-        return _bear_ease(t)
+        return _template_value(bull_grid, bear_template, t)
+
+    # A latest-actual boundary may occur partway through the current fixed phase.
+    # Continue from that phase's learned progress rather than restarting the full
+    # bull/bear template at the projection boundary.
+    if end_type == "trough" and start_date is not None and end_date is not None:
+        phase_start = end_date - pd.Timedelta(days=FIXED_BEAR_DAYS)
+        t0 = float(np.clip((start_date - phase_start).days / FIXED_BEAR_DAYS, 0.0, 1.0))
+        absolute_t = t0 + (1.0 - t0) * t
+        y0 = _template_value(bull_grid, bear_template, t0)
+        y1 = _template_value(bull_grid, bear_template, absolute_t)
+        return 0.0 if 1.0 - y0 < 1e-12 else float((y1 - y0) / (1.0 - y0))
+    if end_type == "peak" and start_date is not None and end_date is not None:
+        phase_start = end_date - pd.Timedelta(days=FIXED_BULL_DAYS)
+        t0 = float(np.clip((start_date - phase_start).days / FIXED_BULL_DAYS, 0.0, 1.0))
+        absolute_t = t0 + (1.0 - t0) * t
+        y0 = _template_value(bull_grid, bull_template, t0)
+        y1 = _template_value(bull_grid, bull_template, absolute_t)
+        return 0.0 if 1.0 - y0 < 1e-12 else float((y1 - y0) / (1.0 - y0))
     return float(_smoothstep(np.array([t]))[0])
 
 
-def _interp_cycle_knots(dates: pd.DatetimeIndex, knots: pd.DataFrame) -> np.ndarray:
+def _interp_cycle_knots(
+    dates: pd.DatetimeIndex,
+    knots: pd.DataFrame,
+    phase_grid: np.ndarray,
+    bull_template: np.ndarray,
+    bear_template: np.ndarray,
+) -> np.ndarray:
     ords = np.array([pd.Timestamp(d).toordinal() for d in dates], dtype=float)
     knot_dates = [pd.Timestamp(d) for d in knots["date"]]
     kd = np.array([d.toordinal() for d in knot_dates], dtype=float)
@@ -241,7 +504,11 @@ def _interp_cycle_knots(dates: pd.DatetimeIndex, knots: pd.DataFrame) -> np.ndar
         j = np.searchsorted(kd, x) - 1
         span = kd[j + 1] - kd[j]
         t = 0.0 if span <= 0 else (x - kd[j]) / span
-        s = _phase_interpolate(kt[j], kt[j + 1], t)
+        s = _phase_interpolate(
+            kt[j], kt[j + 1], t,
+            phase_grid, bull_template, bear_template,
+            start_date=knot_dates[j], end_date=knot_dates[j + 1],
+        )
         out[i] = kv[j] + (kv[j + 1] - kv[j]) * s
     return out
 
@@ -256,6 +523,20 @@ def _build_cycle_fit(
 ):
     center_series = pd.Series(structural_centerline, index=all_dates)
     schedule = _fixed_cycle_anchors(training_start, all_dates.max())
+    (
+        phase_grid,
+        bull_template,
+        bear_template,
+        phase_overlays,
+        phase_templates,
+        bull_shape_diag,
+        bear_shape_diag,
+    ) = _learn_empirical_phase_templates(
+        data=data,
+        center_series=center_series,
+        training_start=training_start,
+        training_end=training_end,
+    )
 
     # Historical anchor intersections are only learned from prices inside the selected training range.
     hist_schedule = schedule[
@@ -368,7 +649,9 @@ def _build_cycle_fit(
     if len(knots) < 2:
         raise ValueError("Not enough cycle anchors exist for the selected training range.")
 
-    deviation_path = _interp_cycle_knots(all_dates, knots)
+    deviation_path = _interp_cycle_knots(
+        all_dates, knots, phase_grid, bull_template, bear_template
+    )
     cycle_price = structural_centerline * np.exp(deviation_path)
 
     # Fixed phase: trough=0, peak=1064/1428, next trough=1.
@@ -417,18 +700,17 @@ def _build_cycle_fit(
 
     overlay_df = pd.concat(overlays, ignore_index=True) if overlays else pd.DataFrame()
 
-    # Deterministic future template: one symmetric amplitude around the structural
-    # centerline, with a curved bull phase and faster bear phase.
+    # Future whole-cycle template uses the empirically learned phase shapes.
     template_amp = _estimate_future_cycle_amplitude(anchors, 1) if not anchors.empty else 0.6
     template_vals = np.empty_like(grid)
     for i, p in enumerate(grid):
         if p <= peak_progress:
             t = p / peak_progress
-            s = _bull_ease(t)
+            s = _template_value(phase_grid, bull_template, t)
             template_vals[i] = -template_amp + (2.0 * template_amp) * s
         else:
             t = (p - peak_progress) / (1.0 - peak_progress)
-            s = _bear_ease(t)
+            s = _template_value(phase_grid, bear_template, t)
             template_vals[i] = template_amp - (2.0 * template_amp) * s
     template_df = pd.DataFrame({"progress": grid, "log_deviation": template_vals})
 
@@ -442,8 +724,14 @@ def _build_cycle_fit(
         "next_modeled_trough": NEXT_TROUGH.date().isoformat(),
         "future_cycle_amplitudes": amplitude_by_cycle,
         "future_cycle_centered": True,
-        "bull_curve": "power-logistic 2.35 (gradual / accelerating)",
-        "bear_curve": "power-logistic 0.72 (faster initial decline)",
+        "bull_curve": f"empirical median from {int(phase_overlays.loc[phase_overlays['phase'] == 'bull', 'phase_id'].nunique()) if not phase_overlays.empty else 0} completed bull phases",
+        "bear_curve": f"empirical median from {int(phase_overlays.loc[phase_overlays['phase'] == 'bear', 'phase_id'].nunique()) if not phase_overlays.empty else 0} completed bear phases",
+        "phase_shape_overlays": phase_overlays,
+        "phase_shape_templates": phase_templates,
+        "bull_shape_diagnostics": bull_shape_diag,
+        "bear_shape_diagnostics": bear_shape_diag,
+        "bull_phases_used": int(phase_overlays.loc[phase_overlays["phase"] == "bull", "phase_id"].nunique()) if not phase_overlays.empty else 0,
+        "bear_phases_used": int(phase_overlays.loc[phase_overlays["phase"] == "bear", "phase_id"].nunique()) if not phase_overlays.empty else 0,
     }
 
 
@@ -487,7 +775,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "cycle_shape_value": deviation_path,
         "cycle_amplitude": np.abs(deviation_path),
         "fitted_or_projected_price_usd": fitted_or_projected,
-        "model_version": "price-model-v2.4-centered-curved-cycle",
+        "model_version": "price-model-v2.5-empirical-phase-shape",
         "training_start_date": training_start.date().isoformat(),
         "training_end_date": training_end.date().isoformat(),
     })

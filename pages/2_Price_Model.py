@@ -8,12 +8,12 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v2.4 — Centered Curved 1428-Day Cycle")
+st.title("Price Model v2.5 — Empirical 1428-Day Cycle Shape")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
-    "Historical fitted-cycle anchors use observed market turning points; future timing is fixed at "
-    "1428 days: 1064 bull days + 364 bear days. Future peaks and troughs use symmetric "
-    "log-amplitudes around the structural centerline, with a curved gradual bull phase."
+    "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
+    "(1064 bull + 364 bear). The shape inside each phase is learned from completed historical "
+    "bull and bear phases instead of being hand-tuned."
 )
 
 try:
@@ -454,8 +454,10 @@ m5.metric("Next modeled trough", diag.get("next_modeled_trough", "2026-10-05"))
 st.caption(
     "Future-cycle centering: **PASS** — each projected peak uses +A and its paired "
     "trough uses -A in log-price space around the same structural centerline. "
-    f"Bull shape: {diag.get('bull_curve', 'curved')}. "
-    f"Bear shape: {diag.get('bear_curve', 'curved')}."
+    f"Bull shape: {diag.get('bull_curve', 'empirical')}. "
+    f"Bear shape: {diag.get('bear_curve', 'empirical')}. "
+    "The phase curves are learned from normalized historical log-price deviations and "
+    "smoothed with monotone, shape-preserving interpolation."
 )
 
 st.subheader("Cycle anchor verification")
@@ -605,15 +607,117 @@ if rows:
         key="price_model_forward_return_chart",
     )
 
+st.subheader("Empirical phase-shape learning")
+st.caption(
+    "Each completed bull and bear phase is normalized from 0% to 100% in time and "
+    "0% to 100% of its log-deviation move. The individual historical paths are "
+    "shown below; the bold learned template is their smoothed median. Future phases "
+    "use this learned shape while keeping the fixed 1064/364-day timing."
+)
+
+bull_shape_diag = diag.get("bull_shape_diagnostics", {})
+bear_shape_diag = diag.get("bear_shape_diagnostics", {})
+shape_cols = st.columns(6)
+shape_cols[0].metric("Bull phases used", int(diag.get("bull_phases_used", 0)))
+shape_cols[1].metric(
+    "Bull 50% move",
+    f"{bull_shape_diag.get('half_move_progress', float('nan')) * 100:.1f}%",
+    help="Percent of the 1064-day bull phase elapsed when the learned template has completed half of its normalized move.",
+)
+shape_cols[2].metric(
+    "Bull max acceleration",
+    f"{bull_shape_diag.get('max_acceleration_progress', float('nan')) * 100:.1f}%",
+    help="Data-derived point where the second derivative of the learned bull template is greatest.",
+)
+shape_cols[3].metric("Bear phases used", int(diag.get("bear_phases_used", 0)))
+shape_cols[4].metric(
+    "Bear 50% decline",
+    f"{bear_shape_diag.get('half_move_progress', float('nan')) * 100:.1f}%",
+    help="Percent of the 364-day bear phase elapsed when half of the learned normalized decline is complete.",
+)
+shape_cols[5].metric(
+    "Bear max decline velocity",
+    f"{bear_shape_diag.get('max_velocity_progress', float('nan')) * 100:.1f}%",
+    help="Data-derived point where the normalized bear decline is progressing fastest.",
+)
+
+phase_overlays = diag.get("phase_shape_overlays")
+phase_templates = diag.get("phase_shape_templates")
+if (
+    phase_templates is not None
+    and not phase_templates.empty
+):
+    bull_tab, bear_tab = st.tabs(["Bull phase shape", "Bear phase shape"])
+    for tab, phase_name, phase_label, phase_diag in [
+        (bull_tab, "bull", "Bull", bull_shape_diag),
+        (bear_tab, "bear", "Bear", bear_shape_diag),
+    ]:
+        with tab:
+            phase_fig = go.Figure()
+            if phase_overlays is not None and not phase_overlays.empty:
+                phase_hist = phase_overlays[phase_overlays["phase"] == phase_name]
+                for phase_id, grp in phase_hist.groupby("phase_id"):
+                    phase_fig.add_trace(go.Scatter(
+                        x=grp["progress"] * 100,
+                        y=grp["normalized_move"] * 100,
+                        mode="lines",
+                        name=str(phase_id),
+                        opacity=0.35,
+                        line={"width": 1.5},
+                    ))
+            learned = phase_templates[phase_templates["phase"] == phase_name]
+            phase_fig.add_trace(go.Scatter(
+                x=learned["progress"] * 100,
+                y=learned["normalized_move"] * 100,
+                mode="lines",
+                name=f"Learned median {phase_name} template",
+                line={"width": 4},
+            ))
+            if phase_name == "bull" and phase_diag:
+                phase_fig.add_vline(
+                    x=float(phase_diag.get("max_acceleration_progress", 0.0)) * 100,
+                    line_dash=REFERENCE_LINE_DASH,
+                    line_color=REFERENCE_LINE_COLOR,
+                    line_width=REFERENCE_LINE_WIDTH,
+                    annotation_text="Max acceleration",
+                )
+            if phase_name == "bear" and phase_diag:
+                phase_fig.add_vline(
+                    x=float(phase_diag.get("max_velocity_progress", 0.0)) * 100,
+                    line_dash=REFERENCE_LINE_DASH,
+                    line_color=REFERENCE_LINE_COLOR,
+                    line_width=REFERENCE_LINE_WIDTH,
+                    annotation_text="Max decline velocity",
+                )
+            phase_fig.update_layout(
+                title=f"{phase_label} phase — historical normalized paths vs learned template",
+                xaxis_title=f"{phase_label} phase progress (%)",
+                yaxis_title="Normalized move completed (%)",
+                yaxis={"range": [0, 100]},
+                hovermode="x unified",
+                height=460,
+            )
+            st.plotly_chart(
+                phase_fig,
+                use_container_width=True,
+                config={"displaylogo": False},
+                key=f"price_model_empirical_{phase_name}_shape",
+            )
+else:
+    st.warning(
+        "The selected training window contains no complete historical bull/bear phase, "
+        "so the model is using a conservative fallback phase shape."
+    )
+
 st.subheader("Fixed 1428-day historical cycle overlays")
 if result.cycle_overlays.empty:
     st.warning("The selected training range does not contain enough complete trough-to-trough cycles.")
 else:
-    st.subheader("Fixed asymmetric cycle shape")
+    st.subheader("Empirical full-cycle shape")
     cycle_fig = go.Figure()
     for cycle_no, grp in result.cycle_overlays.groupby("cycle"):
         cycle_fig.add_trace(go.Scatter(x=grp["progress"]*100, y=grp["log_deviation"], mode="lines", name=f"Cycle {cycle_no}", opacity=0.45))
-    cycle_fig.add_trace(go.Scatter(x=result.cycle_template["progress"]*100, y=result.cycle_template["log_deviation"], mode="lines", name="1428-day asymmetric template", line={"width": 4}))
+    cycle_fig.add_trace(go.Scatter(x=result.cycle_template["progress"]*100, y=result.cycle_template["log_deviation"], mode="lines", name="Learned 1428-day empirical template", line={"width": 4}))
     cycle_fig.update_layout(xaxis_title="Cycle progress (%)", yaxis_title="Log deviation from centerline", height=450)
     st.plotly_chart(cycle_fig, use_container_width=True, config={"displaylogo": False})
 
