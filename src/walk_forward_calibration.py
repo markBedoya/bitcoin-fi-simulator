@@ -20,7 +20,7 @@ from src.price_model import (
 # post-model corrections from historical walk-forward outcomes:
 #   G = structural-centerline growth correction
 #   K = cycle-envelope amplitude correction
-CALIBRATION_VERSION = "walk-forward-calibration-v2.0-cycle-aware"
+CALIBRATION_VERSION = "walk-forward-calibration-v2.0.1-cycle-aware"
 CALIBRATION_FLOOR = pd.Timestamp("2015-01-14")
 LOOKBACK_YEARS = (4, 8)
 FAKE_TODAY_STEP_MONTHS = 6
@@ -40,6 +40,25 @@ AMPLITUDE_FACTOR_MAX = 1.30
 # samples without forcing the answer back toward 1.0 as strongly as v1 did.
 GROWTH_PRIOR_WEIGHT = 1.0
 AMPLITUDE_PRIOR_WEIGHT = 0.75
+
+REQUIRED_SUMMARY_KEYS = frozenset({
+    "growth_factor",
+    "amplitude_factor",
+    "raw_cv_error",
+    "calibrated_cv_error",
+    "raw_structural_cv_error",
+    "calibrated_structural_cv_error",
+    "raw_envelope_cv_error",
+    "calibrated_envelope_cv_error",
+    "cv_improvement",
+    "stability",
+    "status",
+    "total_tests",
+    "total_structural_points",
+    "total_envelope_points",
+    "lookback_4y",
+    "lookback_8y",
+})
 
 
 @dataclass
@@ -696,6 +715,7 @@ def calibration_is_current(
         summary.get("version") == CALIBRATION_VERSION
         and summary.get("price_model_engine_version") == PRICE_MODEL_ENGINE_VERSION
         and summary.get("latest_data_date") == pd.Timestamp(prices["date"].max()).date().isoformat()
+        and REQUIRED_SUMMARY_KEYS.issubset(summary.keys())
     )
 
 

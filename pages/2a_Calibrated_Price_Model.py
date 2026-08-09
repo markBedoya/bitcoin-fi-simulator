@@ -7,14 +7,21 @@ from src.active_model_config import build_model_fingerprint
 from src.data_pipeline import load_coinmetrics
 from src.price_model import fit_price_model
 from src.theme import REFERENCE_LINE_COLOR
-from src.walk_forward_calibration import (
-    CALIBRATION_FLOOR,
-    CALIBRATION_VERSION,
-    build_calibrated_price_model,
-    build_calibrated_projection_fingerprint,
-    calibration_is_current,
-    run_walk_forward_calibration,
-)
+import importlib
+import src.walk_forward_calibration as _wfc
+
+_EXPECTED_CALIBRATION_VERSION = "walk-forward-calibration-v2.0.1-cycle-aware"
+if getattr(_wfc, "CALIBRATION_VERSION", None) != _EXPECTED_CALIBRATION_VERSION:
+    importlib.invalidate_caches()
+    _wfc = importlib.reload(_wfc)
+
+CALIBRATION_FLOOR = _wfc.CALIBRATION_FLOOR
+CALIBRATION_VERSION = _wfc.CALIBRATION_VERSION
+REQUIRED_SUMMARY_KEYS = _wfc.REQUIRED_SUMMARY_KEYS
+build_calibrated_price_model = _wfc.build_calibrated_price_model
+build_calibrated_projection_fingerprint = _wfc.build_calibrated_projection_fingerprint
+calibration_is_current = _wfc.calibration_is_current
+run_walk_forward_calibration = _wfc.run_walk_forward_calibration
 
 st.title("Calibrated Price Model v2 — Multi-Horizon + Cycle-Aware")
 st.caption(
@@ -131,6 +138,17 @@ if calibration is None:
     st.stop()
 
 summary = calibration.summary
+missing_summary_keys = sorted(REQUIRED_SUMMARY_KEYS.difference(summary.keys()))
+if missing_summary_keys:
+    st.session_state.pop("walk_forward_calibration_result", None)
+    st.session_state.pop("active_calibrated_price_model_config", None)
+    st.warning(
+        "The saved calibration result came from an older calibration schema and was cleared. "
+        "Run the 4Y + 8Y walk-forward calibration again to create the cycle-aware v2 result."
+    )
+    st.caption("Missing fields: " + ", ".join(missing_summary_keys))
+    st.stop()
+
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Structural growth factor G", f"{summary['growth_factor']:.3f}×")
 c2.metric("Cycle amplitude factor K", f"{summary['amplitude_factor']:.3f}×")
