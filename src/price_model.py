@@ -28,6 +28,11 @@ HISTORICAL_CYCLE_ANCHORS = [
 # date such as 2018-11-28 from discarding the 2017 peak when estimating how
 # cycle overshoots are compressing over time.
 MATURE_AMPLITUDE_START = pd.Timestamp("2017-12-17")
+# Phase-shape learning is also independent of the user-selected structural
+# start. This keeps both mature bear phases (2017-18 and 2021-22) and the two
+# mature bull phases (2018-21 and 2022-25) available for the empirical shape.
+MATURE_PHASE_START = pd.Timestamp("2017-12-17")
+MATURE_BULL_GAIN_START = pd.Timestamp("2018-12-15")
 MATURE_AMPLITUDE_ANCHORS = [
     anchor for anchor in HISTORICAL_CYCLE_ANCHORS
     if anchor[0] >= MATURE_AMPLITUDE_START
@@ -321,7 +326,7 @@ def _learn_empirical_phase_templates(
     for (start_date, start_type, _), (end_date, end_type, _) in zip(schedule[:-1], schedule[1:]):
         if (start_type, end_type) not in [("trough", "peak"), ("peak", "trough")]:
             continue
-        if start_date < training_start or end_date > training_end:
+        if start_date < MATURE_PHASE_START or end_date > training_end:
             continue
         start_lookup = _lookup_price_near(data, start_date)
         end_lookup = _lookup_price_near(data, end_date)
@@ -532,6 +537,105 @@ def _build_amplitude_anchor_history(
         })
     return pd.DataFrame(rows, columns=columns)
 
+
+
+def _build_mature_bull_gain_history(data: pd.DataFrame, training_end: pd.Timestamp) -> pd.DataFrame:
+    """Build completed mature trough->peak bull-run gains from actual prices.
+
+    This dataset is independent of the selected structural-training start. It
+    measures the total log-price gain of each completed mature bull phase, so a
+    future peak cannot expand simply because the structural centerline moved.
+    """
+    cols = [
+        "cycle", "start_date", "peak_date", "start_price_usd", "peak_price_usd",
+        "bull_multiple", "bull_log_gain", "source",
+    ]
+    schedule = sorted(HISTORICAL_CYCLE_ANCHORS, key=lambda item: item[0])
+    rows = []
+    for (start_date, start_type, _), (peak_date, peak_type, peak_cycle) in zip(schedule[:-1], schedule[1:]):
+        if start_type != "trough" or peak_type != "peak":
+            continue
+        if start_date < MATURE_BULL_GAIN_START or peak_date > training_end:
+            continue
+        start_lookup = _lookup_price_near(data, start_date)
+        peak_lookup = _lookup_price_near(data, peak_date)
+        if start_lookup is None or peak_lookup is None:
+            continue
+        actual_start, start_price = start_lookup
+        actual_peak, peak_price = peak_lookup
+        if start_price <= 0 or peak_price <= start_price:
+            continue
+        multiple = float(peak_price / start_price)
+        rows.append({
+            "cycle": int(peak_cycle),
+            "start_date": actual_start,
+            "peak_date": actual_peak,
+            "start_price_usd": float(start_price),
+            "peak_price_usd": float(peak_price),
+            "bull_multiple": multiple,
+            "bull_log_gain": float(np.log(multiple)),
+            "source": "observed mature bull",
+        })
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _bull_gain_decay(history: pd.DataFrame) -> dict:
+    """Fit monotone decay in completed bull-run *log gains*.
+
+    With two mature completed bulls, the observed ratio of their log gains is
+    the exact recent retention estimate. More history can contribute a robust
+    median pairwise slope. Retention is capped at 100%, so the model can never
+    project an expanding bull log gain after a shrinking sequence.
+    """
+    if history is None or history.empty:
+        return {
+            "observations": 0,
+            "latest_cycle": 0.0,
+            "latest_log_gain": float(np.log(4.0)),
+            "latest_multiple": 4.0,
+            "retention_per_cycle": 0.90,
+            "robust_retention_per_cycle": 0.90,
+            "recent_retention_per_cycle": np.nan,
+            "method": "fallback",
+        }
+    h = history.sort_values(["cycle", "peak_date"]).drop_duplicates("cycle", keep="last")
+    cycles = h["cycle"].to_numpy(dtype=float)
+    gains = np.maximum(h["bull_log_gain"].to_numpy(dtype=float), 1e-9)
+    robust = 0.90
+    recent = np.nan
+    if len(gains) >= 2:
+        slopes = []
+        log_g = np.log(gains)
+        for i in range(len(gains)-1):
+            for j in range(i+1, len(gains)):
+                dc = cycles[j]-cycles[i]
+                if dc > 0:
+                    slopes.append((log_g[j]-log_g[i])/dc)
+        slope = min(float(np.median(slopes)) if slopes else 0.0, 0.0)
+        robust = float(np.clip(np.exp(slope), 0.25, 1.0))
+        dc = cycles[-1]-cycles[-2]
+        if dc > 0:
+            recent = float(np.clip((gains[-1]/gains[-2])**(1.0/dc), 0.25, 1.0))
+    retention = min(robust, float(recent) if np.isfinite(recent) else 1.0, 1.0)
+    retention = float(np.clip(retention, 0.25, 1.0))
+    return {
+        "observations": int(len(gains)),
+        "latest_cycle": float(cycles[-1]),
+        "latest_log_gain": float(gains[-1]),
+        "latest_multiple": float(np.exp(gains[-1])),
+        "retention_per_cycle": retention,
+        "robust_retention_per_cycle": robust,
+        "recent_retention_per_cycle": float(recent) if np.isfinite(recent) else np.nan,
+        "method": "min(robust mature bull-log-gain trend, most recent bull-log-gain retention)",
+    }
+
+
+def _project_bull_log_gain(decay: dict, future_cycle: int) -> float:
+    steps = max(float(future_cycle) - float(decay["latest_cycle"]), 0.0)
+    return float(max(
+        float(decay["latest_log_gain"]) * (float(decay["retention_per_cycle"]) ** steps),
+        0.0,
+    ))
 
 def _anchor_amplitude_decay(history: pd.DataFrame, anchor_type: str) -> dict:
     """Estimate conservative monotone peak/trough amplitude decay.
@@ -1061,6 +1165,9 @@ def _build_cycle_fit(
     amplitude_by_cycle = {}
     peak_decay = _anchor_amplitude_decay(history_for_forecast, "peak")
     trough_decay = _anchor_amplitude_decay(history_for_forecast, "trough")
+    bull_gain_history = _build_mature_bull_gain_history(data, training_end)
+    bull_gain_decay = _bull_gain_decay(bull_gain_history)
+    projected_bull_gain_rows = []
 
     conditioned_cycle1_trough_amp = None
     if current_partial_phase is not None and NEXT_TROUGH in center_series.index:
@@ -1076,6 +1183,8 @@ def _build_cycle_fit(
         if conditioned_cycle1_trough_amp is not None
         else float(trough_decay["latest_amplitude"])
     )
+    latest_projected_trough_price = None
+    latest_projected_trough_date = None
 
     for row in future_schedule.itertuples(index=False):
         if row.date > all_dates.max():
@@ -1092,16 +1201,48 @@ def _build_cycle_fit(
             dev = float(np.log(knot_price / center))
             conditioned_cycle1_trough_amp = abs(dev)
             amp = abs(dev)
+            latest_projected_trough_price = knot_price
+            latest_projected_trough_date = pd.Timestamp(row.date)
             source = "current bear-conditioned projected trough"
         elif row.type == "peak":
-            # Upside amplitude follows mature observed peak compression and is
-            # explicitly capped at the immediately previous peak amplitude.
+            # Guardrail 1: the peak's log deviation above the structural
+            # centerline may not expand versus the prior mature peak.
             amp = _project_anchor_amplitude(peak_decay, cycle_id)
             amp = float(min(amp, previous_peak_amp))
-            previous_peak_amp = amp
-            dev = amp
-            knot_price = center * np.exp(dev)
-            source = "projected peak with monotone mature amplitude decay"
+            amplitude_price = center * np.exp(amp)
+
+            # Guardrail 2: total trough->peak bull log gain also follows its own
+            # mature compression trend. This prevents a deep trough plus a fast
+            # structural centerline from creating an expanding bull multiple.
+            gain_cap_price = np.inf
+            target_bull_log_gain = np.nan
+            centerline_conflict = False
+            if latest_projected_trough_price is not None:
+                target_bull_log_gain = _project_bull_log_gain(bull_gain_decay, cycle_id)
+                gain_cap_price = latest_projected_trough_price * np.exp(target_bull_log_gain)
+                raw_capped = min(amplitude_price, gain_cap_price)
+                centerline_conflict = bool(raw_capped < center)
+                knot_price = float(max(center, raw_capped))
+                actual_log_gain = float(np.log(knot_price / latest_projected_trough_price))
+                projected_bull_gain_rows.append({
+                    "cycle": cycle_id,
+                    "start_date": latest_projected_trough_date,
+                    "peak_date": pd.Timestamp(row.date),
+                    "start_price_usd": float(latest_projected_trough_price),
+                    "peak_price_usd": knot_price,
+                    "bull_multiple": float(knot_price / latest_projected_trough_price),
+                    "bull_log_gain": actual_log_gain,
+                    "target_log_gain": float(target_bull_log_gain),
+                    "target_multiple": float(np.exp(target_bull_log_gain)),
+                    "centerline_conflict": centerline_conflict,
+                    "source": "projected bull with dual maturity guardrails",
+                })
+            else:
+                knot_price = float(amplitude_price)
+            dev = float(np.log(knot_price / center))
+            amp = max(dev, 0.0)
+            previous_peak_amp = float(amp)
+            source = "projected peak with peak-amplitude + bull-gain compression"
         else:
             # Downside amplitude is anchored to the live 2026 trough when
             # available, then decays at the historical trough retention rate.
@@ -1121,6 +1262,8 @@ def _build_cycle_fit(
             dev = -amp
             knot_price = center * np.exp(dev)
             source = "projected trough with monotone mature amplitude decay"
+            latest_projected_trough_price = float(knot_price)
+            latest_projected_trough_date = pd.Timestamp(row.date)
 
         amplitude_by_cycle.setdefault(cycle_id, {})[row.type] = float(amp)
         future_rows.append({
@@ -1147,6 +1290,13 @@ def _build_cycle_fit(
     )
     if not amplitude_anchor_table.empty:
         amplitude_anchor_table = amplitude_anchor_table.sort_values("date").reset_index(drop=True)
+
+    projected_bull_gain_table = pd.DataFrame(projected_bull_gain_rows)
+    bull_gain_table = pd.concat(
+        [bull_gain_history, projected_bull_gain_table], ignore_index=True, sort=False
+    )
+    if not bull_gain_table.empty:
+        bull_gain_table = bull_gain_table.sort_values(["peak_date", "cycle"]).reset_index(drop=True)
 
     knots = pd.concat(
         [pd.DataFrame(endpoint_rows), anchors, pd.DataFrame(future_rows)],
@@ -1271,6 +1421,11 @@ def _build_cycle_fit(
         ),
         "amplitude_training_end": training_end.date().isoformat(),
         "amplitude_training_independent_of_structural_start": True,
+        "bull_gain_decay": bull_gain_decay,
+        "bull_gain_table": bull_gain_table,
+        "bull_gain_monotone_guardrail": True,
+        "phase_shape_training_start": MATURE_PHASE_START.date().isoformat(),
+        "phase_shape_training_independent_of_structural_start": True,
         "future_peak_amplitude_monotone": True,
         "future_trough_amplitude_monotone": True,
         "future_cycle_centered": True,
@@ -1329,7 +1484,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "cycle_shape_value": deviation_path,
         "cycle_amplitude": np.abs(deviation_path),
         "fitted_or_projected_price_usd": fitted_or_projected,
-        "model_version": "price-model-v2.9-mature-monotone-amplitude",
+        "model_version": "price-model-v3.0-dual-cycle-compression",
         "training_start_date": training_start.date().isoformat(),
         "training_end_date": training_end.date().isoformat(),
     })
@@ -1343,6 +1498,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "training_start": training_start.date().isoformat(),
         "training_end": training_end.date().isoformat(),
         "projection_years": projection_years,
+        "model_version": "price-model-v3.0-dual-cycle-compression",
         "amplitude_scale": 1.0,
         "amplitude_retained_per_cycle": np.nan,
         "template_log_mean": 0.0,

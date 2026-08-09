@@ -8,7 +8,7 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v2.9 — Mature-Cycle Monotone Amplitude Decay")
+st.title("Price Model v3.0 — Dual Cycle Compression")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
@@ -344,8 +344,14 @@ c5.metric("Bull / bear days", f'{diag.get("bull_days", 1064)} / {diag.get("bear_
 
 st.caption(
     f"Active Price Model fingerprint: **{active_model_fingerprint}**. "
+    f"Backend model: **{diag.get('model_version', 'UNKNOWN')}**. "
     "BTC Financial Independence will use this exact model."
 )
+if diag.get("model_version") != "price-model-v3.0-dual-cycle-compression":
+    st.error(
+        "Price Model UI/backend version mismatch. The page is newer than the loaded "
+        "model engine. Replace src/price_model.py with the release copy and redeploy."
+    )
 
 fig = go.Figure()
 fig.add_trace(go.Scatter(
@@ -505,8 +511,13 @@ st.caption(
 
 peak_decay = diag.get("peak_amplitude_decay", {})
 trough_decay = diag.get("trough_amplitude_decay", {})
-if peak_decay or trough_decay:
-    st.subheader("Cycle amplitude decay")
+st.subheader("Cycle amplitude diagnostics")
+if not peak_decay and not trough_decay:
+    st.error(
+        "Amplitude diagnostics are missing from the backend result. This normally means "
+        "src/price_model.py was not updated with the same release as this page."
+    )
+else:
     st.caption(
         "Amplitude decay is trained on mature Bitcoin cycle anchors independently of the "
         "selected structural-training start. For example, choosing a 2018-11-28 structural "
@@ -534,6 +545,14 @@ if peak_decay or trough_decay:
             f"most recent observed retention: {float(trough_decay.get('recent_retention_per_cycle', float('nan'))):.1%}."
         ),
     )
+    r1, r2, r3, r4, r5, r6 = st.columns(6)
+    r1.metric("Peak robust retention", f"{float(peak_decay.get('robust_retention_per_cycle', float('nan'))):.1%}")
+    r2.metric("Peak recent retention", f"{float(peak_decay.get('recent_retention_per_cycle', float('nan'))):.1%}")
+    r3.metric("Peak final retention", f"{float(peak_decay.get('retention_per_cycle', float('nan'))):.1%}")
+    r4.metric("Trough robust retention", f"{float(trough_decay.get('robust_retention_per_cycle', float('nan'))):.1%}")
+    r5.metric("Trough recent retention", f"{float(trough_decay.get('recent_retention_per_cycle', float('nan'))):.1%}")
+    r6.metric("Trough final retention", f"{float(trough_decay.get('retention_per_cycle', float('nan'))):.1%}")
+
     st.caption(
         f"Amplitude dataset: {diag.get('amplitude_training_start') or '—'} → "
         f"{diag.get('amplitude_training_end') or '—'}; structural training start is "
@@ -628,6 +647,102 @@ if peak_decay or trough_decay:
                     "Next peak log-amplitude change",
                     f"{(next_amp / latest_amp - 1.0):+.1%}" if latest_amp > 0 else "—",
                 )
+
+
+# Total bull-run compression is an independent guardrail from peak/centerline
+# amplitude. This catches cases where a deep trough would otherwise create a
+# larger trough->peak multiple even though peak deviation itself is monotone.
+st.subheader("Bull-run compression guardrail")
+bull_gain_decay = diag.get("bull_gain_decay", {})
+bull_gain_table = diag.get("bull_gain_table")
+if not bull_gain_decay:
+    st.error("Bull-run compression diagnostics are missing from the backend model.")
+else:
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Completed mature bulls used", int(bull_gain_decay.get("observations", 0)))
+    b2.metric(
+        "Bull log-gain retained / cycle",
+        f"{float(bull_gain_decay.get('retention_per_cycle', float('nan'))):.1%}",
+    )
+    b3.metric(
+        "Latest completed bull multiple",
+        f"{float(bull_gain_decay.get('latest_multiple', float('nan'))):.2f}×",
+    )
+    projected_multiple = float("nan")
+    if bull_gain_table is not None and not bull_gain_table.empty:
+        projected = bull_gain_table[bull_gain_table["source"].astype(str).str.contains("projected", case=False, na=False)]
+        if not projected.empty:
+            projected_multiple = float(projected.iloc[0]["bull_multiple"])
+    b4.metric(
+        "Next projected bull multiple",
+        f"{projected_multiple:.2f}×" if np.isfinite(projected_multiple) else "—",
+    )
+
+    st.caption(
+        "This guardrail measures the entire trough-to-peak move, independent of the "
+        "structural centerline. A future bull log gain cannot exceed the mature compression "
+        "trend. It prevents a deep projected trough from mechanically generating a larger "
+        "next-cycle bull multiple."
+    )
+
+    if bull_gain_table is not None and not bull_gain_table.empty:
+        bull_view = bull_gain_table.copy().sort_values("peak_date")
+        bull_view["Bull multiple"] = bull_view["bull_multiple"]
+        bull_view["Bull log gain"] = bull_view["bull_log_gain"]
+        if "target_multiple" in bull_view.columns:
+            bull_view["Target multiple"] = bull_view["target_multiple"]
+        else:
+            bull_view["Target multiple"] = np.nan
+        if "centerline_conflict" in bull_view.columns:
+            bull_view["Centerline conflict"] = bull_view["centerline_conflict"].fillna(False)
+        else:
+            bull_view["Centerline conflict"] = False
+        st.dataframe(
+            bull_view[[
+                "start_date", "peak_date", "source", "start_price_usd", "peak_price_usd",
+                "Bull multiple", "Bull log gain", "Target multiple", "Centerline conflict",
+            ]].style.format({
+                "start_price_usd": "${:,.0f}",
+                "peak_price_usd": "${:,.0f}",
+                "Bull multiple": "{:.2f}×",
+                "Bull log gain": "{:.4f}",
+                "Target multiple": "{:.2f}×",
+            }, na_rep="—"),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+        completed = bull_view[bull_view["source"].astype(str).str.contains("observed", case=False, na=False)]
+        future = bull_view[bull_view["source"].astype(str).str.contains("projected", case=False, na=False)]
+        bull_pass = True
+        if not completed.empty and not future.empty:
+            prior_gain = float(completed.iloc[-1]["bull_log_gain"])
+            for gain in future["bull_log_gain"].to_numpy(dtype=float):
+                if gain > prior_gain + 1e-12:
+                    bull_pass = False
+                    break
+                prior_gain = float(gain)
+        if bull_pass:
+            st.success(
+                "Bull-run compression: PASS — projected trough-to-peak log gains do not "
+                "expand relative to the preceding mature bull run."
+            )
+        else:
+            st.error("Bull-run compression: FAIL — a projected bull run expands versus the prior mature cycle.")
+
+        if "centerline_conflict" in future.columns and future["centerline_conflict"].fillna(False).any():
+            st.warning(
+                "Structural-centerline conflict detected: the independently projected centerline "
+                "rose above the bull-gain compression cap for at least one future peak. The model "
+                "floors that peak at the centerline and flags the conflict so we can evaluate whether "
+                "the structural growth curve itself is too aggressive."
+            )
+
+st.caption(
+    f"Empirical phase-shape dataset starts at {diag.get('phase_shape_training_start', '—')} "
+    "and is independent of the selected structural-training start. This keeps the mature "
+    "2017–2018 and 2021–2022 bear phases available even when structural training starts in 2018."
+)
 
 current_partial_phase = diag.get("current_partial_phase")
 if current_partial_phase:
