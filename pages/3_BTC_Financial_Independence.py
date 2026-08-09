@@ -4,6 +4,11 @@ import streamlit as st
 
 from src.data_pipeline import load_coinmetrics
 from src.price_model import fit_price_model
+from src.walk_forward_calibration import (
+    build_calibrated_price_model,
+    build_calibrated_projection_fingerprint,
+    calibration_is_current,
+)
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 from src.financial_independence import (
@@ -52,7 +57,7 @@ except Exception as exc:
     st.error(f"Price model could not be fitted: {exc}")
     st.stop()
 
-model_fingerprint = build_model_fingerprint(
+base_model_fingerprint = build_model_fingerprint(
     training_start,
     training_end,
     projection_years,
@@ -62,18 +67,85 @@ model_fingerprint = build_model_fingerprint(
 latest_actual = float(
     prices.loc[prices["date"] <= training_end, "price_usd"].iloc[-1]
 )
-btc_paths = build_rebased_btc_paths(model.daily, latest_actual)
+base_btc_paths = build_rebased_btc_paths(model.daily, latest_actual)
+
+calibration = st.session_state.get("walk_forward_calibration_result")
+calibration_current = calibration_is_current(calibration, prices) if calibration is not None else False
+calibration_pass = bool(
+    calibration_current
+    and getattr(calibration, "summary", {}).get("status") == "PASS"
+)
+
+source_options = []
+if calibration_pass:
+    source_options.append("Calibrated Price Model (recommended)")
+source_options.append("Frozen Price Model v3.12")
+projection_source = st.radio(
+    "Bitcoin projection source",
+    source_options,
+    index=0,
+    horizontal=True,
+    help=(
+        "The calibrated model is the frozen v3.12 projection after historical 4Y/8Y "
+        "walk-forward learning adjusts future structural growth and cycle amplitude. "
+        "Choose the frozen model to compare FI results without calibration."
+    ),
+)
+
+if projection_source.startswith("Calibrated"):
+    calibrated_model = build_calibrated_price_model(model, calibration)
+    projected = calibrated_model.daily[
+        calibrated_model.daily["row_type"] == "projected"
+    ].copy()
+    btc_paths = pd.DataFrame({
+        "date": projected["date"].to_numpy(),
+        "btc_centerline_price": projected["calibrated_centerline_usd"].to_numpy(dtype=float),
+        "btc_cycle_price": projected["calibrated_price_usd"].to_numpy(dtype=float),
+    })
+    model_fingerprint = build_calibrated_projection_fingerprint(
+        base_model_fingerprint, calibrated_model
+    )
+    center_scenario_name = "BTC calibrated centerline"
+    cycle_scenario_name = "BTC walk-forward calibrated path"
+    projection_source_label = (
+        f"Walk-forward calibrated — G={calibration.summary['growth_factor']:.3f}×, "
+        f"K={calibration.summary['amplitude_factor']:.3f}×"
+    )
+else:
+    btc_paths = base_btc_paths
+    model_fingerprint = base_model_fingerprint
+    center_scenario_name = "BTC structural centerline"
+    cycle_scenario_name = "BTC cycle-adjusted path"
+    projection_source_label = "Frozen Price Model v3.12"
 
 st.info(
-    f"Active Price Model: **{training_start.date()} → {training_end.date()}**, "
-    f"**{projection_years} years**, fingerprint **{model_fingerprint}**."
+    f"Bitcoin projection: **{projection_source_label}**  \n"
+    f"Parent Price Model: **{training_start.date()} → {training_end.date()}**, "
+    f"**{projection_years} years**. Effective fingerprint **{model_fingerprint}**."
 )
+
+if not calibration_pass:
+    if calibration is None:
+        st.caption(
+            "No validated walk-forward calibration exists in this session yet. Run it on the "
+            "Calibrated Price Model page to make that path the FI default."
+        )
+    elif not calibration_current:
+        st.warning(
+            "The saved calibration is stale for the current Bitcoin data/model engine. Rerun the "
+            "Calibrated Price Model before FI can use it."
+        )
+    else:
+        st.warning(
+            f"The latest calibration status is {calibration.summary.get('status', 'UNKNOWN')}; "
+            "FI is therefore using the frozen v3.12 model."
+        )
 
 saved = st.session_state.get("btc_fi_last_results")
 if saved and saved.get("model_fingerprint") != model_fingerprint:
     st.session_state.pop("btc_fi_last_results", None)
     st.warning(
-        "The active Price Model changed. Previous FI results were cleared. "
+        "The active Bitcoin projection changed. Previous FI results were cleared. "
         "Run the calculation again."
     )
 
@@ -254,7 +326,7 @@ if run:
     with st.spinner("Running FI calculations..."):
         if mode == "Find earliest FI age":
             center = solve_earliest_financial_independence(
-                "BTC structural centerline",
+                center_scenario_name,
                 btc_paths["date"],
                 btc_paths["btc_centerline_price"],
                 btc_monthly_contribution=btc_monthly,
@@ -262,7 +334,7 @@ if run:
                 **common,
             )
             cycle = solve_earliest_financial_independence(
-                "BTC cycle-adjusted path",
+                cycle_scenario_name,
                 btc_paths["date"],
                 btc_paths["btc_cycle_price"],
                 btc_monthly_contribution=btc_monthly,
@@ -312,7 +384,7 @@ if run:
         else:
             coast_value = coast_age if mode == "Coast to FI age" else None
             center_target = solve_required_monthly_contribution(
-                "BTC structural centerline",
+                center_scenario_name,
                 btc_paths["date"],
                 btc_paths["btc_centerline_price"],
                 target_financial_independence_age=target_fi_age,
@@ -321,7 +393,7 @@ if run:
                 **common,
             )
             cycle_target = solve_required_monthly_contribution(
-                "BTC cycle-adjusted path",
+                cycle_scenario_name,
                 btc_paths["date"],
                 btc_paths["btc_cycle_price"],
                 target_financial_independence_age=target_fi_age,
@@ -336,6 +408,7 @@ if run:
             }
 
     payload["model_fingerprint"] = model_fingerprint
+    payload["projection_source"] = projection_source_label
     payload["inputs"] = {
         "current_age": current_age,
         "end_age": end_age,
