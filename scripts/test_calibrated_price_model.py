@@ -67,9 +67,14 @@ def main():
     calibration = WalkForwardCalibrationResult(
         summary={
             "growth_factor": 0.80,
+            "effective_growth_factor": 0.80,
             "amplitude_factor": 0.70,
+            "amplitude_mode": "CONSTANT",
+            "amplitude_trend_center_date": None,
+            "amplitude_trend_center_log_factor": float(np.log(0.70)),
+            "amplitude_trend_effective_log_slope_per_year": 0.0,
             "status": "PASS",
-            "version": "walk-forward-calibration-v1.0",
+            "version": "synthetic-calibration",
         },
         tests=pd.DataFrame(),
         observations=pd.DataFrame(),

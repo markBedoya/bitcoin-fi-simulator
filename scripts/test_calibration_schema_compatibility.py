@@ -1,11 +1,7 @@
 from types import SimpleNamespace
 import pandas as pd
 
-from src.walk_forward_calibration import (
-    CALIBRATION_VERSION,
-    REQUIRED_SUMMARY_KEYS,
-    calibration_is_current,
-)
+from src.walk_forward_calibration import CALIBRATION_VERSION, REQUIRED_SUMMARY_KEYS, calibration_is_current
 from src.price_model import PRICE_MODEL_ENGINE_VERSION
 
 prices = pd.DataFrame({
@@ -14,11 +10,9 @@ prices = pd.DataFrame({
 })
 
 old = SimpleNamespace(summary={
-    "version": "walk-forward-calibration-v1.0",
+    "version": "walk-forward-calibration-v2.0.1-cycle-aware",
     "price_model_engine_version": PRICE_MODEL_ENGINE_VERSION,
     "latest_data_date": "2026-08-07",
-    "growth_factor": 1.0,
-    "amplitude_factor": 1.0,
 })
 assert not calibration_is_current(old, prices)
 
@@ -27,13 +21,12 @@ summary.update({
     "version": CALIBRATION_VERSION,
     "price_model_engine_version": PRICE_MODEL_ENGINE_VERSION,
     "latest_data_date": "2026-08-07",
+    "cycle_parents": [],
 })
 current = SimpleNamespace(summary=summary)
 assert calibration_is_current(current, prices)
 
 missing = dict(summary)
-missing.pop("raw_structural_cv_error")
-incomplete = SimpleNamespace(summary=missing)
-assert not calibration_is_current(incomplete, prices)
-
-print("Calibration schema compatibility checks passed.")
+missing.pop("amplitude_mode")
+assert not calibration_is_current(SimpleNamespace(summary=missing), prices)
+print("Calibration v3 schema compatibility checks passed.")

@@ -86,14 +86,14 @@ projection_source = st.radio(
     index=0,
     horizontal=True,
     help=(
-        "The calibrated model is the frozen v3.12 projection after historical 4Y/8Y "
-        "walk-forward learning adjusts future structural growth and cycle amplitude. "
-        "Choose the frozen model to compare FI results without calibration."
+        "The calibrated model uses a growing ensemble of cycle-aligned frozen-v3.12 parent models, "
+        "then applies separately validated structural and cycle-envelope learning. It is independent "
+        "of the Price Model page's selected training start. Choose the frozen model for comparison."
     ),
 )
 
 if projection_source.startswith("Calibrated"):
-    calibrated_model = build_calibrated_price_model(model, calibration)
+    calibrated_model = build_calibrated_price_model(model, calibration, prices=prices)
     projected = calibrated_model.daily[
         calibrated_model.daily["row_type"] == "projected"
     ].copy()
@@ -108,8 +108,9 @@ if projection_source.startswith("Calibrated"):
     center_scenario_name = "BTC calibrated centerline"
     cycle_scenario_name = "BTC walk-forward calibrated path"
     projection_source_label = (
-        f"Walk-forward calibrated — G={calibration.summary['growth_factor']:.3f}×, "
-        f"K={calibration.summary['amplitude_factor']:.3f}×"
+        f"Dynamic calibrated ensemble — effective G={calibration.summary['effective_growth_factor']:.3f}×, "
+        f"current K={calibration.summary['amplitude_factor']:.3f}× "
+        f"({calibration.summary['amplitude_mode'].lower()})"
     )
 else:
     btc_paths = base_btc_paths
@@ -118,11 +119,19 @@ else:
     cycle_scenario_name = "BTC cycle-adjusted path"
     projection_source_label = "Frozen Price Model v3.12"
 
-st.info(
-    f"Bitcoin projection: **{projection_source_label}**  \n"
-    f"Parent Price Model: **{training_start.date()} → {training_end.date()}**, "
-    f"**{projection_years} years**. Effective fingerprint **{model_fingerprint}**."
-)
+if projection_source.startswith("Calibrated"):
+    parent_dates = ", ".join(p["start_date"][:4] for p in calibration.summary.get("cycle_parents", []))
+    st.info(
+        f"Bitcoin projection: **{projection_source_label}**  \n"
+        f"Cycle-aligned parents: **{parent_dates or 'n/a'}**; projection horizon **{projection_years} years**. "
+        f"Effective fingerprint **{model_fingerprint}**."
+    )
+else:
+    st.info(
+        f"Bitcoin projection: **{projection_source_label}**  \n"
+        f"Parent Price Model: **{training_start.date()} → {training_end.date()}**, "
+        f"**{projection_years} years**. Effective fingerprint **{model_fingerprint}**."
+    )
 
 if not calibration_pass:
     if calibration is None:

@@ -1,3 +1,23 @@
+## v3.15.0 — dynamic cycle-parent ensemble + maturity trend
+
+- Keeps the frozen Price Model v3.12 byte-for-byte unchanged.
+- Separates the model-derived current bear trough price from the frozen schedule's fixed Oct-5-2026 trough date; the calibrated page now states this explicitly.
+- Replaces selected-start dependence with a production cycle-aligned parent ensemble. Current observed trough parents are 2015, 2018, and 2022.
+- Scores each parent using genuine out-of-sample structural/envelope evidence; newer parents start cautiously and can gain weight as more outcomes mature.
+- Adds automatic future parent discovery after enough actual data exists around later cycle windows.
+- Validates structural G independently; rejected structural calibration falls back to effective G = 1.0 instead of worsening the centerline.
+- Tests constant cycle-amplitude K against a time-trending K under held-out envelope forecasts and uses the trend only when it wins out of sample.
+- Projects an accepted K maturity trend forward with confidence shrinkage, allowing each future peak/trough to use a different learned amplitude factor.
+- Makes the calibrated production path independent of the Price Model page's selected training start; that selection remains available only as a frozen-model research comparison.
+- FI consumes the validated dynamic calibrated ensemble by default when calibration status is PASS.
+
+## v3.14.1 — calibration schema hotfix
+
+- Force-reloads a stale in-memory calibration engine after Streamlit hot deploys.
+- Rejects saved calibration results that do not contain the v2 cycle-aware summary schema.
+- Replaces UI KeyError crashes with an actionable rerun message.
+- Adds a regression test covering v1-to-v2 calibration schema compatibility.
+
 # Changelog
 
 ## 3.13.0 — Walk-Forward Calibrated Price Model
@@ -21,3 +41,17 @@
 - Added cloud-safe temporary Coin Metrics cache.
 - Added Streamlit configuration and Codespaces support.
 - Added deployment, contribution, and disclaimer documentation.
+
+## v3.14.0 — Cycle-Aware Multi-Horizon Calibration
+
+- Keeps the frozen Price Model v3.12 engine byte-for-byte unchanged.
+- Replaces the first 12-month pooled calibration objective with a two-part walk-forward objective:
+  - structural growth factor G from 12/24/36/48-month low-frequency realized growth;
+  - cycle amplitude factor K from realized historical peak/trough envelope magnitudes.
+- Uses a hard Jan 14, 2015 calibration floor.
+- Starts true 4Y fake-today tests in Jan 2019 and true 8Y tests in Jan 2023.
+- Uses 180-day trailing log-price medians for structural outcomes and 31-day turning-point medians for envelope outcomes.
+- Reports structural and envelope held-out errors separately as well as a combined cycle-aware OOS score.
+- Adds PASS / MODEST / UNSTABLE / INSUFFICIENT_EVIDENCE / NO_IMPROVEMENT calibration states; FI only auto-selects a PASS calibration.
+- Adds detailed calibration-evidence tables for inspecting implied G/K observations.
+- Uses explicit Streamlit navigation so the sidebar order is Data Management → Price Model → Calibrated Price Model → BTC Financial Independence.
