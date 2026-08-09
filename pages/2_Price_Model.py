@@ -9,13 +9,14 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v3.0.1 — Dual Cycle Compression")
+st.title("Price Model v3.0.2 — Reconciled Geometric Centerline")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
     "(1064 bull + 364 bear). The phase shape is learned from completed historical total-price "
     "moves. When the latest date is inside an unfinished cycle phase, the projection continues "
-    "from that exact phase progress instead of restarting the phase."
+    "from that exact phase progress instead of restarting the phase. Future centerline growth is "
+    "reconciled with mature-cycle compression so the centerline remains inside projected cycles."
 )
 
 try:
@@ -281,6 +282,8 @@ REQUIRED_BACKEND_DIAGNOSTICS = {
     "bull_gain_table",
     "phase_shape_training_independent_of_structural_start",
     "bull_gain_monotone_guardrail",
+    "future_centerline_reconciled",
+    "future_centerline_scale_table",
 }
 
 
@@ -397,7 +400,8 @@ st.caption(
 )
 st.success(
     "Price Model backend capability check: PASS — amplitude diagnostics, mature-cycle "
-    "compression, phase-shape independence, and bull-gain guardrails are loaded."
+    "compression, phase-shape independence, bull-gain guardrails, and future centerline "
+    "reconciliation are loaded."
 )
 
 fig = go.Figure()
@@ -537,6 +541,29 @@ else:
     st.error(
         "A projection-boundary continuity check failed. Do not rely on this "
         "projection until the failed check is resolved."
+    )
+
+st.subheader("Future centerline reconciliation")
+reconciliation_applied = bool(diag.get("future_centerline_reconciliation_applied", False))
+min_center_scale = float(diag.get("future_centerline_min_scale", 1.0))
+scale_table = diag.get("future_centerline_scale_table")
+rc1, rc2, rc3 = st.columns(3)
+rc1.metric("Projection-boundary scale", "1.000×")
+rc2.metric("Minimum future centerline scale", f"{min_center_scale:.3f}×")
+rc3.metric("Maturity reconciliation", "ACTIVE" if reconciliation_applied else "NOT NEEDED")
+st.caption(
+    "The historical structural fit is unchanged. In the future, if the independent mature-cycle "
+    "peak/bull-gain constraints would otherwise force a projected peak onto or below the raw "
+    "structural trend, the future geometric centerline is smoothly reconciled downward instead. "
+    "Projected peaks therefore remain above the displayed centerline and projected troughs below it."
+)
+if scale_table is not None and not scale_table.empty:
+    scale_view = scale_table.copy()
+    scale_view["date"] = pd.to_datetime(scale_view["date"]).dt.date
+    st.dataframe(
+        scale_view.style.format({"scale": "{:.4f}×"}),
+        hide_index=True,
+        use_container_width=True,
     )
 
 st.subheader("Model diagnostics")
@@ -744,16 +771,24 @@ else:
             bull_view["Centerline conflict"] = bull_view["centerline_conflict"].fillna(False)
         else:
             bull_view["Centerline conflict"] = False
+        bull_view["Centerline reconciled"] = bull_view.get(
+            "centerline_reconciled", pd.Series(False, index=bull_view.index)
+        ).fillna(False)
+        bull_view["Centerline scale"] = bull_view.get(
+            "centerline_scale", pd.Series(np.nan, index=bull_view.index)
+        )
         st.dataframe(
             bull_view[[
                 "start_date", "peak_date", "source", "start_price_usd", "peak_price_usd",
-                "Bull multiple", "Bull log gain", "Target multiple", "Centerline conflict",
+                "Bull multiple", "Bull log gain", "Target multiple", "Centerline reconciled",
+                "Centerline scale",
             ]].style.format({
                 "start_price_usd": "${:,.0f}",
                 "peak_price_usd": "${:,.0f}",
                 "Bull multiple": "{:.2f}×",
                 "Bull log gain": "{:.4f}",
                 "Target multiple": "{:.2f}×",
+                "Centerline scale": "{:.3f}×",
             }, na_rep="—"),
             hide_index=True,
             use_container_width=True,
@@ -777,12 +812,12 @@ else:
         else:
             st.error("Bull-run compression: FAIL — a projected bull run expands versus the prior mature cycle.")
 
-        if "centerline_conflict" in future.columns and future["centerline_conflict"].fillna(False).any():
-            st.warning(
-                "Structural-centerline conflict detected: the independently projected centerline "
-                "rose above the bull-gain compression cap for at least one future peak. The model "
-                "floors that peak at the centerline and flags the conflict so we can evaluate whether "
-                "the structural growth curve itself is too aggressive."
+        if "centerline_reconciled" in future.columns and future["centerline_reconciled"].fillna(False).any():
+            st.info(
+                "Future centerline reconciliation was applied: at least one raw structural-centerline "
+                "value conflicted with the mature bull-compression constraints. Instead of flooring "
+                "the peak at the centerline, the model lowered the future geometric centerline so the "
+                "peak keeps a positive decaying amplitude above it."
             )
 
 st.caption(

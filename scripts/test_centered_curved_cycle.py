@@ -34,7 +34,7 @@ future = anchors[
 ]
 peaks = future[future["type"] == "peak"].sort_values("cycle")
 troughs = future[future["type"] == "trough"].sort_values("cycle")
-assert (peaks["log_deviation"] >= -1e-12).all()
+assert (peaks["log_deviation"] >= 0.03 - 1e-10).all()
 assert (troughs["log_deviation"] < 0).all()
 
 # Purely projected amplitudes must not expand cycle over cycle.
