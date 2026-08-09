@@ -11,10 +11,16 @@ history = pd.DataFrame([
 ])
 peak = _anchor_amplitude_decay(history, "peak")
 trough = _anchor_amplitude_decay(history, "trough")
-assert peak["retention_per_cycle"] <= peak["robust_retention_per_cycle"] + 1e-12
-assert peak["retention_per_cycle"] <= peak["recent_retention_per_cycle"] + 1e-12
-assert peak["retention_per_cycle"] < 1.0
-assert trough["retention_per_cycle"] < 1.0
+
+# The empirical raw decay is still monotone, but small samples are shrunk
+# toward neutral retention=1.0 instead of extrapolating one transition at full
+# strength. Effective retention must therefore sit between raw retention and 1.
+assert 0 < peak["raw_retention_per_cycle"] <= peak["retention_per_cycle"] <= 1.0
+assert 0 < trough["raw_retention_per_cycle"] <= trough["retention_per_cycle"] <= 1.0
+assert peak["sample_confidence"] == 2 / 3
+assert trough["sample_confidence"] == 1 / 2
+assert peak["retention_per_cycle"] > peak["raw_retention_per_cycle"]
+assert trough["retention_per_cycle"] > trough["raw_retention_per_cycle"]
 assert _project_anchor_amplitude(peak, 1) <= 0.45 + 1e-12
 assert _project_anchor_amplitude(trough, 1) <= 0.60 + 1e-12
-print("Recent-aware mature peak/trough amplitude decay is monotone.")
+print("Small-sample-shrunk mature peak/trough amplitude decay is monotone.")

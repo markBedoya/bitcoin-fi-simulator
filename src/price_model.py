@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-PRICE_MODEL_ENGINE_VERSION = "price-model-v3.1.0-locked-structural-centerline"
+PRICE_MODEL_ENGINE_VERSION = "price-model-v3.1.1-shrunk-amplitude-lookahead"
 
 GENESIS = pd.Timestamp("2009-01-03")
 FIXED_CYCLE_DAYS = 1428
@@ -658,8 +658,11 @@ def _anchor_amplitude_decay(history: pd.DataFrame, anchor_type: str) -> dict:
             "latest_amplitude": 0.35,
             "log_slope_per_cycle": float(np.log(0.90)),
             "retention_per_cycle": 0.90,
+            "raw_retention_per_cycle": 0.90,
             "robust_retention_per_cycle": 0.90,
             "recent_retention_per_cycle": np.nan,
+            "transitions": 0,
+            "sample_confidence": 0.0,
             "retention_method": "fallback",
         }
 
@@ -696,27 +699,48 @@ def _anchor_amplitude_decay(history: pd.DataFrame, anchor_type: str) -> dict:
     else:
         recent_retention = np.nan
 
-    # Favor the more conservative of the mature-history trend and the latest
-    # observed mature-cycle change. Neither is allowed to imply expansion.
+    # First form the raw empirical retention from the mature-history trend and
+    # the latest observed same-type change.  With only two observed peaks (or
+    # troughs), however, that raw number is based on a *single* cycle-to-cycle
+    # transition and can wildly overfit one unusually large compression move.
+    #
+    # Apply sample-size shrinkage in log-retention space toward the neutral
+    # hypothesis of 1.0 (no further compression).  The data receive weight
+    # transitions / (transitions + 1), so one observed transition gets 50%
+    # weight, two transitions 67%, three 75%, etc.  As more cycles arrive the
+    # shrinkage naturally disappears.  This is deliberately not a hard-coded
+    # amplitude floor: it only controls how much confidence we place in a tiny
+    # sample when extrapolating the *rate* of decay.
     finite_recent = np.isfinite(recent_retention)
-    retention = min(
+    raw_retention = min(
         robust_retention,
         float(recent_retention) if finite_recent else 1.0,
         1.0,
     )
-    retention = float(np.clip(retention, 0.25, 1.0))
+    raw_retention = float(np.clip(raw_retention, 0.25, 1.0))
+    transition_count = max(int(len(amps)) - 1, 0)
+    if transition_count > 0:
+        sample_confidence = float(transition_count / (transition_count + 1.0))
+        retention = float(np.exp(sample_confidence * np.log(raw_retention)))
+    else:
+        sample_confidence = 0.0
+        retention = 0.90
+    retention = float(np.clip(retention, raw_retention, 1.0))
     slope = float(np.log(retention))
 
     return {
         "anchor_type": anchor_type,
         "observations": int(len(amps)),
+        "transitions": int(transition_count),
+        "sample_confidence": float(sample_confidence),
         "latest_cycle": float(cycles[-1]),
         "latest_amplitude": float(amps[-1]),
         "log_slope_per_cycle": slope,
         "retention_per_cycle": retention,
+        "raw_retention_per_cycle": raw_retention,
         "robust_retention_per_cycle": float(robust_retention),
         "recent_retention_per_cycle": float(recent_retention) if finite_recent else np.nan,
-        "retention_method": "min(robust mature trend, most recent observed retention)",
+        "retention_method": "small-sample shrinkage of empirical retention toward 100%",
     }
 
 
@@ -1504,23 +1528,52 @@ def fit_price_model(prices, training_start, training_end, projection_years):
     if len(train) < 1000:
         raise ValueError("Select at least 1,000 daily training observations.")
 
+    projection_end = training_end + pd.DateOffset(years=projection_years)
     future_dates = pd.date_range(
         training_end + pd.Timedelta(days=1),
-        training_end + pd.DateOffset(years=projection_years),
+        projection_end,
         freq="D",
     )
 
-    structural_centerline, trend_diag = _fit_centerline(train, future_dates)
-    all_dates = pd.DatetimeIndex(train["date"].tolist() + future_dates.tolist())
+    # The visible horizon can end halfway through a bull or bear phase.  The
+    # phase interpolator needs the *next* turning point to know where that
+    # unfinished segment is heading.  Model through one look-ahead anchor, then
+    # trim the public daily output back to the requested horizon.  Without this,
+    # the projection became flat after the last in-horizon turning point.
+    lookahead_schedule = _fixed_cycle_anchors(training_start, projection_end)
+    later_anchors = lookahead_schedule.loc[
+        lookahead_schedule["date"] > projection_end, "date"
+    ]
+    model_end = (
+        pd.Timestamp(later_anchors.min())
+        if not later_anchors.empty
+        else pd.Timestamp(projection_end)
+    )
+    model_future_dates = pd.date_range(
+        training_end + pd.Timedelta(days=1),
+        model_end,
+        freq="D",
+    )
 
-    fitted_or_projected, deviation_path, cycle_progress, knots, overlays, template, display_centerline, cycle_diag = _build_cycle_fit(
+    structural_centerline_model, trend_diag = _fit_centerline(train, model_future_dates)
+    all_model_dates = pd.DatetimeIndex(train["date"].tolist() + model_future_dates.tolist())
+
+    fitted_model, deviation_model, progress_model, knots, overlays, template, display_centerline_model, cycle_diag = _build_cycle_fit(
         data=data,
         train=train,
-        all_dates=all_dates,
-        structural_centerline=structural_centerline,
+        all_dates=all_model_dates,
+        structural_centerline=structural_centerline_model,
         training_start=training_start,
         training_end=training_end,
     )
+
+    visible_len = len(train) + len(future_dates)
+    all_dates = all_model_dates[:visible_len]
+    fitted_or_projected = fitted_model[:visible_len]
+    deviation_path = deviation_model[:visible_len]
+    cycle_progress = progress_model[:visible_len]
+    display_centerline = display_centerline_model[:visible_len]
+    structural_centerline = structural_centerline_model[:visible_len]
 
     latest_actual_price = float(train["price_usd"].iloc[-1])
     fitted_endpoint = float(fitted_or_projected[len(train) - 1])
@@ -1559,7 +1612,11 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "latest_actual_price": latest_actual_price,
         "fitted_endpoint_price": fitted_endpoint,
         "fitted_endpoint_error_pct": float(endpoint_error),
-        "cycle_anchor_table": knots,
+        "cycle_anchor_table": knots[knots["date"] <= projection_end].copy(),
+        "cycle_anchor_lookahead_table": knots[knots["date"] > projection_end].copy(),
+        "projection_end_date": pd.Timestamp(projection_end),
+        "projection_lookahead_anchor_date": pd.Timestamp(model_end),
+        "projection_tail_uses_lookahead_anchor": bool(model_end > projection_end),
         **cycle_diag,
     }
     return PriceModelResult(daily, diagnostics, overlays, template)
@@ -1593,6 +1650,12 @@ def _score_projection_endpoint_exact(
         (schedule["date"] > training_end) & (schedule["date"] <= target_date),
         "date",
     ].tolist()
+    after_target = schedule.loc[schedule["date"] > target_date, "date"]
+    if not after_target.empty:
+        # Include exactly one anchor beyond the target so a horizon ending
+        # mid-phase is scored on the same interpolated segment as the full
+        # daily model instead of being flat-filled from the prior turning point.
+        future_anchor_dates.append(pd.Timestamp(after_target.min()))
     sparse_future = pd.DatetimeIndex(sorted(set(future_anchor_dates + [target_date])))
 
     structural_centerline, _ = _fit_centerline(train, sparse_future)

@@ -9,7 +9,7 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v3.1 — Locked Structural Centerline")
+st.title("Price Model v3.1.1 — Locked Centerline + Shrunk Cycle Amplitude")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
@@ -561,6 +561,17 @@ if backbone_locked and not centerline_adjusted:
 else:
     st.error("Structural backbone: FAIL — a future rule altered the structural centerline.")
 
+lookahead_used = bool(diag.get("projection_tail_uses_lookahead_anchor", False))
+lookahead_date = diag.get("projection_lookahead_anchor_date")
+if lookahead_used and lookahead_date is not None:
+    st.success(
+        "Projection tail: PASS — an internal next turning point "
+        f"({pd.Timestamp(lookahead_date).date().isoformat()}) is used to shape the unfinished final phase, "
+        "then the displayed series is trimmed back to the selected horizon."
+    )
+else:
+    st.caption("Projection tail ends on a modeled turning point; no internal look-ahead anchor is required.")
+
 st.subheader("Model diagnostics")
 m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Bull phase", f'{diag.get("bull_days", 1064):,} days')
@@ -597,34 +608,40 @@ else:
     a1, a2, a3, a4 = st.columns(4)
     a1.metric("Mature peaks used", int(peak_decay.get("observations", 0)))
     a2.metric(
-        "Peak amplitude retained / cycle",
+        "Peak effective retention / cycle",
         f"{float(peak_decay.get('retention_per_cycle', float('nan'))):.1%}",
         help=(
-            f"Robust mature trend: {float(peak_decay.get('robust_retention_per_cycle', float('nan'))):.1%}; "
-            f"most recent observed retention: {float(peak_decay.get('recent_retention_per_cycle', float('nan'))):.1%}."
+            f"Raw empirical retention: {float(peak_decay.get('raw_retention_per_cycle', float('nan'))):.1%}; "
+            f"sample confidence: {float(peak_decay.get('sample_confidence', float('nan'))):.0%}. "
+            "Small samples are shrunk toward no-change instead of extrapolating one unusually large compression move at full strength."
         ),
     )
     a3.metric("Mature troughs used", int(trough_decay.get("observations", 0)))
     a4.metric(
-        "Trough amplitude retained / cycle",
+        "Trough effective retention / cycle",
         f"{float(trough_decay.get('retention_per_cycle', float('nan'))):.1%}",
         help=(
-            f"Robust mature trend: {float(trough_decay.get('robust_retention_per_cycle', float('nan'))):.1%}; "
-            f"most recent observed retention: {float(trough_decay.get('recent_retention_per_cycle', float('nan'))):.1%}."
+            f"Raw empirical retention: {float(trough_decay.get('raw_retention_per_cycle', float('nan'))):.1%}; "
+            f"sample confidence: {float(trough_decay.get('sample_confidence', float('nan'))):.0%}."
         ),
     )
     r1, r2, r3, r4, r5, r6 = st.columns(6)
-    r1.metric("Peak robust retention", f"{float(peak_decay.get('robust_retention_per_cycle', float('nan'))):.1%}")
-    r2.metric("Peak recent retention", f"{float(peak_decay.get('recent_retention_per_cycle', float('nan'))):.1%}")
-    r3.metric("Peak final retention", f"{float(peak_decay.get('retention_per_cycle', float('nan'))):.1%}")
-    r4.metric("Trough robust retention", f"{float(trough_decay.get('robust_retention_per_cycle', float('nan'))):.1%}")
-    r5.metric("Trough recent retention", f"{float(trough_decay.get('recent_retention_per_cycle', float('nan'))):.1%}")
-    r6.metric("Trough final retention", f"{float(trough_decay.get('retention_per_cycle', float('nan'))):.1%}")
+    r1.metric("Peak raw retention", f"{float(peak_decay.get('raw_retention_per_cycle', float('nan'))):.1%}")
+    r2.metric("Peak sample confidence", f"{float(peak_decay.get('sample_confidence', float('nan'))):.0%}")
+    r3.metric("Peak effective retention", f"{float(peak_decay.get('retention_per_cycle', float('nan'))):.1%}")
+    r4.metric("Trough raw retention", f"{float(trough_decay.get('raw_retention_per_cycle', float('nan'))):.1%}")
+    r5.metric("Trough sample confidence", f"{float(trough_decay.get('sample_confidence', float('nan'))):.0%}")
+    r6.metric("Trough effective retention", f"{float(trough_decay.get('retention_per_cycle', float('nan'))):.1%}")
 
     st.caption(
         f"Amplitude dataset inside selected structural fit: {diag.get('amplitude_training_start') or '—'} → "
         f"{diag.get('amplitude_training_end') or '—'}; structural training start is "
         f"{training_start.date().isoformat()}."
+    )
+    st.caption(
+        "Small-sample shrinkage changes only the extrapolated amplitude-decay rate. It does not move "
+        "the structural centerline or alter observed turning points. With more completed cycles, the "
+        "effective retention automatically converges toward the empirical rate."
     )
 
     amplitude_knots = diag.get("amplitude_anchor_table")
