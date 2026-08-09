@@ -1,14 +1,15 @@
+import importlib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from src.data_pipeline import load_coinmetrics
-from src.price_model import fit_price_model, find_most_conservative_training_start
+import src.price_model as price_model_engine
 from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v3.0 — Dual Cycle Compression")
+st.title("Price Model v3.0.1 — Dual Cycle Compression")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
@@ -48,7 +49,7 @@ def run_conservative_search(minimum_years: int):
         )
 
     try:
-        best, results_table = find_most_conservative_training_start(
+        best, results_table = price_model_engine.find_most_conservative_training_start(
             prices=prices,
             training_end=search_end,
             projection_years=projection_years,
@@ -272,14 +273,61 @@ if leaderboard is not None and not leaderboard.empty:
             st.rerun()
 
 
+REQUIRED_BACKEND_DIAGNOSTICS = {
+    "amplitude_anchor_table",
+    "peak_amplitude_decay",
+    "trough_amplitude_decay",
+    "bull_gain_decay",
+    "bull_gain_table",
+    "phase_shape_training_independent_of_structural_start",
+    "bull_gain_monotone_guardrail",
+}
+
+
+def _fit_with_loaded_engine():
+    return price_model_engine.fit_price_model(
+        prices, training_start, training_end, projection_years
+    )
+
+
 try:
-    result = fit_price_model(prices, training_start, training_end, projection_years)
+    result = _fit_with_loaded_engine()
 except Exception as exc:
     st.error(str(exc))
     st.stop()
 
-daily = result.daily
+# Streamlit can occasionally rerun a changed page while a previously imported
+# local module is still resident in the Python process. Test capabilities, not
+# a hard-coded version string. If required diagnostics are missing, reload the
+# engine source once and recompute before declaring a genuine incompatibility.
 diag = result.diagnostics
+missing_backend_features = sorted(REQUIRED_BACKEND_DIAGNOSTICS.difference(diag.keys()))
+loaded_engine_version = getattr(price_model_engine, "PRICE_MODEL_ENGINE_VERSION", None)
+if missing_backend_features or loaded_engine_version is None:
+    try:
+        importlib.invalidate_caches()
+        price_model_engine = importlib.reload(price_model_engine)
+        result = _fit_with_loaded_engine()
+        diag = result.diagnostics
+        missing_backend_features = sorted(
+            REQUIRED_BACKEND_DIAGNOSTICS.difference(diag.keys())
+        )
+        loaded_engine_version = getattr(
+            price_model_engine, "PRICE_MODEL_ENGINE_VERSION", None
+        )
+    except Exception as exc:
+        st.error(f"Unable to reload the Price Model engine: {exc}")
+        st.stop()
+
+if missing_backend_features:
+    st.error(
+        "The loaded Price Model engine is missing capabilities required by this page: "
+        + ", ".join(missing_backend_features)
+        + ". Redeploy the repository so Streamlit reloads src/price_model.py."
+    )
+    st.stop()
+
+daily = result.daily
 hist = daily[daily["row_type"] == "historical_training"]
 proj = daily[daily["row_type"] == "projected"]
 
@@ -344,14 +392,13 @@ c5.metric("Bull / bear days", f'{diag.get("bull_days", 1064)} / {diag.get("bear_
 
 st.caption(
     f"Active Price Model fingerprint: **{active_model_fingerprint}**. "
-    f"Backend model: **{diag.get('model_version', 'UNKNOWN')}**. "
+    f"Backend model: **{diag.get('model_version', getattr(price_model_engine, 'PRICE_MODEL_ENGINE_VERSION', 'UNKNOWN'))}**. "
     "BTC Financial Independence will use this exact model."
 )
-if diag.get("model_version") != "price-model-v3.0-dual-cycle-compression":
-    st.error(
-        "Price Model UI/backend version mismatch. The page is newer than the loaded "
-        "model engine. Replace src/price_model.py with the release copy and redeploy."
-    )
+st.success(
+    "Price Model backend capability check: PASS — amplitude diagnostics, mature-cycle "
+    "compression, phase-shape independence, and bull-gain guardrails are loaded."
+)
 
 fig = go.Figure()
 fig.add_trace(go.Scatter(

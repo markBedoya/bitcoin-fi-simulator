@@ -2,6 +2,8 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
+PRICE_MODEL_ENGINE_VERSION = "price-model-v3.0.1-dual-cycle-compression"
+
 GENESIS = pd.Timestamp("2009-01-03")
 FIXED_CYCLE_DAYS = 1428
 FIXED_BULL_DAYS = 1064
@@ -1484,7 +1486,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "cycle_shape_value": deviation_path,
         "cycle_amplitude": np.abs(deviation_path),
         "fitted_or_projected_price_usd": fitted_or_projected,
-        "model_version": "price-model-v3.0-dual-cycle-compression",
+        "model_version": PRICE_MODEL_ENGINE_VERSION,
         "training_start_date": training_start.date().isoformat(),
         "training_end_date": training_end.date().isoformat(),
     })
@@ -1498,7 +1500,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "training_start": training_start.date().isoformat(),
         "training_end": training_end.date().isoformat(),
         "projection_years": projection_years,
-        "model_version": "price-model-v3.0-dual-cycle-compression",
+        "model_version": PRICE_MODEL_ENGINE_VERSION,
         "amplitude_scale": 1.0,
         "amplitude_retained_per_cycle": np.nan,
         "template_log_mean": 0.0,
