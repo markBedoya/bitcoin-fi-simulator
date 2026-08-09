@@ -71,9 +71,19 @@ base_btc_paths = build_rebased_btc_paths(model.daily, latest_actual)
 
 calibration = st.session_state.get("walk_forward_calibration_result")
 calibration_current = calibration_is_current(calibration, prices) if calibration is not None else False
+calibrated_candidate = None
+calibration_geometry_valid = False
+if calibration_current and getattr(calibration, "summary", {}).get("status") == "PASS":
+    try:
+        calibrated_candidate = build_calibrated_price_model(model, calibration, prices=prices)
+        calibration_geometry_valid = bool(calibrated_candidate.diagnostics.get("geometry_valid", False))
+    except Exception:
+        calibrated_candidate = None
+        calibration_geometry_valid = False
 calibration_pass = bool(
     calibration_current
     and getattr(calibration, "summary", {}).get("status") == "PASS"
+    and calibration_geometry_valid
 )
 
 source_options = []
@@ -93,7 +103,7 @@ projection_source = st.radio(
 )
 
 if projection_source.startswith("Calibrated"):
-    calibrated_model = build_calibrated_price_model(model, calibration, prices=prices)
+    calibrated_model = calibrated_candidate if calibrated_candidate is not None else build_calibrated_price_model(model, calibration, prices=prices)
     projected = calibrated_model.daily[
         calibrated_model.daily["row_type"] == "projected"
     ].copy()
@@ -108,9 +118,10 @@ if projection_source.startswith("Calibrated"):
     center_scenario_name = "BTC calibrated centerline"
     cycle_scenario_name = "BTC walk-forward calibrated path"
     projection_source_label = (
-        f"Dynamic calibrated ensemble — effective G={calibration.summary['effective_growth_factor']:.3f}×, "
+        f"Dynamic calibrated ensemble — effective G={calibration.summary['effective_growth_factor']:.3f}× "
+        f"(trust {calibration.summary.get('structural_blend_weight', 0.0):.0%}), "
         f"current K={calibration.summary['amplitude_factor']:.3f}× "
-        f"({calibration.summary['amplitude_mode'].lower()})"
+        f"({calibration.summary['amplitude_mode'].lower()}, trend trust {calibration.summary.get('amplitude_trend_blend_weight', 0.0):.0%})"
     )
 else:
     btc_paths = base_btc_paths
@@ -143,6 +154,11 @@ if not calibration_pass:
         st.warning(
             "The saved calibration is stale for the current Bitcoin data/model engine. Rerun the "
             "Calibrated Price Model before FI can use it."
+        )
+    elif calibration_current and calibration.summary.get("status") == "PASS" and not calibration_geometry_valid:
+        st.warning(
+            "The calibration passed historical validation but its current forward path failed peak/trough geometry validation. "
+            "FI is therefore using the frozen v3.12 model until the calibrated path is geometrically valid."
         )
     else:
         st.warning(

@@ -21,12 +21,13 @@ from src.price_model import (
 # The frozen Price Model remains untouched.  This layer learns from genuine
 # walk-forward outcomes and maintains a growing ensemble of cycle-aligned
 # parent models.  New confirmed troughs can join the parent set over time.
-CALIBRATION_VERSION = "walk-forward-calibration-v3.0.0-dynamic-cycle-ensemble"
+CALIBRATION_VERSION = "walk-forward-calibration-v4.0.0-cycle-disciplined-learning"
 CALIBRATION_FLOOR = pd.Timestamp("2015-01-14")
 LOOKBACK_YEARS = (4, 8)
 FAKE_TODAY_STEP_MONTHS = 6
 EVALUATION_HORIZONS_MONTHS = (12, 24, 36, 48)
 MAX_EVALUATION_MONTHS = max(EVALUATION_HORIZONS_MONTHS)
+ENVELOPE_MAX_EVALUATION_MONTHS = 96
 STRUCTURAL_SMOOTHING_DAYS = 180
 ANCHOR_SMOOTHING_DAYS = 31
 
@@ -41,20 +42,25 @@ PARENT_TEST_STEP_MONTHS = 12
 
 GROWTH_FACTOR_MIN = 0.45
 GROWTH_FACTOR_MAX = 1.30
-AMPLITUDE_FACTOR_MIN = 0.20
+AMPLITUDE_FACTOR_MIN = 0.01
 AMPLITUDE_FACTOR_MAX = 1.30
 GROWTH_PRIOR_WEIGHT = 1.0
 AMPLITUDE_PRIOR_WEIGHT = 0.75
+GEOMETRY_NUMERICAL_EPS_LOG = 1e-10
 
 REQUIRED_SUMMARY_KEYS = frozenset({
     "growth_factor",
     "effective_growth_factor",
+    "structural_blend_weight",
     "growth_status",
     "amplitude_factor",
+    "amplitude_constant_factor",
+    "amplitude_trend_blend_weight",
     "amplitude_mode",
     "amplitude_trend_direction",
     "amplitude_trend_confidence",
-    "amplitude_trend_annual_change",
+    "amplitude_trend_change_per_cycle",
+    "geometry_guard_enabled",
     "raw_cv_error",
     "calibrated_cv_error",
     "raw_structural_cv_error",
@@ -310,7 +316,7 @@ def _build_backtest_snapshot_for_start(
         raise ValueError("At least 12 months of unseen future data are required for a walk-forward snapshot.")
 
     max_horizon = max(horizons)
-    projection_years = max(2, int(np.ceil(max_horizon / 12.0)) + 1)
+    projection_years = max(2, int(np.ceil(max(max_horizon, ENVELOPE_MAX_EVALUATION_MONTHS) / 12.0)) + 1)
     asof_prices = data[data["date"] <= training_end].copy()
     model = fit_price_model(
         prices=asof_prices,
@@ -362,14 +368,14 @@ def _build_backtest_snapshot_for_start(
     structural = pd.DataFrame(structural_rows)
     G_snapshot = _snapshot_growth_factor(structural)
 
-    evaluation_end = min(training_end + pd.DateOffset(months=MAX_EVALUATION_MONTHS), latest)
+    evaluation_end = min(training_end + pd.DateOffset(months=ENVELOPE_MAX_EVALUATION_MONTHS), latest)
     envelope_rows = []
     anchors = discover_observed_cycle_anchors(data)
-    for anchor in anchors.itertuples(index=False):
+    eligible_anchors = anchors[(pd.to_datetime(anchors["date"]) > training_end) & (pd.to_datetime(anchors["date"]) <= evaluation_end)].copy()
+    eligible_anchors = eligible_anchors.sort_values("date").reset_index(drop=True)
+    for ahead_idx, anchor in enumerate(eligible_anchors.itertuples(index=False), start=1):
         anchor_date = pd.Timestamp(anchor.date).normalize()
         anchor_type = str(anchor.type)
-        if not (training_end < anchor_date <= evaluation_end):
-            continue
         if anchor_date not in daily.index:
             continue
         raw_center = float(daily.loc[anchor_date, "structural_centerline_usd"])
@@ -391,6 +397,8 @@ def _build_backtest_snapshot_for_start(
             "anchor_date": anchor_date,
             "anchor_type": anchor_type,
             "cycle": int(getattr(anchor, "cycle", 0)),
+            "turning_point_ahead": int(ahead_idx),
+            "cycle_horizon": int((ahead_idx + 1) // 2),
             "months_forward": float(months_forward),
             "start_centerline_usd": c0,
             "raw_centerline_usd": raw_center,
@@ -499,38 +507,106 @@ def _cross_validate_structural(structural: pd.DataFrame) -> dict:
     }
 
 
-def _amplitude_trend_points(tests: pd.DataFrame) -> pd.DataFrame:
-    if tests.empty:
+def _amplitude_cycle_points(envelope: pd.DataFrame) -> pd.DataFrame:
+    """Collapse repeated forecasts into independent realized cycle-regime evidence.
+
+    Multiple fake-today forecasts can target the same realized turning point.  They
+    are useful forecast-origin observations, but they are not independent market
+    cycles.  Trend fitting therefore first aggregates by realized anchor and then
+    by cycle index so one 2025 peak cannot masquerade as many separate maturity
+    observations.
+    """
+    if envelope is None or envelope.empty or "cycle" not in envelope.columns:
         return pd.DataFrame()
+    work = envelope.copy()
+    if "implied_amplitude_factor" not in work.columns:
+        work["actual_amplitude_raw_centerline"] = work.apply(lambda r: _actual_anchor_amplitude(r, 1.0), axis=1)
+        work["implied_amplitude_factor"] = np.where(
+            work["raw_amplitude"].to_numpy(dtype=float) > 0,
+            work["actual_amplitude_raw_centerline"].to_numpy(dtype=float) / work["raw_amplitude"].to_numpy(dtype=float),
+            np.nan,
+        )
+    work = work[np.isfinite(work["implied_amplitude_factor"]) & (work["raw_amplitude"] > 0.02)].copy()
+    if work.empty:
+        return pd.DataFrame()
+
+    anchor_rows = []
+    for (cycle, anchor_date, anchor_type), grp in work.groupby(["cycle", "anchor_date", "anchor_type"], dropna=False):
+        vals = grp["implied_amplitude_factor"].to_numpy(dtype=float)
+        w = np.maximum(grp["evidence_weight"].to_numpy(dtype=float), 1e-9)
+        anchor_rows.append({
+            "cycle_index": int(cycle),
+            "anchor_date": pd.Timestamp(anchor_date),
+            "anchor_type": str(anchor_type),
+            "factor": float(np.clip(_weighted_median(vals, w), AMPLITUDE_FACTOR_MIN, AMPLITUDE_FACTOR_MAX)),
+            # Repeated fake-today predictions do not multiply independent-cycle
+            # confidence.  The anchor gets one unit, mildly increased when both
+            # long and short forecast origins agree.
+            "weight": float(np.clip(np.sqrt(len(grp)), 1.0, 2.0)),
+            "forecast_origins": int(len(grp)),
+        })
+    anchors = pd.DataFrame(anchor_rows)
     rows = []
-    valid = tests[tests["envelope_points"] > 0].copy()
+    for cycle, grp in anchors.groupby("cycle_index"):
+        vals = grp["factor"].to_numpy(dtype=float)
+        w = grp["weight"].to_numpy(dtype=float)
+        rows.append({
+            "cycle_index": int(cycle),
+            "date": pd.Timestamp(grp["anchor_date"].max()),
+            "factor": float(_weighted_median(vals, w)),
+            "weight": float(len(grp)),  # at most one independent vote per realized turning point
+            "realized_turning_points": int(len(grp)),
+            "forecast_origins": int(grp["forecast_origins"].sum()),
+        })
+    return pd.DataFrame(rows).sort_values("cycle_index").reset_index(drop=True)
+
+
+def _amplitude_trend_points(tests: pd.DataFrame) -> pd.DataFrame:
+    """Backward-compatible helper used by older tests/tools.
+
+    v4 production trend fitting uses `_amplitude_cycle_points` instead.  When a
+    caller passes date/factor observations directly this function still produces
+    the previous fake-today aggregation shape.
+    """
+    if tests is None or tests.empty:
+        return pd.DataFrame()
+    if {"date", "factor", "weight"}.issubset(tests.columns):
+        return tests[["date", "factor", "weight"]].copy().sort_values("date").reset_index(drop=True)
+    rows = []
+    valid = tests[tests.get("envelope_points", 0) > 0].copy() if "envelope_points" in tests.columns else pd.DataFrame()
     if valid.empty:
         return pd.DataFrame()
     for d, grp in valid.groupby(pd.to_datetime(valid["fake_today"])):
         vals = grp["snapshot_amplitude_factor"].to_numpy(dtype=float)
         weights = np.maximum(grp["envelope_evidence_weight"].to_numpy(dtype=float), 0.25)
-        rows.append({
-            "date": pd.Timestamp(d),
-            "factor": _weighted_median(vals, weights),
-            "weight": float(np.sum(weights)),
-            "lookbacks": int(len(grp)),
-        })
+        rows.append({"date": pd.Timestamp(d), "factor": _weighted_median(vals, weights), "weight": float(np.sum(weights))})
     return pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
 
 
 def _fit_amplitude_trend(points: pd.DataFrame) -> dict:
-    if points.empty:
+    """Fit a conservatively shrunk maturity trend.
+
+    Production points use Bitcoin cycle index rather than calendar time.  This
+    prevents a -15%/year rule from compounding four times inside one market cycle
+    and, more importantly, bases confidence on independent realized cycles.
+    """
+    if points is None or points.empty:
         return {
             "mode": "CONSTANT", "direction": "NO_CLEAR_TREND", "confidence": 0.0,
-            "r2": float("nan"), "raw_log_slope_per_year": 0.0, "effective_log_slope_per_year": 0.0,
-            "center_date": None, "center_log_factor": 0.0, "constant_factor": 1.0,
+            "r2": float("nan"), "raw_log_slope_per_cycle": 0.0, "effective_log_slope_per_cycle": 0.0,
+            "center_cycle": 0.0, "center_log_factor": 0.0, "constant_factor": 1.0, "n_eff": 0.0,
+            "change_per_cycle": 0.0,
         }
     p = points.copy()
     factor = np.clip(p["factor"].to_numpy(dtype=float), AMPLITUDE_FACTOR_MIN, AMPLITUDE_FACTOR_MAX)
     w = np.maximum(p["weight"].to_numpy(dtype=float), 1e-9)
-    dates = pd.to_datetime(p["date"])
-    origin = pd.Timestamp(dates.min())
-    x = np.array([(pd.Timestamp(d) - origin).days / 365.25 for d in dates], dtype=float)
+    if "cycle_index" in p.columns:
+        x = p["cycle_index"].to_numpy(dtype=float)
+    else:
+        dates = pd.to_datetime(p["date"])
+        origin = pd.Timestamp(dates.min())
+        # Compatibility conversion: one x-unit is one fixed Bitcoin cycle.
+        x = np.array([(pd.Timestamp(d) - origin).days / FIXED_CYCLE_DAYS for d in dates], dtype=float)
     y = np.log(factor)
     xbar = float(np.average(x, weights=w))
     ybar = float(np.average(y, weights=w))
@@ -541,10 +617,13 @@ def _fit_amplitude_trend(points: pd.DataFrame) -> dict:
     sst = float(np.sum(w * (y - ybar) ** 2))
     r2 = float(np.clip(1.0 - sse / sst, 0.0, 1.0)) if sst > 1e-12 else 0.0
     n_eff = float((w.sum() ** 2) / max(np.sum(w ** 2), 1e-12))
+    # With only 2-3 independent mature cycles, trend confidence must remain
+    # modest even when R² happens to look excellent.
     confidence = float(np.clip((n_eff / (n_eff + 4.0)) * r2, 0.0, 1.0))
     effective_slope = slope * confidence
-    constant_factor = _regularized_factor(factor, w, lower=AMPLITUDE_FACTOR_MIN, upper=AMPLITUDE_FACTOR_MAX, prior_weight=AMPLITUDE_PRIOR_WEIGHT)
-    center_date = origin + pd.Timedelta(days=xbar * 365.25)
+    constant_factor = _regularized_factor(
+        factor, w, lower=AMPLITUDE_FACTOR_MIN, upper=AMPLITUDE_FACTOR_MAX, prior_weight=AMPLITUDE_PRIOR_WEIGHT
+    )
     if confidence < 0.10 or abs(effective_slope) < 1e-4:
         direction = "NO_CLEAR_TREND"
     else:
@@ -554,50 +633,203 @@ def _fit_amplitude_trend(points: pd.DataFrame) -> dict:
         "direction": direction,
         "confidence": confidence,
         "r2": r2,
-        "raw_log_slope_per_year": slope,
-        "effective_log_slope_per_year": effective_slope,
-        "annual_change": float(np.expm1(effective_slope)),
-        "center_date": pd.Timestamp(center_date),
-        "center_log_factor": ybar,
+        "raw_log_slope_per_cycle": slope,
+        "effective_log_slope_per_cycle": effective_slope,
+        "change_per_cycle": float(np.expm1(effective_slope)),
+        "center_cycle": float(xbar),
+        "center_log_factor": float(ybar),
         "constant_factor": float(constant_factor),
         "n_eff": n_eff,
     }
 
 
-def _trend_factor_at_date(trend: dict, date: pd.Timestamp) -> float:
-    if trend.get("center_date") is None:
-        return float(trend.get("constant_factor", 1.0))
-    years = (pd.Timestamp(date) - pd.Timestamp(trend["center_date"])).days / 365.25
-    log_factor = float(trend["center_log_factor"]) + float(trend["effective_log_slope_per_year"]) * years
+def _trend_factor_at_cycle(trend: dict, cycle_index: float) -> float:
+    log_factor = float(trend.get("center_log_factor", np.log(max(trend.get("constant_factor", 1.0), 1e-12))))
+    log_factor += float(trend.get("effective_log_slope_per_cycle", 0.0)) * (float(cycle_index) - float(trend.get("center_cycle", 0.0)))
     return float(np.clip(np.exp(log_factor), AMPLITUDE_FACTOR_MIN, AMPLITUDE_FACTOR_MAX))
 
 
-def _cross_validate_amplitude_mode(tests: pd.DataFrame, envelope: pd.DataFrame, mode: str) -> dict:
-    points = _amplitude_trend_points(tests)
-    if points.empty or envelope.empty:
-        return {"raw": float("nan"), "calibrated": float("nan"), "holdouts": pd.DataFrame()}
-    rows = []
-    for holdout in sorted(pd.to_datetime(points["date"].unique())):
-        train_tests = tests[pd.to_datetime(tests["fake_today"]) != holdout]
-        test_env = envelope[pd.to_datetime(envelope["fake_today"]) == holdout]
-        if train_tests.empty or test_env.empty:
-            continue
-        if mode == "TREND":
-            fit = _fit_amplitude_trend(_amplitude_trend_points(train_tests))
-            K = _trend_factor_at_date(fit, holdout)
+def _trend_factor_at_date(trend: dict, date: pd.Timestamp) -> float:
+    """Compatibility wrapper for older tests.
+
+    If a date-based center is supplied, convert elapsed time to fixed-cycle units;
+    v4 production forecasts call `_trend_factor_at_cycle` directly.
+    """
+    if trend.get("center_cycle") is not None:
+        if trend.get("center_date") is not None:
+            cycle = float(trend.get("center_cycle", 0.0)) + (pd.Timestamp(date) - pd.Timestamp(trend["center_date"])).days / FIXED_CYCLE_DAYS
         else:
-            K = _fit_constant_amplitude_from_tests(train_tests)
-        raw, cal = _score_envelope(test_env, K)
-        rows.append({"fake_today": pd.Timestamp(holdout), "cv_amplitude_factor": K, "raw_envelope_error": raw, "calibrated_envelope_error": cal})
-    holdouts = pd.DataFrame(rows)
-    if holdouts.empty:
-        return {"raw": float("nan"), "calibrated": float("nan"), "holdouts": holdouts}
+            cycle = float(trend.get("center_cycle", 0.0))
+        return _trend_factor_at_cycle(trend, cycle)
+    if trend.get("center_date") is None:
+        return float(trend.get("constant_factor", 1.0))
+    cycles = (pd.Timestamp(date) - pd.Timestamp(trend["center_date"])).days / FIXED_CYCLE_DAYS
+    slope_cycle = float(trend.get("effective_log_slope_per_cycle", 0.0))
+    return float(np.clip(np.exp(float(trend.get("center_log_factor", 0.0)) + slope_cycle * cycles), AMPLITUDE_FACTOR_MIN, AMPLITUDE_FACTOR_MAX))
+
+
+def _fit_constant_amplitude_from_cycle_points(points: pd.DataFrame) -> float:
+    if points is None or points.empty:
+        return 1.0
+    return _regularized_factor(
+        points["factor"].to_numpy(dtype=float), points["weight"].to_numpy(dtype=float),
+        lower=AMPLITUDE_FACTOR_MIN, upper=AMPLITUDE_FACTOR_MAX, prior_weight=AMPLITUDE_PRIOR_WEIGHT,
+    )
+
+
+def _cross_validate_structural_blend(structural: pd.DataFrame) -> dict:
+    """Learn how much of G to trust using held-out fake-today forecasts."""
+    if structural is None or structural.empty:
+        return {"raw": float("nan"), "calibrated": float("nan"), "blend_weight": 0.0, "holdouts": pd.DataFrame()}
+    groups = sorted(pd.to_datetime(structural["fake_today"].dropna().unique()))
+    folds = []
+    for holdout in groups:
+        train = structural[pd.to_datetime(structural["fake_today"]) != holdout]
+        test = structural[pd.to_datetime(structural["fake_today"]) == holdout]
+        if train.empty or test.empty:
+            continue
+        folds.append((pd.Timestamp(holdout), _fit_constant_growth(train), test))
+    if not folds:
+        return {"raw": float("nan"), "calibrated": float("nan"), "blend_weight": 0.0, "holdouts": pd.DataFrame()}
+
+    alphas = np.linspace(0.0, 1.0, 101)
+    scores = []
+    for alpha in alphas:
+        fold_errors = []
+        for _, g_train, test in folds:
+            g_eff = 1.0 + float(alpha) * (float(g_train) - 1.0)
+            _, cal = _score_structural(test, g_eff)
+            if np.isfinite(cal):
+                fold_errors.append(cal)
+        scores.append(float(np.median(fold_errors)) if fold_errors else float("inf"))
+    best_i = int(np.argmin(scores))
+    alpha = float(alphas[best_i])
+    rows, raw_errors, cal_errors = [], [], []
+    for holdout, g_train, test in folds:
+        g_eff = 1.0 + alpha * (float(g_train) - 1.0)
+        raw, cal = _score_structural(test, g_eff)
+        raw_errors.append(raw); cal_errors.append(cal)
+        rows.append({
+            "fake_today": holdout, "cv_growth_factor": float(g_train), "cv_structural_blend_weight": alpha,
+            "cv_effective_growth_factor": g_eff, "raw_structural_error": raw, "calibrated_structural_error": cal,
+        })
     return {
-        "raw": float(np.nanmedian(holdouts["raw_envelope_error"])),
-        "calibrated": float(np.nanmedian(holdouts["calibrated_envelope_error"])),
-        "holdouts": holdouts,
+        "raw": float(np.nanmedian(raw_errors)), "calibrated": float(np.nanmedian(cal_errors)),
+        "blend_weight": alpha, "holdouts": pd.DataFrame(rows),
     }
 
+
+def _cross_validate_amplitude_blend(cycle_points: pd.DataFrame, envelope: pd.DataFrame) -> dict:
+    """Choose constant-vs-trend blend by leaving entire realized cycles out.
+
+    This is deliberately stricter than fake-today holdouts: all forecasts that
+    target the same realized market cycle are withheld together.
+    """
+    if cycle_points is None or cycle_points.empty or envelope is None or envelope.empty:
+        return {"raw": float("nan"), "calibrated": float("nan"), "blend_weight": 0.0, "holdouts": pd.DataFrame(), "observation_scores": pd.DataFrame()}
+    cycles = sorted(int(c) for c in cycle_points["cycle_index"].unique())
+    if len(cycles) < 2:
+        return {"raw": float("nan"), "calibrated": float("nan"), "blend_weight": 0.0, "holdouts": pd.DataFrame(), "observation_scores": pd.DataFrame()}
+
+    fold_specs = []
+    for hold in cycles:
+        train_points = cycle_points[cycle_points["cycle_index"] != hold]
+        test_env = envelope[envelope["cycle"].astype(int) == hold]
+        if train_points.empty or test_env.empty:
+            continue
+        const = _fit_constant_amplitude_from_cycle_points(train_points)
+        trend = _fit_amplitude_trend(train_points)
+        trend_k = _trend_factor_at_cycle(trend, hold)
+        fold_specs.append((hold, const, trend_k, test_env))
+    if not fold_specs:
+        return {"raw": float("nan"), "calibrated": float("nan"), "blend_weight": 0.0, "holdouts": pd.DataFrame(), "observation_scores": pd.DataFrame()}
+
+    alphas = np.linspace(0.0, 1.0, 101)
+    alpha_scores = []
+    for alpha in alphas:
+        errs = []
+        for _, const, trend_k, test_env in fold_specs:
+            k = (1.0 - alpha) * const + alpha * trend_k
+            _, cal = _score_envelope(test_env, k)
+            if np.isfinite(cal): errs.append(cal)
+        alpha_scores.append(float(np.median(errs)) if errs else float("inf"))
+    best_i = int(np.argmin(alpha_scores))
+    alpha = float(alphas[best_i])
+
+    hold_rows, obs_rows, raw_errors, cal_errors = [], [], [], []
+    for hold, const, trend_k, test_env in fold_specs:
+        k = float(np.clip((1.0 - alpha) * const + alpha * trend_k, AMPLITUDE_FACTOR_MIN, AMPLITUDE_FACTOR_MAX))
+        raw, cal = _score_envelope(test_env, k)
+        raw_errors.append(raw); cal_errors.append(cal)
+        hold_rows.append({
+            "cycle": hold, "cv_constant_K": const, "cv_trend_K": trend_k,
+            "cv_amplitude_blend_weight": alpha, "cv_amplitude_factor": k,
+            "raw_envelope_error": raw, "calibrated_envelope_error": cal,
+        })
+        for _, r in test_env.iterrows():
+            actual = _actual_anchor_amplitude(r, 1.0)
+            raw_amp = float(r["raw_amplitude"])
+            obs_rows.append({
+                "cycle": hold,
+                "fake_today": pd.Timestamp(r["fake_today"]),
+                "anchor_date": pd.Timestamp(r["anchor_date"]),
+                "anchor_type": str(r["anchor_type"]),
+                "turning_point_ahead": int(r.get("turning_point_ahead", 0) or 0),
+                "cycle_horizon": int(r.get("cycle_horizon", 0) or 0),
+                "evidence_weight": float(r["evidence_weight"]),
+                "raw_abs_log_error": abs(actual - raw_amp),
+                "calibrated_abs_log_error": abs(actual - k * raw_amp),
+                "cv_K": k,
+            })
+    return {
+        "raw": float(np.nanmedian(raw_errors)), "calibrated": float(np.nanmedian(cal_errors)),
+        "blend_weight": alpha, "holdouts": pd.DataFrame(hold_rows), "observation_scores": pd.DataFrame(obs_rows),
+    }
+
+
+def _direct_cycle_validation(observation_scores: pd.DataFrame) -> list[dict]:
+    if observation_scores is None or observation_scores.empty:
+        return []
+    rows = []
+    for horizon, grp in observation_scores.groupby("cycle_horizon"):
+        if int(horizon) <= 0:
+            continue
+        w = grp["evidence_weight"].to_numpy(dtype=float)
+        raw = _weighted_equivalent_pct_error(grp["raw_abs_log_error"].to_numpy(dtype=float), w)
+        cal = _weighted_equivalent_pct_error(grp["calibrated_abs_log_error"].to_numpy(dtype=float), w)
+        rows.append({
+            "cycle_horizon": int(horizon), "observations": int(len(grp)),
+            "raw_error": raw, "calibrated_error": cal,
+            "improvement": float(1.0 - cal / raw) if np.isfinite(raw) and raw > 0 and np.isfinite(cal) else float("nan"),
+        })
+    return sorted(rows, key=lambda r: r["cycle_horizon"])
+
+
+def _cross_validate_amplitude_mode(tests: pd.DataFrame, envelope: pd.DataFrame, mode: str) -> dict:
+    """Compatibility shim retained for older tests.
+
+    v4 production uses cycle-level blended CV.  Constant mode still maps to the
+    older fake-today implementation when explicitly requested.
+    """
+    if mode == "TREND":
+        points = _amplitude_cycle_points(envelope)
+        return _cross_validate_amplitude_blend(points, envelope)
+    if tests is None or tests.empty or envelope is None or envelope.empty:
+        return {"raw": float("nan"), "calibrated": float("nan"), "holdouts": pd.DataFrame()}
+    rows = []
+    for holdout in sorted(pd.to_datetime(tests["fake_today"].unique())):
+        train_tests = tests[pd.to_datetime(tests["fake_today"]) != holdout]
+        test_env = envelope[pd.to_datetime(envelope["fake_today"]) == holdout]
+        if train_tests.empty or test_env.empty: continue
+        k = _fit_constant_amplitude_from_tests(train_tests)
+        raw, cal = _score_envelope(test_env, k)
+        rows.append({"fake_today": pd.Timestamp(holdout), "cv_amplitude_factor": k, "raw_envelope_error": raw, "calibrated_envelope_error": cal})
+    holdouts = pd.DataFrame(rows)
+    return {
+        "raw": float(np.nanmedian(holdouts["raw_envelope_error"])) if not holdouts.empty else float("nan"),
+        "calibrated": float(np.nanmedian(holdouts["calibrated_envelope_error"])) if not holdouts.empty else float("nan"),
+        "holdouts": holdouts,
+    }
 
 def _component_status(raw_error: float, calibrated_error: float) -> tuple[str, float]:
     if not np.isfinite(raw_error) or not np.isfinite(calibrated_error) or raw_error <= 0:
@@ -627,11 +859,9 @@ def _score_cycle_aligned_parents(prices: pd.DataFrame, progress_callback=None, p
         while cursor <= latest_eligible:
             fake = pd.Timestamp(_nearest_price_on_or_before(data, cursor)["date"]).normalize()
             try:
-                s, e, _ = _build_backtest_snapshot_for_start(data, fake, start, parent_start=start)
-                if not s.empty:
-                    structural_frames.append(s)
-                if not e.empty:
-                    envelope_frames.append(e)
+                st, env, _ = _build_backtest_snapshot_for_start(data, fake, start, parent_start=start)
+                if not st.empty: structural_frames.append(st)
+                if not env.empty: envelope_frames.append(env)
                 tests += 1
             except Exception:
                 pass
@@ -647,9 +877,9 @@ def _score_cycle_aligned_parents(prices: pd.DataFrame, progress_callback=None, p
         parts = [v for v in (raw_s, raw_e) if np.isfinite(v)]
         raw_error = float(np.mean(parts)) if parts else float("nan")
         confidence = float(tests / (tests + 2.0)) if tests > 0 else 0.0
-        raw_weight = confidence / max(raw_error if np.isfinite(raw_error) else 1.0, 0.05)
         rows.append({
             "start_date": pd.Timestamp(start),
+            "parent_age_years": float((latest - pd.Timestamp(start)).days / 365.25),
             "tests": int(tests),
             "structural_points": int(len(structural)),
             "envelope_points": int(len(envelope)),
@@ -657,23 +887,73 @@ def _score_cycle_aligned_parents(prices: pd.DataFrame, progress_callback=None, p
             "raw_envelope_error": raw_e,
             "raw_total_error": raw_error,
             "evidence_confidence": confidence,
-            "raw_weight": raw_weight,
+            "weight_source": "own OOS evidence" if tests > 0 and np.isfinite(raw_error) else "pending maturity-matched prior",
         })
         if not structural.empty:
-            tmp = structural.copy(); tmp["parent_candidate"] = start; all_parent_obs.append(tmp)
+            tmp = structural.copy(); tmp["parent_candidate"] = pd.Timestamp(start); all_parent_obs.append(tmp)
         if not envelope.empty:
-            tmp = envelope.copy(); tmp["parent_candidate"] = start; all_parent_obs.append(tmp)
+            tmp = envelope.copy(); tmp["parent_candidate"] = pd.Timestamp(start); all_parent_obs.append(tmp)
 
     table = pd.DataFrame(rows)
     if table.empty:
         return table, pd.DataFrame(), done
-    raw_weights = table["raw_weight"].to_numpy(dtype=float)
-    if not np.isfinite(raw_weights).all() or raw_weights.sum() <= 0:
-        raw_weights = np.ones(len(table), dtype=float)
-    table["weight"] = raw_weights / raw_weights.sum()
     obs = pd.concat(all_parent_obs, ignore_index=True, sort=False) if all_parent_obs else pd.DataFrame()
-    return table, obs, done
 
+    # New cycle parents often have not yet accumulated a full 12-month scored
+    # forecast.  Instead of assigning them zero influence, borrow a small prior
+    # from how older parents performed at the same model age.  As soon as the
+    # new parent owns OOS evidence, that evidence replaces the prior naturally.
+    prior_errors = []
+    prior_confidences = []
+    for idx, row in table.iterrows():
+        own_error = float(row["raw_total_error"]) if np.isfinite(row["raw_total_error"]) else float("nan")
+        own_conf = float(row["evidence_confidence"])
+        if np.isfinite(own_error) and own_conf > 0:
+            prior_errors.append(own_error)
+            prior_confidences.append(own_conf)
+            continue
+
+        start = pd.Timestamp(row["start_date"])
+        age_years = float(row["parent_age_years"])
+        analog_errors = []
+        older_starts = [pd.Timestamp(x) for x in table.loc[table["start_date"] < start, "start_date"]]
+        for older in older_starts:
+            cutoff = older + pd.Timedelta(days=age_years * 365.25)
+            sgrp = obs[(obs.get("parent_candidate") == older) & (obs.get("metric_type") == "structural")].copy() if not obs.empty else pd.DataFrame()
+            egrp = obs[(obs.get("parent_candidate") == older) & (obs.get("metric_type") == "envelope")].copy() if not obs.empty else pd.DataFrame()
+            if not sgrp.empty and "fake_today" in sgrp.columns:
+                sgrp = sgrp[pd.to_datetime(sgrp["fake_today"]) <= cutoff]
+            if not egrp.empty and "fake_today" in egrp.columns:
+                egrp = egrp[pd.to_datetime(egrp["fake_today"]) <= cutoff]
+            rs, _ = _score_structural(sgrp, 1.0)
+            re, _ = _score_envelope(egrp, 1.0)
+            vals = [v for v in (rs, re) if np.isfinite(v)]
+            if vals: analog_errors.append(float(np.mean(vals)))
+        if analog_errors:
+            prior_error = float(np.median(analog_errors))
+            analog_count = len(analog_errors)
+            maturity_fraction = float(np.clip(age_years / (ENVELOPE_MAX_EVALUATION_MONTHS / 12.0), 0.0, 1.0))
+            prior_conf = float((analog_count / (analog_count + 2.0)) * maturity_fraction)
+            table.at[idx, "raw_total_error"] = prior_error
+            table.at[idx, "evidence_confidence"] = prior_conf
+            table.at[idx, "weight_source"] = "maturity-matched historical prior"
+            prior_errors.append(prior_error)
+            prior_confidences.append(prior_conf)
+        else:
+            table.at[idx, "evidence_confidence"] = 0.0
+            table.at[idx, "weight_source"] = "insufficient parent evidence"
+
+    raw_weights = []
+    for row in table.itertuples(index=False):
+        err = float(row.raw_total_error) if np.isfinite(row.raw_total_error) else float("nan")
+        conf = float(row.evidence_confidence)
+        raw_weights.append(conf / max(err, 0.05) if np.isfinite(err) and conf > 0 else 0.0)
+    raw_weights = np.asarray(raw_weights, dtype=float)
+    if raw_weights.sum() <= 0:
+        raw_weights = np.ones(len(table), dtype=float)
+    table["raw_weight"] = raw_weights
+    table["weight"] = raw_weights / raw_weights.sum()
+    return table, obs, done
 
 def _lookback_summary(tests: pd.DataFrame, structural: pd.DataFrame, envelope: pd.DataFrame, lookback: int) -> dict:
     t = tests[tests["lookback_years"] == lookback].copy()
@@ -702,7 +982,9 @@ def _fingerprint(summary: dict, tests: pd.DataFrame, latest_data_date: pd.Timest
         "effective_G": round(float(summary.get("effective_growth_factor", 1.0)), 10),
         "K": round(float(summary.get("amplitude_factor", 1.0)), 10),
         "K_mode": summary.get("amplitude_mode"),
-        "K_slope": round(float(summary.get("amplitude_trend_effective_log_slope_per_year", 0.0)), 12),
+        "K_slope_cycle": round(float(summary.get("amplitude_trend_effective_log_slope_per_cycle", 0.0)), 12),
+        "K_blend": round(float(summary.get("amplitude_trend_blend_weight", 0.0)), 8),
+        "G_blend": round(float(summary.get("structural_blend_weight", 0.0)), 8),
         "parents": [(p.get("start_date"), round(float(p.get("weight", 0.0)), 8)) for p in summary.get("cycle_parents", [])],
         "status": str(summary.get("status", "UNKNOWN")),
         "tests": [
@@ -721,12 +1003,11 @@ def run_walk_forward_calibration(prices: pd.DataFrame, progress_callback: Callab
     if not schedule:
         raise ValueError("Not enough post-Jan-2015 history exists for walk-forward calibration.")
 
-    # Estimate parent-test count for a meaningful progress bar.
     parent_starts = discover_cycle_aligned_parent_starts(data)
     latest_eligible = latest - pd.DateOffset(months=12)
     parent_test_count = 0
-    for start in parent_starts:
-        cursor = pd.Timestamp(start) + pd.DateOffset(years=PARENT_MIN_TRAIN_YEARS)
+    for start_date in parent_starts:
+        cursor = pd.Timestamp(start_date) + pd.DateOffset(years=PARENT_MIN_TRAIN_YEARS)
         while cursor <= latest_eligible:
             parent_test_count += 1
             cursor = cursor + pd.DateOffset(months=PARENT_TEST_STEP_MONTHS)
@@ -735,9 +1016,9 @@ def run_walk_forward_calibration(prices: pd.DataFrame, progress_callback: Callab
     structural_frames, envelope_frames, test_meta = [], [], []
     done = 0
     for lookback, fake_today in schedule:
-        s, e, meta = _build_backtest_snapshot(data, fake_today, lookback)
-        if not s.empty: structural_frames.append(s)
-        if not e.empty: envelope_frames.append(e)
+        structural_part, envelope_part, meta = _build_backtest_snapshot(data, fake_today, lookback)
+        if not structural_part.empty: structural_frames.append(structural_part)
+        if not envelope_part.empty: envelope_frames.append(envelope_part)
         test_meta.append(meta)
         done += 1
         if progress_callback is not None:
@@ -747,48 +1028,69 @@ def run_walk_forward_calibration(prices: pd.DataFrame, progress_callback: Callab
     envelope = pd.concat(envelope_frames, ignore_index=True) if envelope_frames else pd.DataFrame()
     tests = pd.DataFrame(test_meta).sort_values(["lookback_years", "fake_today"]).reset_index(drop=True)
 
-    # Structural G is accepted only when it actually improves held-out structural
-    # forecasts.  A rejected G becomes 1.0 rather than making the centerline worse.
+    # G is no longer all-or-nothing.  Held-out fake-today forecasts learn how
+    # much of the structural correction to trust, so weak evidence only nudges
+    # the ensemble centerline rather than applying the entire fitted G.
     learned_G = _fit_constant_growth(structural)
-    struct_cv = _cross_validate_structural(structural)
+    struct_cv = _cross_validate_structural_blend(structural)
+    structural_blend = float(struct_cv.get("blend_weight", 0.0))
+    effective_G = float(1.0 + structural_blend * (learned_G - 1.0))
     growth_status, growth_improvement = _component_status(struct_cv["raw"], struct_cv["calibrated"])
-    effective_G = learned_G if growth_status in ("PASS", "MODEST") else 1.0
-    effective_struct_error = struct_cv["calibrated"] if effective_G != 1.0 else struct_cv["raw"]
+    if growth_status == "REJECTED":
+        structural_blend = 0.0
+        effective_G = 1.0
+        struct_cv = dict(struct_cv)
+        struct_cv["calibrated"] = struct_cv["raw"]
 
-    # Envelope compression is allowed to be a trend.  Compare a constant K and
-    # a trend-aware K under genuine held-out fake-today scoring, then keep the
-    # one that predicts unseen cycle envelopes better.
-    trend_points = _amplitude_trend_points(tests)
-    trend_fit = _fit_amplitude_trend(trend_points)
-    constant_K = _fit_constant_amplitude_from_tests(tests)
-    cv_const = _cross_validate_amplitude_mode(tests, envelope, "CONSTANT")
-    cv_trend = _cross_validate_amplitude_mode(tests, envelope, "TREND")
-    use_trend = (
-        np.isfinite(cv_trend["calibrated"]) and
-        (not np.isfinite(cv_const["calibrated"]) or cv_trend["calibrated"] < cv_const["calibrated"])
-    )
-    amplitude_mode = "TREND" if use_trend else "CONSTANT"
-    selected_env_cv = cv_trend if use_trend else cv_const
-    if use_trend:
-        current_K = _trend_factor_at_date(trend_fit, latest)
-    else:
-        current_K = constant_K
-        trend_fit = dict(trend_fit)
-        trend_fit["effective_log_slope_per_year"] = 0.0
-        trend_fit["annual_change"] = 0.0
-        trend_fit["direction"] = "NO_CLEAR_TREND"
-    envelope_status, envelope_improvement = _component_status(selected_env_cv["raw"], selected_env_cv["calibrated"])
-
+    # Parent models are scored before the maturity trend so their older
+    # cycle-aligned fake-today forecasts can contribute independent cycle
+    # outcomes (including evidence earlier than the rolling 4Y schedule).
     parent_table, parent_obs, done = _score_cycle_aligned_parents(
         data, progress_callback=progress_callback, progress_offset=done, progress_total=progress_total
     )
     if parent_table.empty:
         raise ValueError("No cycle-aligned parent models could be scored.")
 
-    # The calibrated model is considered production-eligible when the envelope
-    # learning materially improves held-out outcomes and there are at least two
-    # cycle-aligned parents.  Structural G may be rejected safely because the
-    # ensemble centerline still provides the structural forecast.
+    parent_envelope = pd.DataFrame()
+    if parent_obs is not None and not parent_obs.empty and "metric_type" in parent_obs.columns:
+        parent_envelope = parent_obs[parent_obs["metric_type"] == "envelope"].copy()
+    amplitude_evidence = pd.concat(
+        [x for x in (envelope, parent_envelope) if x is not None and not x.empty],
+        ignore_index=True, sort=False,
+    ) if (not envelope.empty or not parent_envelope.empty) else pd.DataFrame()
+
+    # Trend fitting now operates on independent Bitcoin cycle indices, not
+    # calendar years.  Repeated forecasts of the same realized anchor are first
+    # collapsed, preventing pseudo-replication from inflating trend confidence.
+    cycle_points = _amplitude_cycle_points(amplitude_evidence)
+    trend_fit = _fit_amplitude_trend(cycle_points)
+    constant_K = _fit_constant_amplitude_from_cycle_points(cycle_points)
+    amp_cv = _cross_validate_amplitude_blend(cycle_points, amplitude_evidence)
+    amplitude_blend = float(amp_cv.get("blend_weight", 0.0))
+    envelope_status, envelope_improvement = _component_status(amp_cv["raw"], amp_cv["calibrated"])
+    if envelope_status == "REJECTED":
+        amplitude_blend = 0.0
+        constant_K = 1.0
+
+    observed_anchors = discover_observed_cycle_anchors(data)
+    current_cycle_index = int(observed_anchors["cycle"].max()) if not observed_anchors.empty else 0
+    trend_K_current = _trend_factor_at_cycle(trend_fit, current_cycle_index)
+    current_K = float(np.clip(
+        (1.0 - amplitude_blend) * constant_K + amplitude_blend * trend_K_current,
+        AMPLITUDE_FACTOR_MIN, AMPLITUDE_FACTOR_MAX,
+    ))
+    if envelope_status == "REJECTED":
+        current_K = 1.0
+
+    if amplitude_blend > 0.05 and trend_fit.get("direction") != "NO_CLEAR_TREND" and envelope_status in ("PASS", "MODEST"):
+        amplitude_mode = "BLENDED_TREND"
+    elif envelope_status in ("PASS", "MODEST"):
+        amplitude_mode = "CONSTANT"
+    else:
+        amplitude_mode = "REJECTED"
+
+    direct_cycle_validation = _direct_cycle_validation(amp_cv.get("observation_scores", pd.DataFrame()))
+
     enough_parents = len(parent_table) >= 2
     if envelope_status == "PASS" and enough_parents:
         status = "PASS"
@@ -800,27 +1102,24 @@ def run_walk_forward_calibration(prices: pd.DataFrame, progress_callback: Callab
         status = "NO_IMPROVEMENT"
 
     raw_struct = float(struct_cv["raw"])
-    cal_struct = float(effective_struct_error)
-    raw_env = float(selected_env_cv["raw"])
-    cal_env = float(selected_env_cv["calibrated"])
+    cal_struct = float(struct_cv["calibrated"])
+    raw_env = float(amp_cv["raw"])
+    cal_env = float(amp_cv["calibrated"])
     raw_parts = [x for x in (raw_struct, raw_env) if np.isfinite(x)]
     cal_parts = [x for x in (cal_struct, cal_env) if np.isfinite(x)]
     raw_total = float(np.mean(raw_parts)) if raw_parts else float("nan")
     cal_total = float(np.mean(cal_parts)) if cal_parts else float("nan")
     overall_improvement = float(1.0 - cal_total / raw_total) if np.isfinite(raw_total) and raw_total > 0 and np.isfinite(cal_total) else float("nan")
 
-    # Merge CV diagnostics back into the fake-today table for inspection.
     tests_out = tests.copy()
-    if not struct_cv["holdouts"].empty:
+    if not struct_cv.get("holdouts", pd.DataFrame()).empty:
         tests_out = tests_out.merge(struct_cv["holdouts"], on="fake_today", how="left")
-    amp_hold = selected_env_cv.get("holdouts", pd.DataFrame())
-    if not amp_hold.empty:
-        tests_out = tests_out.merge(amp_hold, on="fake_today", how="left", suffixes=("", "_amp"))
 
     parent_records = []
     for row in parent_table.itertuples(index=False):
         parent_records.append({
             "start_date": pd.Timestamp(row.start_date).date().isoformat(),
+            "parent_age_years": float(row.parent_age_years),
             "tests": int(row.tests),
             "structural_points": int(row.structural_points),
             "envelope_points": int(row.envelope_points),
@@ -828,6 +1127,7 @@ def run_walk_forward_calibration(prices: pd.DataFrame, progress_callback: Callab
             "raw_envelope_error": float(row.raw_envelope_error) if np.isfinite(row.raw_envelope_error) else None,
             "raw_total_error": float(row.raw_total_error) if np.isfinite(row.raw_total_error) else None,
             "evidence_confidence": float(row.evidence_confidence),
+            "weight_source": str(row.weight_source),
             "weight": float(row.weight),
         })
 
@@ -838,23 +1138,29 @@ def run_walk_forward_calibration(prices: pd.DataFrame, progress_callback: Callab
         "fake_today_step_months": FAKE_TODAY_STEP_MONTHS,
         "evaluation_horizons_months": list(EVALUATION_HORIZONS_MONTHS),
         "max_evaluation_months": MAX_EVALUATION_MONTHS,
+        "envelope_max_evaluation_months": ENVELOPE_MAX_EVALUATION_MONTHS,
         "growth_factor": float(learned_G),
         "effective_growth_factor": float(effective_G),
+        "structural_blend_weight": float(structural_blend),
         "growth_status": growth_status,
         "growth_cv_improvement": growth_improvement,
         "amplitude_factor": float(current_K),
         "amplitude_constant_factor": float(constant_K),
+        "amplitude_trend_blend_weight": float(amplitude_blend),
         "amplitude_mode": amplitude_mode,
         "amplitude_trend_direction": trend_fit.get("direction", "NO_CLEAR_TREND"),
         "amplitude_trend_confidence": float(trend_fit.get("confidence", 0.0)),
         "amplitude_trend_r2": float(trend_fit.get("r2", np.nan)),
-        "amplitude_trend_raw_log_slope_per_year": float(trend_fit.get("raw_log_slope_per_year", 0.0)),
-        "amplitude_trend_effective_log_slope_per_year": float(trend_fit.get("effective_log_slope_per_year", 0.0)),
-        "amplitude_trend_annual_change": float(trend_fit.get("annual_change", 0.0)),
-        "amplitude_trend_center_date": pd.Timestamp(trend_fit["center_date"]).date().isoformat() if trend_fit.get("center_date") is not None else None,
+        "amplitude_trend_raw_log_slope_per_cycle": float(trend_fit.get("raw_log_slope_per_cycle", 0.0)),
+        "amplitude_trend_effective_log_slope_per_cycle": float(trend_fit.get("effective_log_slope_per_cycle", 0.0)),
+        "amplitude_trend_change_per_cycle": float(trend_fit.get("change_per_cycle", 0.0)),
+        "amplitude_trend_center_cycle": float(trend_fit.get("center_cycle", 0.0)),
         "amplitude_trend_center_log_factor": float(trend_fit.get("center_log_factor", 0.0)),
+        "current_cycle_index": int(current_cycle_index),
         "envelope_status": envelope_status,
         "envelope_cv_improvement": envelope_improvement,
+        "geometry_guard_enabled": True,
+        "direct_cycle_validation": direct_cycle_validation,
         "raw_cv_error": raw_total,
         "calibrated_cv_error": cal_total,
         "raw_structural_cv_error": raw_struct,
@@ -865,30 +1171,41 @@ def run_walk_forward_calibration(prices: pd.DataFrame, progress_callback: Callab
         "status": status,
         "total_tests": int(len(tests)),
         "total_structural_points": int(len(structural)),
-        "total_envelope_points": int(len(envelope)),
+        "total_envelope_points": int(len(amplitude_evidence)),
+        "independent_cycle_points": int(len(cycle_points)),
         "lookback_4y": _lookback_summary(tests, structural, envelope, 4),
         "lookback_8y": _lookback_summary(tests, structural, envelope, 8),
         "cycle_parents": parent_records,
         "cycle_parent_count": int(len(parent_records)),
         "latest_data_date": latest.date().isoformat(),
-        "timing_source": "frozen v3.12 fixed 1428-day cycle schedule; calibration currently learns price levels, not future turning-point dates",
+        "timing_source": "frozen v3.12 fixed 1428-day cycle schedule; calibration learns price levels and cycle-regime maturation, not future turning-point dates",
     }
 
-    trend_obs = trend_points.copy()
+    trend_obs = cycle_points.copy()
     if not trend_obs.empty:
-        trend_obs["metric_type"] = "amplitude_trend"
-        trend_obs["predicted_factor"] = trend_obs["date"].apply(lambda d: _trend_factor_at_date(_fit_amplitude_trend(trend_points), d))
+        trend_obs["metric_type"] = "amplitude_cycle_trend"
+        trend_obs["constant_factor"] = float(constant_K)
+        trend_obs["trend_factor"] = trend_obs["cycle_index"].apply(lambda c: _trend_factor_at_cycle(trend_fit, c))
+        trend_obs["predicted_factor"] = (
+            (1.0 - amplitude_blend) * trend_obs["constant_factor"] + amplitude_blend * trend_obs["trend_factor"]
+        )
+
+    cycle_cv_obs = amp_cv.get("observation_scores", pd.DataFrame()).copy()
+    if not cycle_cv_obs.empty:
+        cycle_cv_obs["metric_type"] = "cycle_relative_validation"
+
     observations = pd.concat(
-        [x for x in (structural, envelope, trend_obs, parent_obs) if x is not None and not x.empty],
+        [x for x in (structural, envelope, trend_obs, parent_obs, cycle_cv_obs) if x is not None and not x.empty],
         ignore_index=True, sort=False,
-    ) if any(x is not None and not x.empty for x in (structural, envelope, trend_obs, parent_obs)) else pd.DataFrame()
+    ) if any(x is not None and not x.empty for x in (structural, envelope, trend_obs, parent_obs, cycle_cv_obs)) else pd.DataFrame()
 
     fingerprint = _fingerprint(summary, tests_out, latest)
     summary["fingerprint"] = fingerprint
     tests_out["final_effective_growth_factor"] = effective_G
+    tests_out["final_structural_blend_weight"] = structural_blend
     tests_out["final_current_amplitude_factor"] = current_K
+    tests_out["final_amplitude_trend_blend_weight"] = amplitude_blend
     return WalkForwardCalibrationResult(summary, tests_out, observations, fingerprint)
-
 
 def calibration_is_current(calibration: WalkForwardCalibrationResult | None, prices: pd.DataFrame) -> bool:
     if calibration is None:
@@ -916,14 +1233,20 @@ def _calibrated_centerline_from_raw(raw_center: np.ndarray, dates: pd.DatetimeIn
 
 
 def _summary_trend_dict(summary: dict) -> dict:
-    center_date = summary.get("amplitude_trend_center_date")
     return {
-        "center_date": pd.Timestamp(center_date) if center_date else None,
-        "center_log_factor": float(summary.get("amplitude_trend_center_log_factor", np.log(max(summary.get("amplitude_factor", 1.0), 1e-12)))),
-        "effective_log_slope_per_year": float(summary.get("amplitude_trend_effective_log_slope_per_year", 0.0)) if summary.get("amplitude_mode") == "TREND" else 0.0,
-        "constant_factor": float(summary.get("amplitude_factor", 1.0)),
+        "center_cycle": float(summary.get("amplitude_trend_center_cycle", 0.0)),
+        "center_log_factor": float(summary.get("amplitude_trend_center_log_factor", np.log(max(summary.get("amplitude_constant_factor", 1.0), 1e-12)))),
+        "effective_log_slope_per_cycle": float(summary.get("amplitude_trend_effective_log_slope_per_cycle", 0.0)),
+        "constant_factor": float(summary.get("amplitude_constant_factor", summary.get("amplitude_factor", 1.0))),
+        "blend_weight": float(summary.get("amplitude_trend_blend_weight", 0.0)),
     }
 
+
+def _blended_amplitude_factor_for_cycle(trend: dict, cycle_index: float) -> float:
+    const = float(trend.get("constant_factor", 1.0))
+    alpha = float(np.clip(trend.get("blend_weight", 0.0), 0.0, 1.0))
+    trended = _trend_factor_at_cycle(trend, cycle_index)
+    return float(np.clip((1.0 - alpha) * const + alpha * trended, AMPLITUDE_FACTOR_MIN, AMPLITUDE_FACTOR_MAX))
 
 def _fit_current_parent_models(prices: pd.DataFrame, calibration: WalkForwardCalibrationResult, projection_years: int):
     data = _normalise_prices(prices)
@@ -947,31 +1270,103 @@ def _fit_current_parent_models(prices: pd.DataFrame, calibration: WalkForwardCal
     return [(m[0], float(w), m[2]) for m, w in zip(models, weights)]
 
 
+def _collect_model_anchors(model: PriceModelResult) -> pd.DataFrame:
+    frames = []
+    for key in ("cycle_anchor_table", "cycle_anchor_lookahead_table"):
+        frame = model.diagnostics.get(key)
+        if frame is not None and not frame.empty:
+            frames.append(frame.copy())
+    if not frames:
+        return pd.DataFrame()
+    out = pd.concat(frames, ignore_index=True, sort=False)
+    out["date"] = pd.to_datetime(out["date"]).dt.normalize()
+    return out.drop_duplicates(subset=["date", "type"], keep="first").sort_values("date").reset_index(drop=True)
+
+
+def _cycle_coordinate_for_dates(dates: pd.DatetimeIndex, anchors: pd.DataFrame, default_cycle: float) -> np.ndarray:
+    if anchors is None or anchors.empty or "cycle" not in anchors.columns:
+        return np.full(len(dates), float(default_cycle), dtype=float)
+    a = anchors.dropna(subset=["cycle"]).copy().sort_values("date")
+    if a.empty:
+        return np.full(len(dates), float(default_cycle), dtype=float)
+    x = pd.DatetimeIndex(pd.to_datetime(a["date"])).asi8.astype(float)
+    y = a["cycle"].to_numpy(dtype=float)
+    q = dates.asi8.astype(float)
+    coords = np.interp(q, x, y, left=y[0], right=y[-1])
+    # After the final known anchor, let the cycle coordinate continue slowly at
+    # the frozen cycle cadence rather than staying permanently fixed.
+    right = q > x[-1]
+    if np.any(right):
+        days = (q[right] - x[-1]) / 1e9 / 86400.0
+        coords[right] = y[-1] + days / FIXED_CYCLE_DAYS
+    return coords
+
+
+def _geometry_k_floor_schedule(
+    dates: pd.DatetimeIndex,
+    anchors: pd.DataFrame,
+    calibration_start: pd.Timestamp,
+    calibrated_center: np.ndarray,
+    raw_dev: np.ndarray,
+) -> tuple[np.ndarray, pd.DataFrame]:
+    """Return the mathematical K floor required to preserve peak>next trough.
+
+    For a peak p and following trough t:
+      Cp*exp(K*Ap) > Ct*exp(-K*At)
+    therefore K > log(Ct/Cp)/(Ap+At).  No target-price floor is chosen by hand;
+    the required floor is entirely implied by centerline growth and raw cycle
+    geometry.
+    """
+    floor = np.zeros(len(dates), dtype=float)
+    rows = []
+    if anchors is None or anchors.empty:
+        return floor, pd.DataFrame(rows)
+    turns = anchors[(pd.to_datetime(anchors["date"]) > pd.Timestamp(calibration_start)) & anchors["type"].isin(["peak", "trough"])].copy()
+    turns = turns.sort_values("date").reset_index(drop=True)
+    for i, row in turns.iterrows():
+        if str(row["type"]) != "peak":
+            continue
+        after = turns.iloc[i + 1:]
+        after = after[after["type"] == "trough"]
+        if after.empty:
+            continue
+        trough_row = after.iloc[0]
+        pdte = pd.Timestamp(row["date"]); tdte = pd.Timestamp(trough_row["date"])
+        if pdte not in dates or tdte not in dates:
+            continue
+        pi = int(np.where(dates == pdte)[0][0]); ti = int(np.where(dates == tdte)[0][0])
+        ap = float(max(raw_dev[pi], 0.0)); at = float(max(-raw_dev[ti], 0.0))
+        denom = ap + at
+        center_growth = float(np.log(max(calibrated_center[ti], 1e-12) / max(calibrated_center[pi], 1e-12)))
+        kmin = float(max((center_growth + GEOMETRY_NUMERICAL_EPS_LOG) / denom, 0.0)) if denom > 1e-12 else 0.0
+        if kmin > 0:
+            kmin = float(np.nextafter(kmin, np.inf))
+            floor[pi:ti + 1] = np.maximum(floor[pi:ti + 1], kmin)
+        rows.append({
+            "peak_date": pdte, "trough_date": tdte,
+            "peak_cycle": int(row.get("cycle", 0)) if pd.notna(row.get("cycle", np.nan)) else None,
+            "trough_cycle": int(trough_row.get("cycle", 0)) if pd.notna(trough_row.get("cycle", np.nan)) else None,
+            "peak_raw_amplitude": ap, "trough_raw_amplitude": at,
+            "calibrated_centerline_growth_log": center_growth,
+            "minimum_geometric_K": kmin,
+        })
+    return floor, pd.DataFrame(rows)
+
 def build_calibrated_price_model(
     base_model: PriceModelResult,
     calibration: WalkForwardCalibrationResult,
     prices: pd.DataFrame | None = None,
 ) -> CalibratedPriceModelResult:
-    """Build the production calibrated projection.
-
-    When current prices are supplied (the production path), the calibrated model
-    is independent of the Price Model page's selected training start.  It refits
-    all scored cycle-aligned parents through the latest actual date, blends their
-    centerlines and cycle deviations in log space, then applies separately
-    validated G and a constant/trending K.  The frozen Price Model is not changed.
-
-    If prices is omitted, a compatibility fallback transforms the supplied base
-    model only; this keeps older tests/tools usable but is not the production path.
-    """
+    """Build the dynamic calibrated production projection without modifying v3.12."""
     if prices is None:
         daily = base_model.daily.copy().sort_values("date").reset_index(drop=True)
-        dates = pd.DatetimeIndex(pd.to_datetime(daily["date"]))
+        dates = pd.DatetimeIndex(pd.to_datetime(daily["date"]).dt.normalize())
         raw_center = daily["structural_centerline_usd"].to_numpy(dtype=float)
         raw_price = daily["fitted_or_projected_price_usd"].to_numpy(dtype=float)
-        latest = pd.Timestamp(base_model.diagnostics["training_end"])
-        projection_end = pd.Timestamp(base_model.diagnostics["projection_end_date"])
+        latest = pd.Timestamp(base_model.diagnostics["training_end"]).normalize()
+        projection_end = pd.Timestamp(base_model.diagnostics["projection_end_date"]).normalize()
         ref_model = base_model
-        parent_models = [(pd.Timestamp(base_model.diagnostics["training_start"]) if "training_start" in base_model.diagnostics else latest, 1.0, base_model)]
+        parent_models = [(pd.Timestamp(base_model.diagnostics.get("training_start", latest)), 1.0, base_model)]
     else:
         data = _normalise_prices(prices)
         latest = pd.Timestamp(data["date"].max()).normalize()
@@ -979,14 +1374,14 @@ def build_calibrated_price_model(
         parent_models = _fit_current_parent_models(data, calibration, projection_years)
         ref_model = parent_models[0][2]
         ref = ref_model.daily.copy().sort_values("date").reset_index(drop=True)
-        dates = pd.DatetimeIndex(pd.to_datetime(ref["date"]))
+        ref["date"] = pd.to_datetime(ref["date"]).dt.normalize()
+        dates = pd.DatetimeIndex(ref["date"])
         daily = ref.copy()
 
-        center_stack, dev_stack = [], []
-        used_weights = []
-        for start, weight, model in parent_models:
+        center_stack, dev_stack, used_weights = [], [], []
+        for start_date, weight, model in parent_models:
             frame = model.daily.copy()
-            frame["date"] = pd.to_datetime(frame["date"])
+            frame["date"] = pd.to_datetime(frame["date"]).dt.normalize()
             frame = frame.set_index("date").reindex(dates)
             center = frame["structural_centerline_usd"].to_numpy(dtype=float)
             price = frame["fitted_or_projected_price_usd"].to_numpy(dtype=float)
@@ -998,70 +1393,59 @@ def build_calibrated_price_model(
             used_weights.append(weight)
         if not center_stack:
             raise ValueError("Cycle-aligned parent projections could not be aligned on a common date grid.")
-        w = np.asarray(used_weights, dtype=float); w = w / w.sum()
-        center_arr = np.vstack(center_stack)
-        dev_arr = np.vstack(dev_stack)
-        wc = w[:, None]
-        center_valid = np.isfinite(center_arr)
-        dev_valid = np.isfinite(dev_arr)
-        center_denom = np.sum(wc * center_valid, axis=0)
-        dev_denom = np.sum(wc * dev_valid, axis=0)
-        log_center = np.divide(
-            np.nansum(wc * center_arr, axis=0), center_denom,
-            out=np.full(center_denom.shape, np.nan), where=center_denom > 0,
-        )
-        raw_deviation = np.divide(
-            np.nansum(wc * dev_arr, axis=0), dev_denom,
-            out=np.full(dev_denom.shape, np.nan), where=dev_denom > 0,
-        )
-        raw_center = np.exp(log_center)
-        raw_price = raw_center * np.exp(raw_deviation)
-        projection_end = pd.Timestamp(dates.max())
+        weights = np.asarray(used_weights, dtype=float); weights = weights / weights.sum()
+        wc = weights[:, None]
+        center_arr = np.vstack(center_stack); dev_arr = np.vstack(dev_stack)
+        center_valid = np.isfinite(center_arr); dev_valid = np.isfinite(dev_arr)
+        center_denom = np.sum(wc * center_valid, axis=0); dev_denom = np.sum(wc * dev_valid, axis=0)
+        log_center = np.divide(np.nansum(wc * center_arr, axis=0), center_denom, out=np.full(center_denom.shape, np.nan), where=center_denom > 0)
+        raw_deviation = np.divide(np.nansum(wc * dev_arr, axis=0), dev_denom, out=np.full(dev_denom.shape, np.nan), where=dev_denom > 0)
+        raw_center = np.exp(log_center); raw_price = raw_center * np.exp(raw_deviation)
+        projection_end = pd.Timestamp(dates.max()).normalize()
 
-    dates = pd.DatetimeIndex(pd.to_datetime(daily["date"]))
+    dates = pd.DatetimeIndex(pd.to_datetime(daily["date"]).normalize()) if isinstance(daily["date"], pd.DatetimeIndex) else pd.DatetimeIndex(pd.to_datetime(daily["date"]).dt.normalize())
     projected_mask = dates > latest
     G = float(calibration.summary.get("effective_growth_factor", 1.0))
     trend = _summary_trend_dict(calibration.summary)
 
     if latest < NEXT_TROUGH <= projection_end:
-        calibration_start = pd.Timestamp(NEXT_TROUGH)
+        calibration_start = pd.Timestamp(NEXT_TROUGH).normalize()
         live_cycle_preserved = True
     else:
         calibration_start = latest
         live_cycle_preserved = False
 
     calibrated_center = _calibrated_centerline_from_raw(raw_center, dates, calibration_start, G)
-    calibrated_price = raw_price.copy()
-    K_by_date = np.array([_trend_factor_at_date(trend, d) for d in dates], dtype=float)
     raw_dev = np.log(np.maximum(raw_price, 1e-12) / np.maximum(raw_center, 1e-12))
-    direct_mask = projected_mask & (dates > calibration_start)
-    calibrated_price[direct_mask] = calibrated_center[direct_mask] * np.exp(K_by_date[direct_mask] * raw_dev[direct_mask])
+    anchors = _collect_model_anchors(ref_model)
+    current_cycle = int(calibration.summary.get("current_cycle_index", 0))
+    cycle_coords = _cycle_coordinate_for_dates(dates, anchors, current_cycle)
+    unconstrained_K = np.array([_blended_amplitude_factor_for_cycle(trend, c) for c in cycle_coords], dtype=float)
 
-    # Keep the live current bear unchanged through the frozen schedule's next
-    # trough, then join continuously to the first fully calibrated turning point.
-    anchor_frames = []
-    for key in ("cycle_anchor_table", "cycle_anchor_lookahead_table"):
-        frame = ref_model.diagnostics.get(key)
-        if frame is not None and not frame.empty:
-            anchor_frames.append(frame.copy())
-    anchors = (
-        pd.concat(anchor_frames, ignore_index=True, sort=False)
-        .drop_duplicates(subset=["date", "type"], keep="first")
-        .sort_values("date").reset_index(drop=True)
-        if anchor_frames else pd.DataFrame()
+    geometry_floor, geometry_table = _geometry_k_floor_schedule(
+        dates, anchors, calibration_start, calibrated_center, raw_dev
     )
+    effective_K = np.maximum(unconstrained_K, geometry_floor)
+    calibrated_price = raw_price.copy()
+    direct_mask = projected_mask & (dates > calibration_start)
+    calibrated_price[direct_mask] = calibrated_center[direct_mask] * np.exp(effective_K[direct_mask] * raw_dev[direct_mask])
+
+    # Preserve the live current bear through the model-derived Oct-2026 trough.
+    preserve = dates <= calibration_start
+    calibrated_price[preserve] = raw_price[preserve]
+    calibrated_center[preserve] = raw_center[preserve]
+
+    # Join the live-cycle trough continuously to the first fully calibrated turn.
     first_turn_date = None
     if not anchors.empty:
         future_turns = anchors[(pd.to_datetime(anchors["date"]) > calibration_start) & anchors["type"].isin(["peak", "trough"])].copy()
         if not future_turns.empty:
-            first_turn_date = pd.Timestamp(future_turns.iloc[0]["date"])
+            first_turn_date = pd.Timestamp(future_turns.iloc[0]["date"]).normalize()
             if first_turn_date in dates and calibration_start in dates:
-                start_idx = int(np.where(dates == calibration_start)[0][0])
-                turn_idx = int(np.where(dates == first_turn_date)[0][0])
+                start_idx = int(np.where(dates == calibration_start)[0][0]); turn_idx = int(np.where(dates == first_turn_date)[0][0])
                 if turn_idx > start_idx:
-                    raw_start = float(raw_price[start_idx])
-                    raw_end = float(raw_price[turn_idx])
-                    cal_end = float(calibrated_center[turn_idx] * np.exp(K_by_date[turn_idx] * raw_dev[turn_idx]))
+                    raw_start = float(raw_price[start_idx]); raw_end = float(raw_price[turn_idx])
+                    cal_end = float(calibrated_center[turn_idx] * np.exp(effective_K[turn_idx] * raw_dev[turn_idx]))
                     denom = np.log(max(raw_end, 1e-12)) - np.log(max(raw_start, 1e-12))
                     if abs(denom) > 1e-12:
                         seg = np.arange(start_idx, turn_idx + 1)
@@ -1069,29 +1453,29 @@ def build_calibrated_price_model(
                         progress = np.clip(progress, 0.0, 1.0)
                         calibrated_price[seg] = np.exp(np.log(max(raw_start, 1e-12)) + progress * (np.log(max(cal_end, 1e-12)) - np.log(max(raw_start, 1e-12))))
 
-    preserve = dates <= calibration_start
-    calibrated_price[preserve] = raw_price[preserve]
-    calibrated_center[preserve] = raw_center[preserve]
-
     out = pd.DataFrame({
         "date": dates,
         "row_type": np.where(dates <= latest, "historical_training", "projected"),
-        "actual_price_usd": np.where(dates <= latest, np.nan, np.nan),
+        "actual_price_usd": np.nan,
         "raw_centerline_usd": raw_center,
         "raw_price_usd": raw_price,
         "calibrated_centerline_usd": calibrated_center,
         "calibrated_price_usd": calibrated_price,
-        "amplitude_factor_K": K_by_date,
+        "cycle_coordinate": cycle_coords,
+        "unconstrained_amplitude_factor_K": unconstrained_K,
+        "minimum_geometric_K": geometry_floor,
+        "amplitude_factor_K": effective_K,
+        "geometry_constrained": effective_K > unconstrained_K + 1e-12,
         "calibration_active": dates > calibration_start,
     })
 
     turning_rows = []
+    visible = pd.DataFrame()
     if not anchors.empty:
         visible = anchors[(pd.to_datetime(anchors["date"]) >= latest) & (pd.to_datetime(anchors["date"]) <= projection_end) & anchors["type"].isin(["peak", "trough"])].copy()
         for row in visible.itertuples(index=False):
-            d = pd.Timestamp(row.date)
-            if d not in dates:
-                continue
+            d = pd.Timestamp(row.date).normalize()
+            if d not in dates: continue
             i = int(np.where(dates == d)[0][0])
             turning_rows.append({
                 "date": d, "type": row.type, "cycle": getattr(row, "cycle", np.nan),
@@ -1099,24 +1483,44 @@ def build_calibrated_price_model(
                 "raw_centerline_usd": float(raw_center[i]), "calibrated_centerline_usd": float(calibrated_center[i]),
                 "raw_price_over_centerline": float(raw_price[i] / raw_center[i]),
                 "calibrated_price_over_centerline": float(calibrated_price[i] / calibrated_center[i]),
-                "amplitude_factor_K": float(K_by_date[i]),
+                "unconstrained_amplitude_factor_K": float(unconstrained_K[i]),
+                "minimum_geometric_K": float(geometry_floor[i]),
+                "amplitude_factor_K": float(effective_K[i]),
+                "geometry_constrained": bool(effective_K[i] > unconstrained_K[i] + 1e-12),
                 "source": getattr(row, "source", ""),
             })
     turning_points = pd.DataFrame(turning_rows)
 
-    parent_diag = [{"start_date": s.date().isoformat(), "weight": w} for s, w, _ in parent_models]
+    geometry_valid = True
+    if not turning_points.empty:
+        ordered = turning_points.sort_values("date").reset_index(drop=True)
+        for i, row in ordered.iterrows():
+            if row["type"] != "peak": continue
+            after = ordered.iloc[i + 1:]
+            after = after[after["type"] == "trough"]
+            if after.empty: continue
+            if not (float(row["calibrated_price_usd"]) > float(after.iloc[0]["calibrated_price_usd"])):
+                geometry_valid = False; break
+
+    if not geometry_table.empty:
+        geometry_table = geometry_table.copy()
+        geometry_table["was_binding"] = geometry_table["minimum_geometric_K"] > 0
+
+    parent_diag = [{"start_date": start.date().isoformat(), "weight": weight} for start, weight, _ in parent_models]
     parent_payload = json.dumps(parent_diag, sort_keys=True)
     parent_fingerprint = hashlib.sha256(parent_payload.encode("utf-8")).hexdigest()[:16]
     diagnostics = {
-        "version": "calibrated-price-model-v3.0-dynamic-cycle-ensemble",
+        "version": "calibrated-price-model-v4.0-cycle-disciplined-learning",
         "base_model_version": PRICE_MODEL_ENGINE_VERSION,
         "calibration_version": calibration.summary.get("version", CALIBRATION_VERSION),
         "calibration_fingerprint": calibration.fingerprint,
         "calibration_status": calibration.summary.get("status", "UNKNOWN"),
         "growth_factor": G,
-        "amplitude_factor_at_latest_data": float(_trend_factor_at_date(trend, latest)),
+        "structural_blend_weight": float(calibration.summary.get("structural_blend_weight", 0.0)),
+        "amplitude_factor_at_latest_data": float(calibration.summary.get("amplitude_factor", 1.0)),
         "amplitude_mode": calibration.summary.get("amplitude_mode", "CONSTANT"),
         "amplitude_trend_direction": calibration.summary.get("amplitude_trend_direction", "NO_CLEAR_TREND"),
+        "amplitude_trend_blend_weight": float(calibration.summary.get("amplitude_trend_blend_weight", 0.0)),
         "calibration_start_date": calibration_start.date().isoformat(),
         "live_cycle_preserved_through_calibration_start": live_cycle_preserved,
         "first_calibrated_turning_point": first_turn_date.date().isoformat() if first_turn_date is not None else None,
@@ -1126,9 +1530,11 @@ def build_calibrated_price_model(
         "latest_data_date": latest.date().isoformat(),
         "timing_source": calibration.summary.get("timing_source"),
         "selected_price_model_start_independent": prices is not None,
+        "geometry_guard_enabled": True,
+        "geometry_valid": bool(geometry_valid),
+        "geometry_constraint_table": geometry_table,
     }
     return CalibratedPriceModelResult(out, turning_points, diagnostics)
-
 
 def build_calibrated_projection_fingerprint(base_fingerprint: str | None, calibrated: CalibratedPriceModelResult) -> str:
     """Fingerprint the calibrated production path independently of selected start."""
