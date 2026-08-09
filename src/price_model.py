@@ -23,6 +23,16 @@ HISTORICAL_CYCLE_ANCHORS = [
     (pd.Timestamp("2025-10-06"), "peak", 0),
 ]
 
+# Amplitude decay is intentionally trained on mature cycle anchors even when
+# the user selects a later structural-training start. This prevents a start
+# date such as 2018-11-28 from discarding the 2017 peak when estimating how
+# cycle overshoots are compressing over time.
+MATURE_AMPLITUDE_START = pd.Timestamp("2017-12-17")
+MATURE_AMPLITUDE_ANCHORS = [
+    anchor for anchor in HISTORICAL_CYCLE_ANCHORS
+    if anchor[0] >= MATURE_AMPLITUDE_START
+]
+
 
 @dataclass
 class PriceModelResult:
@@ -450,13 +460,87 @@ def _estimate_future_cycle_amplitude(history: pd.DataFrame, future_cycle: int) -
 
 
 
-def _anchor_amplitude_decay(history: pd.DataFrame, anchor_type: str) -> dict:
-    """Estimate monotone cycle-to-cycle decay for peak or trough log amplitude.
 
-    The slope is a robust Theil-Sen-style median of all pairwise slopes in
-    log(amplitude) versus cycle number. Positive slopes are capped at zero so
-    the model never invents expanding future cycle amplitudes when the observed
-    series is flat/noisy.
+def _historical_centerline_power_law_params(
+    train: pd.DataFrame,
+    center_series: pd.Series,
+) -> tuple[float, float]:
+    """Recover the fitted historical power-law line for arbitrary past dates."""
+    dates = pd.DatetimeIndex(train["date"])
+    centers = center_series.reindex(dates).to_numpy(dtype=float)
+    days = (dates - GENESIS).days.to_numpy(dtype=float)
+    valid = np.isfinite(centers) & (centers > 0) & (days > 0)
+    if valid.sum() < 2:
+        raise ValueError("Not enough structural-centerline points for amplitude diagnostics.")
+    x = np.log(days[valid])
+    y = np.log(centers[valid])
+    X = np.column_stack([np.ones(len(x)), x])
+    beta, *_ = np.linalg.lstsq(X, y, rcond=None)
+    return float(beta[0]), float(beta[1])
+
+
+def _build_amplitude_anchor_history(
+    data: pd.DataFrame,
+    train: pd.DataFrame,
+    center_series: pd.Series,
+    training_end: pd.Timestamp,
+) -> pd.DataFrame:
+    """Build the mature-cycle amplitude dataset independently of training start.
+
+    Structural fitting still obeys the user's selected training range. Amplitude
+    decay, however, uses all mature observed cycle turning points available on or
+    before the selected training end. Centerline values before the structural
+    training start are evaluated from the same fitted historical power-law line,
+    so the amplitude definition remains Price / current structural centerline.
+    """
+    columns = [
+        "date", "requested_anchor_date", "type", "cycle",
+        "actual_price_usd", "structural_centerline_usd", "log_deviation",
+        "knot_price_usd", "source", "inside_structural_training",
+        "used_for_amplitude_decay",
+    ]
+    intercept, exponent = _historical_centerline_power_law_params(train, center_series)
+    train_start = pd.Timestamp(train["date"].min())
+    train_end = pd.Timestamp(train["date"].max())
+    rows = []
+    for requested_date, anchor_type, cycle in MATURE_AMPLITUDE_ANCHORS:
+        if requested_date > training_end:
+            continue
+        lookup = _lookup_price_near(data, requested_date)
+        if lookup is None:
+            continue
+        actual_date, actual_price = lookup
+        days = float((actual_date - GENESIS).days)
+        if days <= 0:
+            continue
+        if actual_date in center_series.index:
+            center = float(center_series.loc[actual_date])
+        else:
+            center = float(np.exp(intercept + exponent * np.log(days)))
+        rows.append({
+            "date": actual_date,
+            "requested_anchor_date": requested_date,
+            "type": anchor_type,
+            "cycle": int(cycle),
+            "actual_price_usd": float(actual_price),
+            "structural_centerline_usd": center,
+            "log_deviation": float(np.log(actual_price / center)),
+            "knot_price_usd": float(actual_price),
+            "source": "mature amplitude anchor",
+            "inside_structural_training": bool(train_start <= actual_date <= train_end),
+            "used_for_amplitude_decay": True,
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _anchor_amplitude_decay(history: pd.DataFrame, anchor_type: str) -> dict:
+    """Estimate conservative monotone peak/trough amplitude decay.
+
+    A robust median pairwise slope is estimated across all mature anchors. The
+    most recent observed cycle-to-cycle amplitude retention is then used as an
+    additional upper bound. This gives the recent 2021->2025 compression direct
+    influence instead of allowing older cycles to dilute it. Future retention is
+    never above 100%, so projected cycle amplitudes cannot expand.
     """
     subset = history[
         (history["type"] == anchor_type)
@@ -471,15 +555,21 @@ def _anchor_amplitude_decay(history: pd.DataFrame, anchor_type: str) -> dict:
             "latest_amplitude": 0.35,
             "log_slope_per_cycle": float(np.log(0.90)),
             "retention_per_cycle": 0.90,
+            "robust_retention_per_cycle": 0.90,
+            "recent_retention_per_cycle": np.nan,
+            "retention_method": "fallback",
         }
 
     subset["amplitude"] = np.maximum(
         np.abs(subset["log_deviation"].to_numpy(dtype=float)), 1e-6
     )
-    subset = subset.sort_values("cycle")
+    subset = subset.sort_values(["cycle", "date"]).drop_duplicates(
+        subset=["cycle"], keep="last"
+    )
     cycles = subset["cycle"].to_numpy(dtype=float)
     amps = subset["amplitude"].to_numpy(dtype=float)
 
+    robust_retention = 0.90
     if len(amps) >= 2:
         slopes = []
         log_amp = np.log(amps)
@@ -490,13 +580,29 @@ def _anchor_amplitude_decay(history: pd.DataFrame, anchor_type: str) -> dict:
                     slopes.append((log_amp[j] - log_amp[i]) / dc)
         slope = float(np.median(slopes)) if slopes else 0.0
         slope = min(slope, 0.0)
-        retention = float(np.exp(slope))
-        # Numerical guardrails only; observed decay still determines the value.
-        retention = float(np.clip(retention, 0.25, 1.0))
-        slope = float(np.log(retention))
+        robust_retention = float(np.clip(np.exp(slope), 0.25, 1.0))
+
+        dc_recent = cycles[-1] - cycles[-2]
+        if dc_recent > 1e-12:
+            recent_retention = float(
+                (amps[-1] / amps[-2]) ** (1.0 / dc_recent)
+            )
+            recent_retention = float(np.clip(recent_retention, 0.25, 1.0))
+        else:
+            recent_retention = np.nan
     else:
-        retention = 0.90
-        slope = float(np.log(retention))
+        recent_retention = np.nan
+
+    # Favor the more conservative of the mature-history trend and the latest
+    # observed mature-cycle change. Neither is allowed to imply expansion.
+    finite_recent = np.isfinite(recent_retention)
+    retention = min(
+        robust_retention,
+        float(recent_retention) if finite_recent else 1.0,
+        1.0,
+    )
+    retention = float(np.clip(retention, 0.25, 1.0))
+    slope = float(np.log(retention))
 
     return {
         "anchor_type": anchor_type,
@@ -505,6 +611,9 @@ def _anchor_amplitude_decay(history: pd.DataFrame, anchor_type: str) -> dict:
         "latest_amplitude": float(amps[-1]),
         "log_slope_per_cycle": slope,
         "retention_per_cycle": retention,
+        "robust_retention_per_cycle": float(robust_retention),
+        "recent_retention_per_cycle": float(recent_retention) if finite_recent else np.nan,
+        "retention_method": "min(robust mature trend, most recent observed retention)",
     }
 
 
@@ -935,7 +1044,13 @@ def _build_cycle_fit(
             "source": "boundary anchor",
         })
 
-    history_for_forecast = anchors.copy()
+    amplitude_history = _build_amplitude_anchor_history(
+        data=data,
+        train=train,
+        center_series=center_series,
+        training_end=training_end,
+    )
+    history_for_forecast = amplitude_history.copy()
 
     # Peak and trough amplitudes are projected independently. Bitcoin's upside
     # and downside deviations have both compressed over successive cycles, but
@@ -955,6 +1070,13 @@ def _build_cycle_fit(
             abs(float(np.log(trough_price / trough_center))), 0.03
         )
 
+    previous_peak_amp = float(peak_decay["latest_amplitude"])
+    previous_trough_amp = (
+        float(conditioned_cycle1_trough_amp)
+        if conditioned_cycle1_trough_amp is not None
+        else float(trough_decay["latest_amplitude"])
+    )
+
     for row in future_schedule.itertuples(index=False):
         if row.date > all_dates.max():
             continue
@@ -972,11 +1094,14 @@ def _build_cycle_fit(
             amp = abs(dev)
             source = "current bear-conditioned projected trough"
         elif row.type == "peak":
-            # Upside amplitude follows the observed peak-amplitude decay only.
+            # Upside amplitude follows mature observed peak compression and is
+            # explicitly capped at the immediately previous peak amplitude.
             amp = _project_anchor_amplitude(peak_decay, cycle_id)
+            amp = float(min(amp, previous_peak_amp))
+            previous_peak_amp = amp
             dev = amp
             knot_price = center * np.exp(dev)
-            source = "projected peak with empirical amplitude decay"
+            source = "projected peak with monotone mature amplitude decay"
         else:
             # Downside amplitude is anchored to the live 2026 trough when
             # available, then decays at the historical trough retention rate.
@@ -988,9 +1113,14 @@ def _build_cycle_fit(
                 amp = float(max(amp, 0.03))
             else:
                 amp = _project_anchor_amplitude(trough_decay, cycle_id)
+            # Once the live 2026 trough is conditioned, every later projected
+            # trough must have an equal-or-smaller log amplitude.
+            if not (row.date == NEXT_TROUGH and conditioned_cycle1_trough_amp is not None):
+                amp = float(min(amp, previous_trough_amp))
+            previous_trough_amp = float(amp)
             dev = -amp
             knot_price = center * np.exp(dev)
-            source = "projected trough with empirical amplitude decay"
+            source = "projected trough with monotone mature amplitude decay"
 
         amplitude_by_cycle.setdefault(cycle_id, {})[row.type] = float(amp)
         future_rows.append({
@@ -1004,6 +1134,19 @@ def _build_cycle_fit(
             "knot_price_usd": knot_price,
             "source": source,
         })
+
+    future_amplitude_rows = pd.DataFrame(future_rows)
+    if not future_amplitude_rows.empty:
+        future_amplitude_rows = future_amplitude_rows.copy()
+        future_amplitude_rows["inside_structural_training"] = False
+        future_amplitude_rows["used_for_amplitude_decay"] = False
+    amplitude_anchor_table = pd.concat(
+        [amplitude_history, future_amplitude_rows],
+        ignore_index=True,
+        sort=False,
+    )
+    if not amplitude_anchor_table.empty:
+        amplitude_anchor_table = amplitude_anchor_table.sort_values("date").reset_index(drop=True)
 
     knots = pd.concat(
         [pd.DataFrame(endpoint_rows), anchors, pd.DataFrame(future_rows)],
@@ -1121,6 +1264,15 @@ def _build_cycle_fit(
         "future_cycle_amplitudes": amplitude_by_cycle,
         "peak_amplitude_decay": peak_decay,
         "trough_amplitude_decay": trough_decay,
+        "amplitude_anchor_table": amplitude_anchor_table,
+        "amplitude_training_start": (
+            pd.Timestamp(amplitude_history["date"].min()).date().isoformat()
+            if not amplitude_history.empty else None
+        ),
+        "amplitude_training_end": training_end.date().isoformat(),
+        "amplitude_training_independent_of_structural_start": True,
+        "future_peak_amplitude_monotone": True,
+        "future_trough_amplitude_monotone": True,
         "future_cycle_centered": True,
         "phase_shape_applied_to": "total log-price path",
         "bull_curve": f"empirical median from {int(phase_overlays.loc[phase_overlays['phase'] == 'bull', 'phase_id'].nunique()) if not phase_overlays.empty else 0} completed bull phases",
@@ -1177,7 +1329,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "cycle_shape_value": deviation_path,
         "cycle_amplitude": np.abs(deviation_path),
         "fitted_or_projected_price_usd": fitted_or_projected,
-        "model_version": "price-model-v2.8-decaying-asymmetric-amplitude",
+        "model_version": "price-model-v2.9-mature-monotone-amplitude",
         "training_start_date": training_start.date().isoformat(),
         "training_end_date": training_end.date().isoformat(),
     })
@@ -1285,7 +1437,7 @@ def find_most_conservative_training_start(
     for idx, candidate_start in enumerate(candidate_dates, start=1):
         try:
             cache_key = (
-                "price-model-v2.8",
+                "price-model-v2.9",
                 pd.Timestamp(candidate_start).date().isoformat(),
                 training_end.date().isoformat(),
                 int(projection_years),

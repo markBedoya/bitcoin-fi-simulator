@@ -8,7 +8,7 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v2.8 — Empirical Shape + Decaying Cycle Amplitudes")
+st.title("Price Model v2.9 — Mature-Cycle Monotone Amplitude Decay")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
@@ -507,58 +507,127 @@ peak_decay = diag.get("peak_amplitude_decay", {})
 trough_decay = diag.get("trough_amplitude_decay", {})
 if peak_decay or trough_decay:
     st.subheader("Cycle amplitude decay")
-    a1, a2, a3, a4 = st.columns(4)
-    a1.metric(
-        "Historical peaks used",
-        int(peak_decay.get("observations", 0)),
+    st.caption(
+        "Amplitude decay is trained on mature Bitcoin cycle anchors independently of the "
+        "selected structural-training start. For example, choosing a 2018-11-28 structural "
+        "start still keeps the 2017 peak for amplitude-decay estimation. The final retention "
+        "uses the more conservative of the robust mature trend and the most recent observed "
+        "same-type cycle change. Future peak and trough amplitudes are then constrained to "
+        "never expand cycle-over-cycle."
     )
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("Mature peaks used", int(peak_decay.get("observations", 0)))
     a2.metric(
         "Peak amplitude retained / cycle",
         f"{float(peak_decay.get('retention_per_cycle', float('nan'))):.1%}",
-        help="Robust data-fitted retention of peak log-deviation from the structural centerline from one cycle to the next.",
+        help=(
+            f"Robust mature trend: {float(peak_decay.get('robust_retention_per_cycle', float('nan'))):.1%}; "
+            f"most recent observed retention: {float(peak_decay.get('recent_retention_per_cycle', float('nan'))):.1%}."
+        ),
     )
-    a3.metric(
-        "Historical troughs used",
-        int(trough_decay.get("observations", 0)),
-    )
+    a3.metric("Mature troughs used", int(trough_decay.get("observations", 0)))
     a4.metric(
         "Trough amplitude retained / cycle",
         f"{float(trough_decay.get('retention_per_cycle', float('nan'))):.1%}",
-        help="Robust data-fitted retention of trough log-deviation from the structural centerline from one cycle to the next.",
+        help=(
+            f"Robust mature trend: {float(trough_decay.get('robust_retention_per_cycle', float('nan'))):.1%}; "
+            f"most recent observed retention: {float(trough_decay.get('recent_retention_per_cycle', float('nan'))):.1%}."
+        ),
+    )
+    st.caption(
+        f"Amplitude dataset: {diag.get('amplitude_training_start') or '—'} → "
+        f"{diag.get('amplitude_training_end') or '—'}; structural training start is "
+        f"{training_start.date().isoformat()}."
     )
 
-    amplitude_knots = diag.get("cycle_anchor_table")
+    amplitude_knots = diag.get("amplitude_anchor_table")
     if amplitude_knots is not None and not amplitude_knots.empty:
         amplitude_view = amplitude_knots[
             amplitude_knots["type"].isin(["peak", "trough"])
-        ].copy()
+        ].copy().sort_values("date")
         if not amplitude_view.empty:
-            amplitude_view["Deviation vs centerline"] = np.where(
-                amplitude_view["type"] == "peak",
-                np.exp(amplitude_view["log_deviation"]) - 1.0,
-                1.0 - np.exp(amplitude_view["log_deviation"]),
-            )
             amplitude_view["Observed / projected"] = np.where(
-                amplitude_view["actual_price_usd"].notna(),
-                "Observed",
-                "Projected",
+                amplitude_view["actual_price_usd"].notna(), "Observed", "Projected"
             )
+            amplitude_view["Inside structural training"] = amplitude_view.get(
+                "inside_structural_training", False
+            ).fillna(False)
+            amplitude_view["Used for amplitude decay"] = amplitude_view.get(
+                "used_for_amplitude_decay", False
+            ).fillna(False)
+            amplitude_view["Price / centerline"] = (
+                amplitude_view["knot_price_usd"] / amplitude_view["structural_centerline_usd"]
+            )
+            amplitude_view["Log amplitude"] = amplitude_view["log_deviation"]
+            amplitude_view["Amplitude magnitude"] = np.abs(amplitude_view["log_deviation"])
+            amplitude_view["Amplitude change vs prior same type"] = np.nan
+            for anchor_type in ["peak", "trough"]:
+                mask = amplitude_view["type"] == anchor_type
+                vals = amplitude_view.loc[mask, "Amplitude magnitude"]
+                amplitude_view.loc[mask, "Amplitude change vs prior same type"] = vals.pct_change()
+
             st.dataframe(
                 amplitude_view[[
                     "date",
                     "type",
                     "Observed / projected",
+                    "Inside structural training",
+                    "Used for amplitude decay",
                     "knot_price_usd",
                     "structural_centerline_usd",
-                    "Deviation vs centerline",
+                    "Price / centerline",
+                    "Log amplitude",
+                    "Amplitude magnitude",
+                    "Amplitude change vs prior same type",
                 ]].style.format({
                     "knot_price_usd": "${:,.0f}",
                     "structural_centerline_usd": "${:,.0f}",
-                    "Deviation vs centerline": "{:.1%}",
-                }),
+                    "Price / centerline": "{:.3f}×",
+                    "Log amplitude": "{:+.4f}",
+                    "Amplitude magnitude": "{:.4f}",
+                    "Amplitude change vs prior same type": "{:+.1%}",
+                }, na_rep="—"),
                 hide_index=True,
                 use_container_width=True,
             )
+
+            peak_rows = amplitude_view[amplitude_view["type"] == "peak"].sort_values("date")
+            projected_peaks = peak_rows[peak_rows["Observed / projected"] == "Projected"]
+            observed_peaks = peak_rows[peak_rows["Observed / projected"] == "Observed"]
+            peak_pass = True
+            if not observed_peaks.empty and not projected_peaks.empty:
+                prior = float(observed_peaks["Amplitude magnitude"].iloc[-1])
+                for amp in projected_peaks["Amplitude magnitude"].to_numpy(dtype=float):
+                    if amp > prior + 1e-12:
+                        peak_pass = False
+                        break
+                    prior = float(amp)
+            if peak_pass:
+                st.success(
+                    "Peak-amplitude monotonicity: PASS — every projected peak is an equal-or-smaller "
+                    "log deviation above the structural centerline than the preceding mature peak."
+                )
+            else:
+                st.error("Peak-amplitude monotonicity: FAIL — review the projected peak sequence.")
+
+            if not observed_peaks.empty and not projected_peaks.empty:
+                last_obs = observed_peaks.iloc[-1]
+                next_proj = projected_peaks.iloc[0]
+                latest_amp = float(last_obs["Amplitude magnitude"])
+                next_amp = float(next_proj["Amplitude magnitude"])
+                cmp1, cmp2, cmp3 = st.columns(3)
+                cmp1.metric(
+                    f"{pd.Timestamp(last_obs['date']).year} observed peak / centerline",
+                    f"{float(last_obs['Price / centerline']):.3f}×",
+                )
+                cmp2.metric(
+                    f"{pd.Timestamp(next_proj['date']).year} projected peak / centerline",
+                    f"{float(next_proj['Price / centerline']):.3f}×",
+                )
+                cmp3.metric(
+                    "Next peak log-amplitude change",
+                    f"{(next_amp / latest_amp - 1.0):+.1%}" if latest_amp > 0 else "—",
+                )
 
 current_partial_phase = diag.get("current_partial_phase")
 if current_partial_phase:
