@@ -9,14 +9,14 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v3.0.2 — Reconciled Geometric Centerline")
+st.title("Price Model v3.1 — Locked Structural Centerline")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
     "(1064 bull + 364 bear). The phase shape is learned from completed historical total-price "
     "moves. When the latest date is inside an unfinished cycle phase, the projection continues "
-    "from that exact phase progress instead of restarting the phase. Future centerline growth is "
-    "reconciled with mature-cycle compression so the centerline remains inside projected cycles."
+    "from that exact phase progress instead of restarting the phase. The structural centerline is "
+    "the fixed backbone; cycle maturity changes only the projected peak/trough deviations around it."
 )
 
 try:
@@ -282,8 +282,8 @@ REQUIRED_BACKEND_DIAGNOSTICS = {
     "bull_gain_table",
     "phase_shape_training_independent_of_structural_start",
     "bull_gain_monotone_guardrail",
-    "future_centerline_reconciled",
-    "future_centerline_scale_table",
+    "bull_gain_guardrail_mode",
+    "structural_centerline_locked",
 }
 
 
@@ -399,9 +399,9 @@ st.caption(
     "BTC Financial Independence will use this exact model."
 )
 st.success(
-    "Price Model backend capability check: PASS — amplitude diagnostics, mature-cycle "
-    "compression, phase-shape independence, bull-gain guardrails, and future centerline "
-    "reconciliation are loaded."
+    "Price Model backend capability check: PASS — locked structural centerline, "
+    "data-fitted peak/trough amplitude decay, empirical phase shapes, and the "
+    "non-expanding bull-multiple sanity ceiling are loaded."
 )
 
 fig = go.Figure()
@@ -543,28 +543,23 @@ else:
         "projection until the failed check is resolved."
     )
 
-st.subheader("Future centerline reconciliation")
-reconciliation_applied = bool(diag.get("future_centerline_reconciliation_applied", False))
-min_center_scale = float(diag.get("future_centerline_min_scale", 1.0))
-scale_table = diag.get("future_centerline_scale_table")
-rc1, rc2, rc3 = st.columns(3)
-rc1.metric("Projection-boundary scale", "1.000×")
-rc2.metric("Minimum future centerline scale", f"{min_center_scale:.3f}×")
-rc3.metric("Maturity reconciliation", "ACTIVE" if reconciliation_applied else "NOT NEEDED")
+st.subheader("Structural backbone integrity")
+backbone_locked = bool(diag.get("structural_centerline_locked", False))
+centerline_adjusted = bool(diag.get("future_centerline_reconciliation_applied", False))
+bi1, bi2, bi3 = st.columns(3)
+bi1.metric("Structural centerline", "LOCKED" if backbone_locked else "CHECK")
+bi2.metric("Future centerline scale", "1.000×")
+bi3.metric("Guardrail can move centerline", "NO" if backbone_locked else "CHECK")
 st.caption(
-    "The historical structural fit is unchanged. In the future, if the independent mature-cycle "
-    "peak/bull-gain constraints would otherwise force a projected peak onto or below the raw "
-    "structural trend, the future geometric centerline is smoothly reconciled downward instead. "
-    "Projected peaks therefore remain above the displayed centerline and projected troughs below it."
+    "The dashed structural/geometric centerline is once again the model backbone. "
+    "It is fitted/extrapolated from the selected training range and is never lowered, "
+    "raised, or reshaped by cycle-amplitude or bull-run guardrails. Future peaks and "
+    "troughs must adapt around this line—not the other way around."
 )
-if scale_table is not None and not scale_table.empty:
-    scale_view = scale_table.copy()
-    scale_view["date"] = pd.to_datetime(scale_view["date"]).dt.date
-    st.dataframe(
-        scale_view.style.format({"scale": "{:.4f}×"}),
-        hide_index=True,
-        use_container_width=True,
-    )
+if backbone_locked and not centerline_adjusted:
+    st.success("Structural backbone: PASS — the future centerline is the untouched structural model.")
+else:
+    st.error("Structural backbone: FAIL — a future rule altered the structural centerline.")
 
 st.subheader("Model diagnostics")
 m1, m2, m3, m4, m5 = st.columns(5)
@@ -593,12 +588,11 @@ if not peak_decay and not trough_decay:
     )
 else:
     st.caption(
-        "Amplitude decay is trained on mature Bitcoin cycle anchors independently of the "
-        "selected structural-training start. For example, choosing a 2018-11-28 structural "
-        "start still keeps the 2017 peak for amplitude-decay estimation. The final retention "
-        "uses the more conservative of the robust mature trend and the most recent observed "
-        "same-type cycle change. Future peak and trough amplitudes are then constrained to "
-        "never expand cycle-over-cycle."
+        "Amplitude is defined relative to the selected structural centerline, so only mature "
+        "turning points that fall inside the selected structural-training range are used for "
+        "amplitude decay. This keeps the peak/trough envelope mathematically aligned with the "
+        "same centerline you see on the chart. Future peak and trough amplitudes are constrained "
+        "to never expand cycle-over-cycle."
     )
     a1, a2, a3, a4 = st.columns(4)
     a1.metric("Mature peaks used", int(peak_decay.get("observations", 0)))
@@ -628,7 +622,7 @@ else:
     r6.metric("Trough final retention", f"{float(trough_decay.get('retention_per_cycle', float('nan'))):.1%}")
 
     st.caption(
-        f"Amplitude dataset: {diag.get('amplitude_training_start') or '—'} → "
+        f"Amplitude dataset inside selected structural fit: {diag.get('amplitude_training_start') or '—'} → "
         f"{diag.get('amplitude_training_end') or '—'}; structural training start is "
         f"{training_start.date().isoformat()}."
     )
@@ -723,10 +717,9 @@ else:
                 )
 
 
-# Total bull-run compression is an independent guardrail from peak/centerline
-# amplitude. This catches cases where a deep trough would otherwise create a
-# larger trough->peak multiple even though peak deviation itself is monotone.
-st.subheader("Bull-run compression guardrail")
+# Bull-run multiple is a secondary sanity ceiling, not a second forecasting
+# model. Peak/centerline amplitude remains the primary cycle forecast.
+st.subheader("Bull-run non-expansion sanity check")
 bull_gain_decay = diag.get("bull_gain_decay", {})
 bull_gain_table = diag.get("bull_gain_table")
 if not bull_gain_decay:
@@ -734,10 +727,7 @@ if not bull_gain_decay:
 else:
     b1, b2, b3, b4 = st.columns(4)
     b1.metric("Completed mature bulls used", int(bull_gain_decay.get("observations", 0)))
-    b2.metric(
-        "Bull log-gain retained / cycle",
-        f"{float(bull_gain_decay.get('retention_per_cycle', float('nan'))):.1%}",
-    )
+    b2.metric("Guardrail mode", "NON-EXPANSION")
     b3.metric(
         "Latest completed bull multiple",
         f"{float(bull_gain_decay.get('latest_multiple', float('nan'))):.2f}×",
@@ -753,10 +743,11 @@ else:
     )
 
     st.caption(
-        "This guardrail measures the entire trough-to-peak move, independent of the "
-        "structural centerline. A future bull log gain cannot exceed the mature compression "
-        "trend. It prevents a deep projected trough from mechanically generating a larger "
-        "next-cycle bull multiple."
+        "This is intentionally only a sanity ceiling. The model does NOT extrapolate the old "
+        "21× → 6× compression rate into a forced ~3× next bull. The projected peak is first "
+        "set by its decaying distance above the locked structural centerline. Only if that "
+        "would make the trough-to-peak multiple larger than the preceding mature bull is the "
+        "peak capped—and the centerline is never moved."
     )
 
     if bull_gain_table is not None and not bull_gain_table.empty:
@@ -771,24 +762,23 @@ else:
             bull_view["Centerline conflict"] = bull_view["centerline_conflict"].fillna(False)
         else:
             bull_view["Centerline conflict"] = False
-        bull_view["Centerline reconciled"] = bull_view.get(
-            "centerline_reconciled", pd.Series(False, index=bull_view.index)
+        bull_view["Ceiling applied"] = bull_view.get(
+            "bull_ceiling_applied", pd.Series(False, index=bull_view.index)
         ).fillna(False)
-        bull_view["Centerline scale"] = bull_view.get(
-            "centerline_scale", pd.Series(np.nan, index=bull_view.index)
-        )
+        bull_view["Centerline conflict"] = bull_view.get(
+            "centerline_conflict", pd.Series(False, index=bull_view.index)
+        ).fillna(False)
         st.dataframe(
             bull_view[[
                 "start_date", "peak_date", "source", "start_price_usd", "peak_price_usd",
-                "Bull multiple", "Bull log gain", "Target multiple", "Centerline reconciled",
-                "Centerline scale",
+                "Bull multiple", "Bull log gain", "Target multiple", "Ceiling applied",
+                "Centerline conflict",
             ]].style.format({
                 "start_price_usd": "${:,.0f}",
                 "peak_price_usd": "${:,.0f}",
                 "Bull multiple": "{:.2f}×",
                 "Bull log gain": "{:.4f}",
                 "Target multiple": "{:.2f}×",
-                "Centerline scale": "{:.3f}×",
             }, na_rep="—"),
             hide_index=True,
             use_container_width=True,
@@ -806,18 +796,17 @@ else:
                 prior_gain = float(gain)
         if bull_pass:
             st.success(
-                "Bull-run compression: PASS — projected trough-to-peak log gains do not "
-                "expand relative to the preceding mature bull run."
+                "Bull-run non-expansion: PASS — projected trough-to-peak multiples do not "
+                "expand relative to the preceding mature/projected bull run."
             )
         else:
-            st.error("Bull-run compression: FAIL — a projected bull run expands versus the prior mature cycle.")
+            st.error("Bull-run non-expansion: CHECK — a projected bull run expands because the structural backbone took precedence over an impossible ceiling.")
 
-        if "centerline_reconciled" in future.columns and future["centerline_reconciled"].fillna(False).any():
-            st.info(
-                "Future centerline reconciliation was applied: at least one raw structural-centerline "
-                "value conflicted with the mature bull-compression constraints. Instead of flooring "
-                "the peak at the centerline, the model lowered the future geometric centerline so the "
-                "peak keeps a positive decaying amplitude above it."
+        if "centerline_conflict" in future.columns and future["centerline_conflict"].fillna(False).any():
+            st.warning(
+                "A bull-multiple ceiling conflicted with the locked structural centerline. The model "
+                "kept the structural backbone and the positive peak amplitude instead of distorting "
+                "the centerline. Treat that cycle's bull-multiple check as diagnostic only."
             )
 
 st.caption(

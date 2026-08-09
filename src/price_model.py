@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-PRICE_MODEL_ENGINE_VERSION = "price-model-v3.0.2-reconciled-geometric-centerline"
+PRICE_MODEL_ENGINE_VERSION = "price-model-v3.1.0-locked-structural-centerline"
 
 GENESIS = pd.Timestamp("2009-01-03")
 FIXED_CYCLE_DAYS = 1428
@@ -25,10 +25,10 @@ HISTORICAL_CYCLE_ANCHORS = [
     (pd.Timestamp("2025-10-06"), "peak", 0),
 ]
 
-# Amplitude decay is intentionally trained on mature cycle anchors even when
-# the user selects a later structural-training start. This prevents a start
-# date such as 2018-11-28 from discarding the 2017 peak when estimating how
-# cycle overshoots are compressing over time.
+# Mature amplitude anchors provide candidate turning points, but amplitude
+# decay is evaluated only where the selected structural centerline is actually
+# trained. This keeps peak/trough deviations mathematically coherent with the
+# user's chosen structural fit instead of extrapolating that fit backward.
 MATURE_AMPLITUDE_START = pd.Timestamp("2017-12-17")
 # Phase-shape learning is also independent of the user-selected structural
 # start. This keeps both mature bear phases (2017-18 and 2021-22) and the two
@@ -492,13 +492,14 @@ def _build_amplitude_anchor_history(
     center_series: pd.Series,
     training_end: pd.Timestamp,
 ) -> pd.DataFrame:
-    """Build the mature-cycle amplitude dataset independently of training start.
+    """Build amplitude anchors that are coherent with the selected centerline.
 
-    Structural fitting still obeys the user's selected training range. Amplitude
-    decay, however, uses all mature observed cycle turning points available on or
-    before the selected training end. Centerline values before the structural
-    training start are evaluated from the same fitted historical power-law line,
-    so the amplitude definition remains Price / current structural centerline.
+    Peak/trough amplitude is defined as log(actual / structural centerline).
+    Because the structural centerline itself is fitted only on the selected
+    training range, only mature anchors inside that range are used to estimate
+    future amplitude decay. This avoids letting a backward extrapolation of the
+    centerline distort the 2017/2021/2025 amplitude trend when a later training
+    start is selected.
     """
     columns = [
         "date", "requested_anchor_date", "type", "cycle",
@@ -506,7 +507,6 @@ def _build_amplitude_anchor_history(
         "knot_price_usd", "source", "inside_structural_training",
         "used_for_amplitude_decay",
     ]
-    intercept, exponent = _historical_centerline_power_law_params(train, center_series)
     train_start = pd.Timestamp(train["date"].min())
     train_end = pd.Timestamp(train["date"].max())
     rows = []
@@ -517,13 +517,10 @@ def _build_amplitude_anchor_history(
         if lookup is None:
             continue
         actual_date, actual_price = lookup
-        days = float((actual_date - GENESIS).days)
-        if days <= 0:
+        inside = bool(train_start <= actual_date <= train_end)
+        if not inside or actual_date not in center_series.index:
             continue
-        if actual_date in center_series.index:
-            center = float(center_series.loc[actual_date])
-        else:
-            center = float(np.exp(intercept + exponent * np.log(days)))
+        center = float(center_series.loc[actual_date])
         rows.append({
             "date": actual_date,
             "requested_anchor_date": requested_date,
@@ -533,8 +530,8 @@ def _build_amplitude_anchor_history(
             "structural_centerline_usd": center,
             "log_deviation": float(np.log(actual_price / center)),
             "knot_price_usd": float(actual_price),
-            "source": "mature amplitude anchor",
-            "inside_structural_training": bool(train_start <= actual_date <= train_end),
+            "source": "mature amplitude anchor inside structural training",
+            "inside_structural_training": True,
             "used_for_amplitude_decay": True,
         })
     return pd.DataFrame(rows, columns=columns)
@@ -1189,28 +1186,23 @@ def _build_cycle_fit(
     latest_projected_trough_price = None
     latest_projected_trough_date = None
 
-    # The raw structural extrapolation is a growth prior, not an immutable future
-    # centerline. If mature-cycle compression says a future peak must be below the
-    # price implied by that raw trend, reconcile the *future centerline* downward
-    # instead of clamping the peak onto/under the centerline. The scale begins at
-    # exactly 1.0 at the projection boundary and can only decline when a maturity
-    # guardrail requires it. This keeps every projected peak above and trough below
-    # the displayed geometric centerline while preserving continuity.
-    current_center_scale = 1.0
-    center_scale_rows = [{
-        "date": pd.Timestamp(training_end),
-        "scale": 1.0,
-        "reason": "projection boundary",
-    }]
+    # Structural centerline is the model backbone. It is never moved by cycle
+    # guardrails. Future peaks/troughs are expressed as decaying deviations
+    # around this fixed structural path. Bull-run maturity is used only as a
+    # sanity ceiling that prevents the next trough->peak multiple from expanding
+    # above the previous mature bull. It may reduce a peak amplitude, but it may
+    # never bend the structural centerline or force a peak onto/below it.
+    previous_bull_multiple = float(bull_gain_decay.get("latest_multiple", np.inf))
+    centerline_conflicts = []
 
     for row in future_schedule.itertuples(index=False):
         if row.date > all_dates.max():
             continue
         cycle_id = int(row.cycle)
-        raw_center = float(center_series.loc[row.date]) if row.date in center_series.index else np.nan
-        center = raw_center * current_center_scale
-        reconciliation_applied = False
-        pre_reconciliation_scale = current_center_scale
+        center = float(center_series.loc[row.date]) if row.date in center_series.index else np.nan
+        raw_center = center
+        bull_ceiling_applied = False
+        centerline_conflict = False
 
         if (
             current_partial_phase is not None
@@ -1219,76 +1211,75 @@ def _build_cycle_fit(
         ):
             knot_price = float(current_partial_phase["projected_trough_price_usd"])
             dev = float(np.log(knot_price / center))
-            conditioned_cycle1_trough_amp = max(abs(dev), 0.03)
-            amp = conditioned_cycle1_trough_amp
-            # Preserve the observed/conditioned trough exactly. If it happens to
-            # lie above the current centerline, lower the centerline just enough
-            # to keep a genuine trough deviation rather than changing the price.
-            if dev >= -0.03:
-                required_scale = knot_price / (raw_center * np.exp(-0.03))
-                current_center_scale = float(min(current_center_scale, required_scale))
-                center = raw_center * current_center_scale
-                dev = float(np.log(knot_price / center))
-                amp = abs(dev)
-                reconciliation_applied = current_center_scale < pre_reconciliation_scale - 1e-12
+            amp = abs(dev)
+            centerline_conflict = bool(dev >= 0.0)
             latest_projected_trough_price = knot_price
             latest_projected_trough_date = pd.Timestamp(row.date)
             source = "current bear-conditioned projected trough"
         elif row.type == "peak":
-            # Guardrail 1: desired peak amplitude remains positive but may not
-            # expand versus the prior mature/projected peak.
+            # Primary forecast: independently decaying historical peak deviation
+            # above the unchanged structural centerline.
             amp = _project_anchor_amplitude(peak_decay, cycle_id)
             amp = float(max(min(amp, previous_peak_amp), 0.03))
+            amplitude_price = float(center * np.exp(amp))
+            knot_price = amplitude_price
 
-            # Guardrail 2: the entire trough->peak log gain also compresses. If
-            # that cap conflicts with the raw structural centerline, lower the
-            # future centerline scale so the capped peak still sits +amp above it.
+            # Secondary sanity check: do not let the trough->peak multiple expand
+            # above the preceding mature/projected bull. Unlike v3.0.2, we do not
+            # extrapolate the historical compression rate into an aggressive new
+            # target multiple. We only enforce non-expansion.
             target_bull_log_gain = np.nan
             gain_cap_price = np.inf
-            if latest_projected_trough_price is not None:
-                target_bull_log_gain = _project_bull_log_gain(bull_gain_decay, cycle_id)
-                gain_cap_price = latest_projected_trough_price * np.exp(target_bull_log_gain)
-
-                max_center_for_capped_peak = gain_cap_price / np.exp(amp)
-                required_scale = max_center_for_capped_peak / raw_center
-                if required_scale < current_center_scale:
-                    current_center_scale = float(max(required_scale, 1e-9))
-                    reconciliation_applied = True
-
-            center = raw_center * current_center_scale
-            amplitude_price = center * np.exp(amp)
-            knot_price = float(min(amplitude_price, gain_cap_price))
-
-            # Numerical protection: after reconciliation the peak should retain
-            # its positive modeled amplitude, not collapse onto the centerline.
-            if knot_price <= center:
-                knot_price = float(center * np.exp(amp))
+            ceiling_multiple = previous_bull_multiple
+            if latest_projected_trough_price is not None and np.isfinite(ceiling_multiple):
+                target_bull_log_gain = float(np.log(max(ceiling_multiple, 1.0)))
+                gain_cap_price = float(latest_projected_trough_price * ceiling_multiple)
+                minimum_valid_peak = float(center * np.exp(0.03))
+                if knot_price > gain_cap_price:
+                    if gain_cap_price >= minimum_valid_peak:
+                        knot_price = gain_cap_price
+                        bull_ceiling_applied = True
+                    else:
+                        # Structural model wins this conflict. Report it rather
+                        # than deforming the backbone or destroying peak geometry.
+                        centerline_conflict = True
+                        centerline_conflicts.append({
+                            "date": pd.Timestamp(row.date),
+                            "cycle": cycle_id,
+                            "centerline_usd": center,
+                            "bull_ceiling_usd": gain_cap_price,
+                            "reason": "bull non-expansion ceiling below structural centerline",
+                        })
 
             dev = float(np.log(knot_price / center))
             amp = float(max(dev, 0.03))
-            previous_peak_amp = amp
+            previous_peak_amp = min(previous_peak_amp, amp)
 
             if latest_projected_trough_price is not None:
-                actual_log_gain = float(np.log(knot_price / latest_projected_trough_price))
+                actual_multiple = float(knot_price / latest_projected_trough_price)
+                actual_log_gain = float(np.log(actual_multiple))
                 projected_bull_gain_rows.append({
                     "cycle": cycle_id,
                     "start_date": latest_projected_trough_date,
                     "peak_date": pd.Timestamp(row.date),
                     "start_price_usd": float(latest_projected_trough_price),
                     "peak_price_usd": knot_price,
-                    "bull_multiple": float(knot_price / latest_projected_trough_price),
+                    "bull_multiple": actual_multiple,
                     "bull_log_gain": actual_log_gain,
                     "target_log_gain": float(target_bull_log_gain),
-                    "target_multiple": float(np.exp(target_bull_log_gain)),
-                    "centerline_conflict": False,
-                    "centerline_reconciled": bool(reconciliation_applied),
-                    "centerline_scale": float(current_center_scale),
-                    "source": "projected bull with dual maturity guardrails",
+                    "target_multiple": float(ceiling_multiple),
+                    "bull_ceiling_applied": bool(bull_ceiling_applied),
+                    "centerline_conflict": bool(centerline_conflict),
+                    "centerline_reconciled": False,
+                    "centerline_scale": 1.0,
+                    "source": "projected bull with locked centerline + non-expansion ceiling",
                 })
-            source = "projected peak with reconciled centerline + dual maturity compression"
+                if not centerline_conflict:
+                    previous_bull_multiple = min(previous_bull_multiple, actual_multiple)
+            source = "projected peak around locked structural centerline"
         else:
             # Downside amplitude is anchored to the live 2026 trough when
-            # available, then decays at the historical trough retention rate.
+            # available, then decays independently around the fixed centerline.
             if conditioned_cycle1_trough_amp is not None and cycle_id >= 1:
                 steps = max(cycle_id - 1, 0)
                 amp = conditioned_cycle1_trough_amp * (
@@ -1300,19 +1291,13 @@ def _build_cycle_fit(
             if not (row.date == NEXT_TROUGH and conditioned_cycle1_trough_amp is not None):
                 amp = float(min(amp, previous_trough_amp))
             previous_trough_amp = float(amp)
-            center = raw_center * current_center_scale
             dev = -amp
-            knot_price = center * np.exp(dev)
-            source = "projected trough with reconciled centerline + monotone mature amplitude decay"
-            latest_projected_trough_price = float(knot_price)
+            knot_price = float(center * np.exp(dev))
+            source = "projected trough around locked structural centerline"
+            latest_projected_trough_price = knot_price
             latest_projected_trough_date = pd.Timestamp(row.date)
 
-        center_scale_rows.append({
-            "date": pd.Timestamp(row.date),
-            "scale": float(current_center_scale),
-            "reason": "maturity reconciliation" if reconciliation_applied else "carry-forward",
-        })
-        amplitude_by_cycle.setdefault(cycle_id, {})[row.type] = float(amp)
+        amplitude_by_cycle.setdefault(cycle_id, {})[row.type] = float(abs(dev))
         future_rows.append({
             "date": row.date,
             "requested_anchor_date": row.date,
@@ -1321,31 +1306,20 @@ def _build_cycle_fit(
             "actual_price_usd": np.nan,
             "raw_structural_centerline_usd": raw_center,
             "structural_centerline_usd": center,
-            "centerline_scale": float(current_center_scale),
+            "centerline_scale": 1.0,
             "log_deviation": dev,
             "knot_price_usd": knot_price,
             "source": source,
         })
 
-    # Reconcile the daily future centerline continuously in log-scale between
-    # turning points. Historical centerline values are untouched; at the exact
-    # projection boundary the scale is 1.0, so there is no discontinuity.
-    scale_df = (
-        pd.DataFrame(center_scale_rows)
-        .sort_values("date")
-        .drop_duplicates("date", keep="last")
-        .reset_index(drop=True)
-    )
-    scale_dates_ord = np.array([pd.Timestamp(d).toordinal() for d in scale_df["date"]], dtype=float)
-    scale_values = np.maximum(scale_df["scale"].to_numpy(dtype=float), 1e-9)
-    all_dates_ord = np.array([pd.Timestamp(d).toordinal() for d in all_dates], dtype=float)
-    interpolated_log_scale = np.interp(
-        all_dates_ord, scale_dates_ord, np.log(scale_values),
-        left=0.0, right=float(np.log(scale_values[-1])),
-    )
-    centerline_scale_path = np.exp(interpolated_log_scale)
-    centerline_scale_path[all_dates <= training_end] = 1.0
-    reconciled_centerline = raw_structural_centerline * centerline_scale_path
+    # Locked structural backbone: the displayed centerline is exactly the raw
+    # fitted/extrapolated centerline for every date. No maturity rule may alter it.
+    display_centerline = raw_structural_centerline.copy()
+    scale_df = pd.DataFrame([{
+        "date": pd.Timestamp(training_end),
+        "scale": 1.0,
+        "reason": "structural centerline locked",
+    }])
 
     future_amplitude_rows = pd.DataFrame(future_rows)
     if not future_amplitude_rows.empty:
@@ -1392,7 +1366,7 @@ def _build_cycle_fit(
         )
         deviation_path = np.full(len(all_dates), np.nan, dtype=float)
         deviation_path[future_slice] = np.log(
-            cycle_price[future_slice] / reconciled_centerline[future_slice]
+            cycle_price[future_slice] / display_centerline[future_slice]
         )
     else:
         cycle_price = _interp_cycle_price_knots(
@@ -1402,7 +1376,7 @@ def _build_cycle_fit(
         # shape. Future values continue to use the aggregate empirical templates.
         historical_fit = _fit_historical_segment_path(train, knots)
         cycle_price[:len(train)] = historical_fit
-        deviation_path = np.log(cycle_price / reconciled_centerline)
+        deviation_path = np.log(cycle_price / display_centerline)
 
     # Fixed phase: trough=0, peak=1064/1428, next trough=1.
     elapsed = np.array([(d - REFERENCE_TROUGH).days for d in all_dates], dtype=float)
@@ -1472,7 +1446,7 @@ def _build_cycle_fit(
         template_df = pd.DataFrame()
         complete_cycles = 0
 
-    return cycle_price, deviation_path, cycle_progress, knots, overlay_df, template_df, reconciled_centerline, {
+    return cycle_price, deviation_path, cycle_progress, knots, overlay_df, template_df, display_centerline, {
         "cycle_days": float(FIXED_CYCLE_DAYS),
         "bull_days": int(FIXED_BULL_DAYS),
         "bear_days": int(FIXED_BEAR_DAYS),
@@ -1489,19 +1463,23 @@ def _build_cycle_fit(
             if not amplitude_history.empty else None
         ),
         "amplitude_training_end": training_end.date().isoformat(),
-        "amplitude_training_independent_of_structural_start": True,
+        "amplitude_training_independent_of_structural_start": False,
         "bull_gain_decay": bull_gain_decay,
         "bull_gain_table": bull_gain_table,
         "bull_gain_monotone_guardrail": True,
+        "bull_gain_guardrail_mode": "non-expansion ceiling only",
+        "bull_gain_ceiling_basis_multiple": float(bull_gain_decay.get("latest_multiple", np.nan)),
+        "bull_gain_centerline_conflicts": pd.DataFrame(centerline_conflicts),
         "phase_shape_training_start": MATURE_PHASE_START.date().isoformat(),
         "phase_shape_training_independent_of_structural_start": True,
         "future_peak_amplitude_monotone": True,
         "future_trough_amplitude_monotone": True,
         "future_cycle_centered": True,
-        "future_centerline_reconciled": True,
-        "future_centerline_reconciliation_applied": bool(np.nanmin(centerline_scale_path[len(train):]) < 1.0 - 1e-12) if len(all_dates) > len(train) else False,
-        "future_centerline_min_scale": float(np.nanmin(centerline_scale_path[len(train):])) if len(all_dates) > len(train) else 1.0,
+        "future_centerline_reconciled": False,
+        "future_centerline_reconciliation_applied": False,
+        "future_centerline_min_scale": 1.0,
         "future_centerline_scale_table": scale_df.copy(),
+        "structural_centerline_locked": True,
         "raw_structural_centerline_preserved_for_diagnostics": True,
         "phase_shape_applied_to": "total log-price path",
         "bull_curve": f"empirical median from {int(phase_overlays.loc[phase_overlays['phase'] == 'bull', 'phase_id'].nunique()) if not phase_overlays.empty else 0} completed bull phases",
@@ -1535,7 +1513,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
     structural_centerline, trend_diag = _fit_centerline(train, future_dates)
     all_dates = pd.DatetimeIndex(train["date"].tolist() + future_dates.tolist())
 
-    fitted_or_projected, deviation_path, cycle_progress, knots, overlays, template, reconciled_centerline, cycle_diag = _build_cycle_fit(
+    fitted_or_projected, deviation_path, cycle_progress, knots, overlays, template, display_centerline, cycle_diag = _build_cycle_fit(
         data=data,
         train=train,
         all_dates=all_dates,
@@ -1553,7 +1531,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
         "row_type": ["historical_training"] * len(train) + ["projected"] * len(future_dates),
         "actual_price_usd": list(train["price_usd"]) + [np.nan] * len(future_dates),
         "included_in_training": [True] * len(train) + [False] * len(future_dates),
-        "structural_centerline_usd": reconciled_centerline,
+        "structural_centerline_usd": display_centerline,
         "raw_structural_centerline_usd": structural_centerline,
         "cycle_progress": cycle_progress,
         "cycle_shape_value": deviation_path,
@@ -1668,7 +1646,7 @@ def find_most_conservative_training_start(
     for idx, candidate_start in enumerate(candidate_dates, start=1):
         try:
             cache_key = (
-                "price-model-v3.0.2",
+                "price-model-v3.1.0",
                 pd.Timestamp(candidate_start).date().isoformat(),
                 training_end.date().isoformat(),
                 int(projection_years),
