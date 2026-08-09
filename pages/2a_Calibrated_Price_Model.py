@@ -16,12 +16,12 @@ from src.walk_forward_calibration import (
     run_walk_forward_calibration,
 )
 
-st.title("Calibrated Price Model v1 — Walk-Forward Learned")
+st.title("Calibrated Price Model v2 — Multi-Horizon + Cycle-Aware")
 st.caption(
-    "The frozen Price Model v3.12 remains the parent model. This page never changes its mathematics. "
-    "Instead, standardized 4-year and 8-year historical walk-forward tests learn two corrections: "
-    "G for future structural-centerline growth and K for future cycle amplitude. The calibrated model "
-    "then produces its own future centerline, peaks, troughs, and daily Bitcoin path for FI planning."
+    "The frozen Price Model v3.12 remains the parent model and is not modified. "
+    "This calibration layer uses multi-horizon structural backtests to learn G and "
+    "realized historical turning-point envelope errors to learn K. It then creates its "
+    "own future centerline, peaks, troughs, and daily Bitcoin path for FI planning."
 )
 
 try:
@@ -70,18 +70,25 @@ st.info(
 st.subheader("Walk-forward calibration")
 st.markdown(
     """
-The calibration runs standardized fake-**today** experiments every six months beginning in January 2023.
-At every fake date it fits the frozen model twice — once with exactly 4 years of trailing history and once
-with exactly 8 years — and then scores the next 12 months against Bitcoin prices that the fake model was
-not allowed to see. No calibration training data is allowed before **Jan 14, 2015**.
+The calibration runs fake-**today** experiments every six months while enforcing a hard
+**Jan 14, 2015** training-data floor. A 4-year test can therefore begin in **Jan 2019**;
+an 8-year test begins in **Jan 2023**. Each fake model sees only information available at
+that fake date.
 
-The backtest learns only:
+The two corrections are learned differently on purpose:
 
-- **G — structural growth factor:** changes how quickly the *new calibrated centerline* grows in the future.
-- **K — cycle amplitude factor:** changes the size of highs/lows around that calibrated centerline.
+- **G — structural growth factor:** learned from realized low-frequency Bitcoin growth at
+  **12, 24, 36, and 48 months** versus the frozen model's centerline growth. Realized
+  structural level uses a trailing 180-day median of log price rather than a single day.
+- **K — cycle amplitude factor:** learned from how large the frozen model said future
+  historical peaks/troughs would be versus what actually materialized. Realized turning
+  points use a 31-day median around the anchor so one wick cannot dominate the answer.
 
-Both are regularized toward **1.000×**, so weak historical evidence cannot radically rewrite the frozen model.
-"""
+This makes K specifically answer the question we care about: **how much of the frozen
+model's projected cycle envelope historically materialized?** Longer-horizon evidence
+receives more weight, and held-out fake dates are still scored using factors learned only
+from the other dates.
+    """
 )
 
 existing = st.session_state.get("walk_forward_calibration_result")
@@ -131,26 +138,48 @@ c3.metric("Calibration stability", summary["stability"])
 c4.metric("Calibration status", summary["status"])
 
 m1, m2, m3, m4 = st.columns(4)
-m1.metric("Raw OOS error", f"{summary['raw_cv_error']:.1%}")
+m1.metric("Raw cycle-aware OOS error", f"{summary['raw_cv_error']:.1%}")
 m2.metric("Calibrated OOS error", f"{summary['calibrated_cv_error']:.1%}")
 m3.metric("OOS improvement", f"{summary['cv_improvement']:+.1%}")
 m4.metric("Walk-forward tests", f"{summary['total_tests']}")
 
-if summary["status"] == "PASS":
+s1, s2, s3, s4 = st.columns(4)
+s1.metric("Raw structural error", f"{summary['raw_structural_cv_error']:.1%}")
+s2.metric("Calibrated structural error", f"{summary['calibrated_structural_cv_error']:.1%}")
+s3.metric("Raw envelope error", f"{summary['raw_envelope_cv_error']:.1%}")
+s4.metric("Calibrated envelope error", f"{summary['calibrated_envelope_cv_error']:.1%}")
+
+status = summary["status"]
+if status == "PASS":
     st.success(
-        "Calibration validation: PASS — the learned factors are stable enough and reduce genuine held-out "
-        "walk-forward error. This calibrated path is eligible to become the default FI Bitcoin projection."
+        "Calibration validation: PASS — multi-horizon structural growth and historical cycle-envelope "
+        "calibration reduce held-out error by at least 10% with acceptable stability. This path is "
+        "eligible to become the default FI Bitcoin projection."
     )
-elif summary["status"] == "UNSTABLE":
+elif status == "MODEST":
     st.warning(
-        "Calibration validation: UNSTABLE — the page will still show the learned projection for research, "
-        "but FI will fall back to the frozen Price Model."
+        "Calibration validation: MODEST — held-out error improved, but by less than 10%. The calibrated "
+        "path is shown for research, while FI stays on frozen v3.12 until the evidence becomes stronger."
+    )
+elif status == "UNSTABLE":
+    st.warning(
+        "Calibration validation: UNSTABLE — historical G/K estimates vary too much for FI to trust automatically."
+    )
+elif status == "INSUFFICIENT_EVIDENCE":
+    st.warning(
+        "Calibration validation: INSUFFICIENT EVIDENCE — more completed multi-year/turning-point outcomes are needed."
     )
 else:
     st.warning(
-        "Calibration validation: NO IMPROVEMENT — the learned projection is shown for research, but the "
-        "held-out tests did not beat the frozen model, so FI will fall back to the frozen Price Model."
+        "Calibration validation: NO IMPROVEMENT — the cycle-aware held-out tests did not beat frozen v3.12, "
+        "so FI remains on the frozen model."
     )
+
+st.caption(
+    f"Evidence: {summary['total_structural_points']} structural horizon observations and "
+    f"{summary['total_envelope_points']} realized peak/trough envelope observations. "
+    f"Maximum evaluation horizon: {summary['max_evaluation_months']} months."
+)
 
 l4 = summary["lookback_4y"]
 l8 = summary["lookback_8y"]
@@ -160,71 +189,103 @@ lookback_table = pd.DataFrame([
         "Lookback": "4 years",
         "G": l4["growth_factor"],
         "K": l4["amplitude_factor"],
-        "Raw OOS error": l4["raw_cv_error"],
-        "Calibrated OOS error": l4["calibrated_cv_error"],
-        "Stability": l4["stability"],
+        "Raw total OOS": l4["raw_cv_error"],
+        "Calibrated total OOS": l4["calibrated_cv_error"],
+        "Raw structural": l4["raw_structural_cv_error"],
+        "Calibrated structural": l4["calibrated_structural_cv_error"],
+        "Raw envelope": l4["raw_envelope_cv_error"],
+        "Calibrated envelope": l4["calibrated_envelope_cv_error"],
         "Tests": l4["tests"],
+        "Envelope outcomes": l4["envelope_points"],
         "Final weight": summary["lookback_weights"].get("4", np.nan),
     },
     {
         "Lookback": "8 years",
         "G": l8["growth_factor"],
         "K": l8["amplitude_factor"],
-        "Raw OOS error": l8["raw_cv_error"],
-        "Calibrated OOS error": l8["calibrated_cv_error"],
-        "Stability": l8["stability"],
+        "Raw total OOS": l8["raw_cv_error"],
+        "Calibrated total OOS": l8["calibrated_cv_error"],
+        "Raw structural": l8["raw_structural_cv_error"],
+        "Calibrated structural": l8["calibrated_structural_cv_error"],
+        "Raw envelope": l8["raw_envelope_cv_error"],
+        "Calibrated envelope": l8["calibrated_envelope_cv_error"],
         "Tests": l8["tests"],
+        "Envelope outcomes": l8["envelope_points"],
         "Final weight": summary["lookback_weights"].get("8", np.nan),
     },
 ])
 st.dataframe(
     lookback_table.style.format({
-        "G": "{:.3f}×",
-        "K": "{:.3f}×",
-        "Raw OOS error": "{:.1%}",
-        "Calibrated OOS error": "{:.1%}",
+        "G": "{:.3f}×", "K": "{:.3f}×",
+        "Raw total OOS": "{:.1%}", "Calibrated total OOS": "{:.1%}",
+        "Raw structural": "{:.1%}", "Calibrated structural": "{:.1%}",
+        "Raw envelope": "{:.1%}", "Calibrated envelope": "{:.1%}",
         "Final weight": "{:.1%}",
     }),
-    hide_index=True,
-    use_container_width=True,
+    hide_index=True, use_container_width=True,
 )
 
 st.subheader("Historical fake-today tests")
 tests = calibration.tests.copy()
 tests["fake_today"] = pd.to_datetime(tests["fake_today"]).dt.date
 tests["training_start"] = pd.to_datetime(tests["training_start"]).dt.date
+show_cols = [
+    "fake_today", "lookback_years", "training_start", "max_horizon_months",
+    "structural_points", "envelope_points", "snapshot_growth_factor",
+    "snapshot_amplitude_factor", "raw_error", "calibrated_error",
+    "raw_structural_error", "calibrated_structural_error",
+    "raw_envelope_error", "calibrated_envelope_error",
+    "cv_growth_factor", "cv_amplitude_factor",
+]
+show_cols = [c for c in show_cols if c in tests.columns]
 st.dataframe(
-    tests[[
-        "fake_today",
-        "lookback_years",
-        "training_start",
-        "snapshot_growth_factor",
-        "snapshot_amplitude_factor",
-        "raw_error",
-        "calibrated_error",
-        "cv_growth_factor",
-        "cv_amplitude_factor",
-        "raw_12m_price_usd",
-        "actual_12m_price_usd",
-        "raw_12m_error_pct",
-    ]].style.format({
-        "snapshot_growth_factor": "{:.3f}×",
-        "snapshot_amplitude_factor": "{:.3f}×",
-        "raw_error": "{:.1%}",
-        "calibrated_error": "{:.1%}",
-        "cv_growth_factor": "{:.3f}×",
-        "cv_amplitude_factor": "{:.3f}×",
-        "raw_12m_price_usd": "${:,.0f}",
-        "actual_12m_price_usd": "${:,.0f}",
-        "raw_12m_error_pct": "{:+.1%}",
+    tests[show_cols].style.format({
+        "snapshot_growth_factor": "{:.3f}×", "snapshot_amplitude_factor": "{:.3f}×",
+        "cv_growth_factor": "{:.3f}×", "cv_amplitude_factor": "{:.3f}×",
+        "raw_error": "{:.1%}", "calibrated_error": "{:.1%}",
+        "raw_structural_error": "{:.1%}", "calibrated_structural_error": "{:.1%}",
+        "raw_envelope_error": "{:.1%}", "calibrated_envelope_error": "{:.1%}",
     }),
-    hide_index=True,
-    use_container_width=True,
+    hide_index=True, use_container_width=True,
 )
 st.caption(
-    "Snapshot G/K values are the regularized correction learned by each individual fake-today experiment. "
-    "The final 4Y and 8Y corrections use their medians, and each held-out cutoff is scored using only the other cutoffs."
+    "4Y snapshots begin in Jan-2019; 8Y snapshots begin in Jan-2023. A snapshot can contribute "
+    "12/24/36/48-month structural evidence as it matures, plus any realized historical cycle turning "
+    "points inside its forward window."
 )
+
+with st.expander("Inspect calibration evidence"):
+    obs = calibration.observations.copy()
+    if obs.empty:
+        st.caption("No detailed evidence rows are available.")
+    else:
+        structural_evidence = obs[obs["metric_type"] == "structural"].copy()
+        envelope_evidence = obs[obs["metric_type"] == "envelope"].copy()
+        t1, t2 = st.tabs(["Structural horizons", "Cycle envelope outcomes"])
+        with t1:
+            if structural_evidence.empty:
+                st.caption("No structural evidence rows.")
+            else:
+                cols = ["fake_today", "lookback_years", "horizon_months",
+                        "raw_structural_log_growth", "actual_structural_log_growth",
+                        "implied_growth_factor", "evidence_weight"]
+                st.dataframe(structural_evidence[cols], hide_index=True, use_container_width=True)
+        with t2:
+            if envelope_evidence.empty:
+                st.caption("No realized turning-point outcomes are available yet.")
+            else:
+                cols = ["fake_today", "lookback_years", "anchor_date", "anchor_type",
+                        "months_forward", "raw_projected_anchor_price_usd",
+                        "actual_anchor_price_usd", "raw_amplitude",
+                        "actual_amplitude_using_snapshot_G", "implied_amplitude_factor",
+                        "evidence_weight"]
+                st.dataframe(
+                    envelope_evidence[cols].style.format({
+                        "raw_projected_anchor_price_usd": "${:,.0f}",
+                        "actual_anchor_price_usd": "${:,.0f}",
+                        "implied_amplitude_factor": "{:.3f}×",
+                    }), hide_index=True, use_container_width=True,
+                )
 
 calibrated = build_calibrated_price_model(base_model, calibration)
 effective_fingerprint = build_calibrated_projection_fingerprint(base_fingerprint, calibrated)
@@ -331,7 +392,7 @@ if not turns.empty:
 
 st.subheader("Model chain")
 st.code(
-    "Frozen Price Model v3.12  →  Walk-Forward Calibration v1  →  "
+    "Frozen Price Model v3.12  →  Walk-Forward Calibration v2  →  "
     "Calibrated Price Model  →  BTC Financial Independence"
 )
 st.caption(
