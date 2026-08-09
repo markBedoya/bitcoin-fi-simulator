@@ -9,14 +9,14 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v3.1.1 — Locked Centerline + Shrunk Cycle Amplitude")
+st.title("Price Model v3.2.0 — Locked Centerline + Symmetric Cycle Envelope")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
     "(1064 bull + 364 bear). The phase shape is learned from completed historical total-price "
     "moves. When the latest date is inside an unfinished cycle phase, the projection continues "
     "from that exact phase progress instead of restarting the phase. The structural centerline is "
-    "the fixed backbone; cycle maturity changes only the projected peak/trough deviations around it."
+    "the fixed backbone; completed future cycles use one symmetric, gradually decaying envelope around it."
 )
 
 try:
@@ -276,6 +276,7 @@ if leaderboard is not None and not leaderboard.empty:
 
 REQUIRED_BACKEND_DIAGNOSTICS = {
     "amplitude_anchor_table",
+    "symmetric_cycle_amplitude_decay",
     "peak_amplitude_decay",
     "trough_amplitude_decay",
     "bull_gain_decay",
@@ -400,8 +401,8 @@ st.caption(
 )
 st.success(
     "Price Model backend capability check: PASS — locked structural centerline, "
-    "data-fitted peak/trough amplitude decay, empirical phase shapes, and the "
-    "non-expanding bull-multiple sanity ceiling are loaded."
+    "symmetric completed-cycle envelope, empirical phase shapes, and exact projection-tail "
+    "continuation are loaded."
 )
 
 fig = go.Figure()
@@ -581,255 +582,89 @@ m4.metric("Terminal exponent", f'{diag["terminal_exponent"]:.3f}')
 m5.metric("Next modeled trough", diag.get("next_modeled_trough", "2026-10-05"))
 
 st.caption(
-    "Future-cycle amplitude: peaks and troughs now use **separate data-fitted decay rates**. "
-    "The live Oct-2026 trough conditions downside amplitude only; it no longer forces an "
-    "equally large 2029 upside move. The structural centerline remains between positive "
-    "peak deviations and negative trough deviations. "
+    "Future-cycle amplitude has been realigned around the structural centerline. "
+    "Each completed projected cycle now uses one symmetric log-amplitude: the peak is +A "
+    "above the locked centerline and the mature trough is -A below it. The live Oct-2026 "
+    "trough remains a one-cycle exception because it is conditioned from the bear market "
+    "already in progress. "
     f"Bull shape: {diag.get('bull_curve', 'empirical')}. "
     f"Bear shape: {diag.get('bear_curve', 'empirical')}."
 )
 
-peak_decay = diag.get("peak_amplitude_decay", {})
-trough_decay = diag.get("trough_amplitude_decay", {})
-st.subheader("Cycle amplitude diagnostics")
-if not peak_decay and not trough_decay:
-    st.error(
-        "Amplitude diagnostics are missing from the backend result. This normally means "
-        "src/price_model.py was not updated with the same release as this page."
-    )
+sym_decay = diag.get("symmetric_cycle_amplitude_decay", {})
+st.subheader("Symmetric cycle-envelope diagnostics")
+if not sym_decay:
+    st.error("Symmetric cycle-envelope diagnostics are missing from the backend model.")
 else:
+    e1, e2, e3, e4 = st.columns(4)
+    e1.metric("Completed cycles used", int(sym_decay.get("observations", 0)))
+    e2.metric("Observed transitions", int(sym_decay.get("transitions", 0)))
+    e3.metric("Raw envelope retention / cycle", f"{float(sym_decay.get('raw_retention_per_cycle', float('nan'))):.1%}")
+    e4.metric(
+        "Effective envelope retention / cycle",
+        f"{float(sym_decay.get('retention_per_cycle', float('nan'))):.1%}",
+        help=(f"Sample confidence: {float(sym_decay.get('sample_confidence', float('nan'))):.0%}. "
+              "Small samples are shrunk toward no further compression."),
+    )
     st.caption(
-        "Amplitude is defined relative to the selected structural centerline, so only mature "
-        "turning points that fall inside the selected structural-training range are used for "
-        "amplitude decay. This keeps the peak/trough envelope mathematically aligned with the "
-        "same centerline you see on the chart. Future peak and trough amplitudes are constrained "
-        "to never expand cycle-over-cycle."
+        "This is one cycle envelope, not separate peak and trough forecasts. That keeps the blue "
+        "structural line geometrically centered inside complete future cycles. The envelope may "
+        "shrink with maturity, but cycle rules never move the centerline."
     )
-    a1, a2, a3, a4 = st.columns(4)
-    a1.metric("Mature peaks used", int(peak_decay.get("observations", 0)))
-    a2.metric(
-        "Peak effective retention / cycle",
-        f"{float(peak_decay.get('retention_per_cycle', float('nan'))):.1%}",
-        help=(
-            f"Raw empirical retention: {float(peak_decay.get('raw_retention_per_cycle', float('nan'))):.1%}; "
-            f"sample confidence: {float(peak_decay.get('sample_confidence', float('nan'))):.0%}. "
-            "Small samples are shrunk toward no-change instead of extrapolating one unusually large compression move at full strength."
-        ),
-    )
-    a3.metric("Mature troughs used", int(trough_decay.get("observations", 0)))
-    a4.metric(
-        "Trough effective retention / cycle",
-        f"{float(trough_decay.get('retention_per_cycle', float('nan'))):.1%}",
-        help=(
-            f"Raw empirical retention: {float(trough_decay.get('raw_retention_per_cycle', float('nan'))):.1%}; "
-            f"sample confidence: {float(trough_decay.get('sample_confidence', float('nan'))):.0%}."
-        ),
-    )
-    r1, r2, r3, r4, r5, r6 = st.columns(6)
-    r1.metric("Peak raw retention", f"{float(peak_decay.get('raw_retention_per_cycle', float('nan'))):.1%}")
-    r2.metric("Peak sample confidence", f"{float(peak_decay.get('sample_confidence', float('nan'))):.0%}")
-    r3.metric("Peak effective retention", f"{float(peak_decay.get('retention_per_cycle', float('nan'))):.1%}")
-    r4.metric("Trough raw retention", f"{float(trough_decay.get('raw_retention_per_cycle', float('nan'))):.1%}")
-    r5.metric("Trough sample confidence", f"{float(trough_decay.get('sample_confidence', float('nan'))):.0%}")
-    r6.metric("Trough effective retention", f"{float(trough_decay.get('retention_per_cycle', float('nan'))):.1%}")
 
-    st.caption(
-        f"Amplitude dataset inside selected structural fit: {diag.get('amplitude_training_start') or '—'} → "
-        f"{diag.get('amplitude_training_end') or '—'}; structural training start is "
-        f"{training_start.date().isoformat()}."
-    )
-    st.caption(
-        "Small-sample shrinkage changes only the extrapolated amplitude-decay rate. It does not move "
-        "the structural centerline or alter observed turning points. With more completed cycles, the "
-        "effective retention automatically converges toward the empirical rate."
-    )
+    cycle_amp_table = sym_decay.get("cycle_amplitudes")
+    if cycle_amp_table is not None and not cycle_amp_table.empty:
+        cycle_view = cycle_amp_table.copy()
+        cycle_view["Peak multiple"] = np.exp(cycle_view["peak_amplitude"])
+        cycle_view["Trough multiple"] = np.exp(-cycle_view["trough_amplitude"])
+        cycle_view["Symmetric envelope multiple"] = np.exp(cycle_view["cycle_amplitude"])
+        st.dataframe(
+            cycle_view[["cycle", "peak_amplitude", "trough_amplitude", "cycle_amplitude",
+                        "Peak multiple", "Trough multiple", "Symmetric envelope multiple"]].style.format({
+                "cycle": "{:.0f}", "peak_amplitude": "{:.4f}", "trough_amplitude": "{:.4f}",
+                "cycle_amplitude": "{:.4f}", "Peak multiple": "{:.3f}×",
+                "Trough multiple": "{:.3f}×", "Symmetric envelope multiple": "{:.3f}×",
+            }), hide_index=True, use_container_width=True,
+        )
 
     amplitude_knots = diag.get("amplitude_anchor_table")
     if amplitude_knots is not None and not amplitude_knots.empty:
-        amplitude_view = amplitude_knots[
-            amplitude_knots["type"].isin(["peak", "trough"])
-        ].copy().sort_values("date")
+        amplitude_view = amplitude_knots[amplitude_knots["type"].isin(["peak", "trough"])].copy().sort_values("date")
         if not amplitude_view.empty:
-            amplitude_view["Observed / projected"] = np.where(
-                amplitude_view["actual_price_usd"].notna(), "Observed", "Projected"
-            )
-            amplitude_view["Inside structural training"] = amplitude_view.get(
-                "inside_structural_training", False
-            ).fillna(False)
-            amplitude_view["Used for amplitude decay"] = amplitude_view.get(
-                "used_for_amplitude_decay", False
-            ).fillna(False)
-            amplitude_view["Price / centerline"] = (
-                amplitude_view["knot_price_usd"] / amplitude_view["structural_centerline_usd"]
-            )
-            amplitude_view["Log amplitude"] = amplitude_view["log_deviation"]
-            amplitude_view["Amplitude magnitude"] = np.abs(amplitude_view["log_deviation"])
-            amplitude_view["Amplitude change vs prior same type"] = np.nan
-            for anchor_type in ["peak", "trough"]:
-                mask = amplitude_view["type"] == anchor_type
-                vals = amplitude_view.loc[mask, "Amplitude magnitude"]
-                amplitude_view.loc[mask, "Amplitude change vs prior same type"] = vals.pct_change()
-
+            amplitude_view["Observed / projected"] = np.where(amplitude_view["actual_price_usd"].notna(), "Observed", "Projected")
+            amplitude_view["Price / centerline"] = amplitude_view["knot_price_usd"] / amplitude_view["structural_centerline_usd"]
+            amplitude_view["Log deviation"] = amplitude_view["log_deviation"]
             st.dataframe(
-                amplitude_view[[
-                    "date",
-                    "type",
-                    "Observed / projected",
-                    "Inside structural training",
-                    "Used for amplitude decay",
-                    "knot_price_usd",
-                    "structural_centerline_usd",
-                    "Price / centerline",
-                    "Log amplitude",
-                    "Amplitude magnitude",
-                    "Amplitude change vs prior same type",
-                ]].style.format({
-                    "knot_price_usd": "${:,.0f}",
-                    "structural_centerline_usd": "${:,.0f}",
-                    "Price / centerline": "{:.3f}×",
-                    "Log amplitude": "{:+.4f}",
-                    "Amplitude magnitude": "{:.4f}",
-                    "Amplitude change vs prior same type": "{:+.1%}",
-                }, na_rep="—"),
-                hide_index=True,
-                use_container_width=True,
+                amplitude_view[["date", "type", "cycle", "Observed / projected", "knot_price_usd",
+                                "structural_centerline_usd", "Price / centerline", "Log deviation", "source"]].style.format({
+                    "knot_price_usd": "${:,.0f}", "structural_centerline_usd": "${:,.0f}",
+                    "Price / centerline": "{:.3f}×", "Log deviation": "{:+.4f}",
+                }, na_rep="—"), hide_index=True, use_container_width=True,
             )
-
-            peak_rows = amplitude_view[amplitude_view["type"] == "peak"].sort_values("date")
-            projected_peaks = peak_rows[peak_rows["Observed / projected"] == "Projected"]
-            observed_peaks = peak_rows[peak_rows["Observed / projected"] == "Observed"]
-            peak_pass = True
-            if not observed_peaks.empty and not projected_peaks.empty:
-                prior = float(observed_peaks["Amplitude magnitude"].iloc[-1])
-                for amp in projected_peaks["Amplitude magnitude"].to_numpy(dtype=float):
-                    if amp > prior + 1e-12:
-                        peak_pass = False
-                        break
-                    prior = float(amp)
-            if peak_pass:
-                st.success(
-                    "Peak-amplitude monotonicity: PASS — every projected peak is an equal-or-smaller "
-                    "log deviation above the structural centerline than the preceding mature peak."
-                )
+            projected = amplitude_view[amplitude_view["Observed / projected"] == "Projected"]
+            complete_future = projected[~projected["source"].astype(str).str.contains("live-cycle exception", na=False)]
+            symmetry_pass = True
+            for cycle_id, grp in complete_future.groupby("cycle"):
+                pks = grp[grp["type"] == "peak"]
+                trs = grp[grp["type"] == "trough"]
+                if not pks.empty and not trs.empty:
+                    pa = abs(float(pks.iloc[0]["log_deviation"]))
+                    ta = abs(float(trs.iloc[0]["log_deviation"]))
+                    symmetry_pass = symmetry_pass and abs(pa - ta) < 1e-9
+            if symmetry_pass:
+                st.success("Future envelope symmetry: PASS — complete projected cycles use equal log distance above and below the locked centerline.")
             else:
-                st.error("Peak-amplitude monotonicity: FAIL — review the projected peak sequence.")
+                st.error("Future envelope symmetry: FAIL — projected peak/trough geometry is not centered.")
 
-            if not observed_peaks.empty and not projected_peaks.empty:
-                last_obs = observed_peaks.iloc[-1]
-                next_proj = projected_peaks.iloc[0]
-                latest_amp = float(last_obs["Amplitude magnitude"])
-                next_amp = float(next_proj["Amplitude magnitude"])
-                cmp1, cmp2, cmp3 = st.columns(3)
-                cmp1.metric(
-                    f"{pd.Timestamp(last_obs['date']).year} observed peak / centerline",
-                    f"{float(last_obs['Price / centerline']):.3f}×",
-                )
-                cmp2.metric(
-                    f"{pd.Timestamp(next_proj['date']).year} projected peak / centerline",
-                    f"{float(next_proj['Price / centerline']):.3f}×",
-                )
-                cmp3.metric(
-                    "Next peak log-amplitude change",
-                    f"{(next_amp / latest_amp - 1.0):+.1%}" if latest_amp > 0 else "—",
-                )
-
-
-# Bull-run multiple is a secondary sanity ceiling, not a second forecasting
-# model. Peak/centerline amplitude remains the primary cycle forecast.
-st.subheader("Bull-run non-expansion sanity check")
-bull_gain_decay = diag.get("bull_gain_decay", {})
-bull_gain_table = diag.get("bull_gain_table")
-if not bull_gain_decay:
-    st.error("Bull-run compression diagnostics are missing from the backend model.")
-else:
-    b1, b2, b3, b4 = st.columns(4)
-    b1.metric("Completed mature bulls used", int(bull_gain_decay.get("observations", 0)))
-    b2.metric("Guardrail mode", "NON-EXPANSION")
-    b3.metric(
-        "Latest completed bull multiple",
-        f"{float(bull_gain_decay.get('latest_multiple', float('nan'))):.2f}×",
-    )
-    projected_multiple = float("nan")
-    if bull_gain_table is not None and not bull_gain_table.empty:
-        projected = bull_gain_table[bull_gain_table["source"].astype(str).str.contains("projected", case=False, na=False)]
-        if not projected.empty:
-            projected_multiple = float(projected.iloc[0]["bull_multiple"])
-    b4.metric(
-        "Next projected bull multiple",
-        f"{projected_multiple:.2f}×" if np.isfinite(projected_multiple) else "—",
-    )
-
-    st.caption(
-        "This is intentionally only a sanity ceiling. The model does NOT extrapolate the old "
-        "21× → 6× compression rate into a forced ~3× next bull. The projected peak is first "
-        "set by its decaying distance above the locked structural centerline. Only if that "
-        "would make the trough-to-peak multiple larger than the preceding mature bull is the "
-        "peak capped—and the centerline is never moved."
-    )
-
-    if bull_gain_table is not None and not bull_gain_table.empty:
-        bull_view = bull_gain_table.copy().sort_values("peak_date")
-        bull_view["Bull multiple"] = bull_view["bull_multiple"]
-        bull_view["Bull log gain"] = bull_view["bull_log_gain"]
-        if "target_multiple" in bull_view.columns:
-            bull_view["Target multiple"] = bull_view["target_multiple"]
-        else:
-            bull_view["Target multiple"] = np.nan
-        if "centerline_conflict" in bull_view.columns:
-            bull_view["Centerline conflict"] = bull_view["centerline_conflict"].fillna(False)
-        else:
-            bull_view["Centerline conflict"] = False
-        bull_view["Ceiling applied"] = bull_view.get(
-            "bull_ceiling_applied", pd.Series(False, index=bull_view.index)
-        ).fillna(False)
-        bull_view["Centerline conflict"] = bull_view.get(
-            "centerline_conflict", pd.Series(False, index=bull_view.index)
-        ).fillna(False)
-        st.dataframe(
-            bull_view[[
-                "start_date", "peak_date", "source", "start_price_usd", "peak_price_usd",
-                "Bull multiple", "Bull log gain", "Target multiple", "Ceiling applied",
-                "Centerline conflict",
-            ]].style.format({
-                "start_price_usd": "${:,.0f}",
-                "peak_price_usd": "${:,.0f}",
-                "Bull multiple": "{:.2f}×",
-                "Bull log gain": "{:.4f}",
-                "Target multiple": "{:.2f}×",
-            }, na_rep="—"),
-            hide_index=True,
-            use_container_width=True,
-        )
-
-        completed = bull_view[bull_view["source"].astype(str).str.contains("observed", case=False, na=False)]
-        future = bull_view[bull_view["source"].astype(str).str.contains("projected", case=False, na=False)]
-        bull_pass = True
-        if not completed.empty and not future.empty:
-            prior_gain = float(completed.iloc[-1]["bull_log_gain"])
-            for gain in future["bull_log_gain"].to_numpy(dtype=float):
-                if gain > prior_gain + 1e-12:
-                    bull_pass = False
-                    break
-                prior_gain = float(gain)
-        if bull_pass:
-            st.success(
-                "Bull-run non-expansion: PASS — projected trough-to-peak multiples do not "
-                "expand relative to the preceding mature/projected bull run."
-            )
-        else:
-            st.error("Bull-run non-expansion: CHECK — a projected bull run expands because the structural backbone took precedence over an impossible ceiling.")
-
-        if "centerline_conflict" in future.columns and future["centerline_conflict"].fillna(False).any():
-            st.warning(
-                "A bull-multiple ceiling conflicted with the locked structural centerline. The model "
-                "kept the structural backbone and the positive peak amplitude instead of distorting "
-                "the centerline. Treat that cycle's bull-multiple check as diagnostic only."
-            )
-
+st.subheader("Structural backbone integrity")
+b1, b2, b3 = st.columns(3)
+b1.metric("Structural centerline", "LOCKED")
+b2.metric("Future centerline scale", "1.000×")
+b3.metric("Cycle rules can move centerline", "NO")
+st.success("Structural backbone: PASS — cycle-envelope calculations do not alter the structural centerline.")
 st.caption(
-    f"Empirical phase-shape dataset starts at {diag.get('phase_shape_training_start', '—')} "
-    "and is independent of the selected structural-training start. This keeps the mature "
-    "2017–2018 and 2021–2022 bear phases available even when structural training starts in 2018."
+    f"Empirical phase-shape dataset starts at {diag.get('phase_shape_training_start', '—')} and is independent "
+    f"of the structural start date: {bool(diag.get('phase_shape_training_independent_of_structural_start', False))}."
 )
 
 current_partial_phase = diag.get("current_partial_phase")

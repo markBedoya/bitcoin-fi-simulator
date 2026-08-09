@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-PRICE_MODEL_ENGINE_VERSION = "price-model-v3.1.1-shrunk-amplitude-lookahead"
+PRICE_MODEL_ENGINE_VERSION = "price-model-v3.2.0-symmetric-cycle-envelope"
 
 GENESIS = pd.Timestamp("2009-01-03")
 FIXED_CYCLE_DAYS = 1428
@@ -429,42 +429,96 @@ def _learn_empirical_phase_templates(
     return grid, bull_template, bear_template, overlay_df, template_df, bull_diag, bear_diag
 
 
-def _estimate_future_cycle_amplitude(history: pd.DataFrame, future_cycle: int) -> float:
-    """Estimate one symmetric log-amplitude for a future cycle."""
-    if history.empty:
-        return 0.6
+def _symmetric_cycle_amplitude_decay(history: pd.DataFrame) -> dict:
+    """Estimate one decaying log-amplitude for complete future cycles.
 
-    cycle_amplitudes = []
+    Each completed historical cycle contributes one amplitude equal to the mean
+    of its peak and trough absolute log deviations from the structural centerline.
+    Peak and trough are therefore treated as one cycle envelope rather than two
+    independent forecasts.  The empirical retention rate is shrunk toward 1.0
+    when only a few completed cycle-to-cycle transitions exist.
+    """
+    if history.empty:
+        return {
+            "observations": 0, "transitions": 0, "sample_confidence": 0.0,
+            "latest_cycle": 0.0, "latest_amplitude": 0.35,
+            "raw_retention_per_cycle": 0.90, "retention_per_cycle": 0.90,
+            "method": "fallback", "cycle_amplitudes": pd.DataFrame(),
+        }
+
+    rows = []
     for cycle, grp in history.dropna(subset=["cycle"]).groupby("cycle"):
-        peaks = grp.loc[grp["type"] == "peak", "log_deviation"]
-        troughs = grp.loc[grp["type"] == "trough", "log_deviation"]
+        peaks = grp.loc[grp["type"] == "peak", "log_deviation"].dropna()
+        troughs = grp.loc[grp["type"] == "trough", "log_deviation"].dropna()
         if peaks.empty or troughs.empty:
             continue
         peak_amp = float(np.median(np.abs(peaks.to_numpy(dtype=float))))
         trough_amp = float(np.median(np.abs(troughs.to_numpy(dtype=float))))
-        cycle_amplitudes.append((float(cycle), 0.5 * (peak_amp + trough_amp)))
+        rows.append({
+            "cycle": float(cycle),
+            "peak_amplitude": peak_amp,
+            "trough_amplitude": trough_amp,
+            "cycle_amplitude": 0.5 * (peak_amp + trough_amp),
+        })
 
-    if not cycle_amplitudes:
-        amp = float(np.median(np.abs(history["log_deviation"].to_numpy(dtype=float))))
-        return max(amp, 0.05)
+    cycle_df = pd.DataFrame(rows).sort_values("cycle") if rows else pd.DataFrame()
+    if cycle_df.empty:
+        amp = float(np.median(np.abs(history["log_deviation"].dropna().to_numpy(dtype=float))))
+        return {
+            "observations": 0, "transitions": 0, "sample_confidence": 0.0,
+            "latest_cycle": 0.0, "latest_amplitude": max(amp, 0.05),
+            "raw_retention_per_cycle": 0.90, "retention_per_cycle": 0.90,
+            "method": "anchor-median fallback", "cycle_amplitudes": cycle_df,
+        }
 
-    cycle_amplitudes.sort(key=lambda item: item[0])
-    cycles = np.array([item[0] for item in cycle_amplitudes], dtype=float)
-    amps = np.array([item[1] for item in cycle_amplitudes], dtype=float)
-    latest_cycle = float(cycles[-1])
-    latest_amp = float(amps[-1])
-
+    cycles = cycle_df["cycle"].to_numpy(dtype=float)
+    amps = np.maximum(cycle_df["cycle_amplitude"].to_numpy(dtype=float), 1e-6)
+    raw_retention = 1.0
     if len(amps) >= 2:
-        use = min(3, len(amps))
-        slope, _ = np.polyfit(cycles[-use:], np.log(np.maximum(amps[-use:], 1e-6)), 1)
-        retention = float(np.clip(np.exp(min(float(slope), 0.0)), 0.78, 1.0))
-    else:
-        retention = 0.92
+        log_amp = np.log(amps)
+        slopes = []
+        for i in range(len(amps) - 1):
+            for j in range(i + 1, len(amps)):
+                dc = cycles[j] - cycles[i]
+                if dc > 1e-12:
+                    slopes.append((log_amp[j] - log_amp[i]) / dc)
+        robust_slope = min(float(np.median(slopes)) if slopes else 0.0, 0.0)
+        robust_retention = float(np.exp(robust_slope))
+        dc = cycles[-1] - cycles[-2]
+        recent_retention = float((amps[-1] / amps[-2]) ** (1.0 / dc)) if dc > 1e-12 else 1.0
+        raw_retention = float(np.clip(min(robust_retention, recent_retention, 1.0), 0.25, 1.0))
 
-    steps = max(float(future_cycle) - latest_cycle, 0.0)
-    amp = latest_amp * (retention ** steps)
+    transitions = max(len(amps) - 1, 0)
+    if transitions:
+        confidence = float(transitions / (transitions + 1.0))
+        retention = float(np.exp(confidence * np.log(raw_retention)))
+    else:
+        confidence = 0.0
+        retention = 0.90
+    retention = float(np.clip(retention, raw_retention, 1.0))
+
+    return {
+        "observations": int(len(amps)),
+        "transitions": int(transitions),
+        "sample_confidence": confidence,
+        "latest_cycle": float(cycles[-1]),
+        "latest_amplitude": float(amps[-1]),
+        "raw_retention_per_cycle": raw_retention,
+        "retention_per_cycle": retention,
+        "method": "symmetric completed-cycle envelope with small-sample shrinkage",
+        "cycle_amplitudes": cycle_df,
+    }
+
+
+def _project_symmetric_cycle_amplitude(decay: dict, future_cycle: int) -> float:
+    steps = max(float(future_cycle) - float(decay["latest_cycle"]), 0.0)
+    amp = float(decay["latest_amplitude"]) * float(decay["retention_per_cycle"]) ** steps
     return float(max(amp, 0.05))
 
+
+def _estimate_future_cycle_amplitude(history: pd.DataFrame, future_cycle: int) -> float:
+    """Compatibility wrapper for the symmetric complete-cycle envelope."""
+    return _project_symmetric_cycle_amplitude(_symmetric_cycle_amplitude_decay(history), future_cycle)
 
 
 
@@ -1180,18 +1234,15 @@ def _build_cycle_fit(
     )
     history_for_forecast = amplitude_history.copy()
 
-    # Peak and trough amplitudes are projected independently. Bitcoin's upside
-    # and downside deviations have both compressed over successive cycles, but
-    # not at identical rates. Conditioning the 2026 trough must therefore NOT
-    # mechanically force an equally large 2029 upside deviation.
+    # Complete future cycles use ONE symmetric log-amplitude around the locked
+    # structural centerline. This restores the geometric meaning of "centerline":
+    # for a complete projected cycle, peak and trough are equal log distances
+    # above and below it. The live Oct-2026 trough is the only exception because
+    # it is conditioned from the already-partially-observed current bear market.
     future_schedule = schedule[schedule["date"] > training_end].copy()
     future_rows = []
     amplitude_by_cycle = {}
-    peak_decay = _anchor_amplitude_decay(history_for_forecast, "peak")
-    trough_decay = _anchor_amplitude_decay(history_for_forecast, "trough")
-    bull_gain_history = _build_mature_bull_gain_history(data, training_end)
-    bull_gain_decay = _bull_gain_decay(bull_gain_history)
-    projected_bull_gain_rows = []
+    symmetric_decay = _symmetric_cycle_amplitude_decay(history_for_forecast)
 
     conditioned_cycle1_trough_amp = None
     if current_partial_phase is not None and NEXT_TROUGH in center_series.index:
@@ -1201,32 +1252,12 @@ def _build_cycle_fit(
             abs(float(np.log(trough_price / trough_center))), 0.03
         )
 
-    previous_peak_amp = float(peak_decay["latest_amplitude"])
-    previous_trough_amp = (
-        float(conditioned_cycle1_trough_amp)
-        if conditioned_cycle1_trough_amp is not None
-        else float(trough_decay["latest_amplitude"])
-    )
-    latest_projected_trough_price = None
-    latest_projected_trough_date = None
-
-    # Structural centerline is the model backbone. It is never moved by cycle
-    # guardrails. Future peaks/troughs are expressed as decaying deviations
-    # around this fixed structural path. Bull-run maturity is used only as a
-    # sanity ceiling that prevents the next trough->peak multiple from expanding
-    # above the previous mature bull. It may reduce a peak amplitude, but it may
-    # never bend the structural centerline or force a peak onto/below it.
-    previous_bull_multiple = float(bull_gain_decay.get("latest_multiple", np.inf))
-    centerline_conflicts = []
-
     for row in future_schedule.itertuples(index=False):
         if row.date > all_dates.max():
             continue
         cycle_id = int(row.cycle)
         center = float(center_series.loc[row.date]) if row.date in center_series.index else np.nan
         raw_center = center
-        bull_ceiling_applied = False
-        centerline_conflict = False
 
         if (
             current_partial_phase is not None
@@ -1236,90 +1267,12 @@ def _build_cycle_fit(
             knot_price = float(current_partial_phase["projected_trough_price_usd"])
             dev = float(np.log(knot_price / center))
             amp = abs(dev)
-            centerline_conflict = bool(dev >= 0.0)
-            latest_projected_trough_price = knot_price
-            latest_projected_trough_date = pd.Timestamp(row.date)
-            source = "current bear-conditioned projected trough"
-        elif row.type == "peak":
-            # Primary forecast: independently decaying historical peak deviation
-            # above the unchanged structural centerline.
-            amp = _project_anchor_amplitude(peak_decay, cycle_id)
-            amp = float(max(min(amp, previous_peak_amp), 0.03))
-            amplitude_price = float(center * np.exp(amp))
-            knot_price = amplitude_price
-
-            # Secondary sanity check: do not let the trough->peak multiple expand
-            # above the preceding mature/projected bull. Unlike v3.0.2, we do not
-            # extrapolate the historical compression rate into an aggressive new
-            # target multiple. We only enforce non-expansion.
-            target_bull_log_gain = np.nan
-            gain_cap_price = np.inf
-            ceiling_multiple = previous_bull_multiple
-            if latest_projected_trough_price is not None and np.isfinite(ceiling_multiple):
-                target_bull_log_gain = float(np.log(max(ceiling_multiple, 1.0)))
-                gain_cap_price = float(latest_projected_trough_price * ceiling_multiple)
-                minimum_valid_peak = float(center * np.exp(0.03))
-                if knot_price > gain_cap_price:
-                    if gain_cap_price >= minimum_valid_peak:
-                        knot_price = gain_cap_price
-                        bull_ceiling_applied = True
-                    else:
-                        # Structural model wins this conflict. Report it rather
-                        # than deforming the backbone or destroying peak geometry.
-                        centerline_conflict = True
-                        centerline_conflicts.append({
-                            "date": pd.Timestamp(row.date),
-                            "cycle": cycle_id,
-                            "centerline_usd": center,
-                            "bull_ceiling_usd": gain_cap_price,
-                            "reason": "bull non-expansion ceiling below structural centerline",
-                        })
-
-            dev = float(np.log(knot_price / center))
-            amp = float(max(dev, 0.03))
-            previous_peak_amp = min(previous_peak_amp, amp)
-
-            if latest_projected_trough_price is not None:
-                actual_multiple = float(knot_price / latest_projected_trough_price)
-                actual_log_gain = float(np.log(actual_multiple))
-                projected_bull_gain_rows.append({
-                    "cycle": cycle_id,
-                    "start_date": latest_projected_trough_date,
-                    "peak_date": pd.Timestamp(row.date),
-                    "start_price_usd": float(latest_projected_trough_price),
-                    "peak_price_usd": knot_price,
-                    "bull_multiple": actual_multiple,
-                    "bull_log_gain": actual_log_gain,
-                    "target_log_gain": float(target_bull_log_gain),
-                    "target_multiple": float(ceiling_multiple),
-                    "bull_ceiling_applied": bool(bull_ceiling_applied),
-                    "centerline_conflict": bool(centerline_conflict),
-                    "centerline_reconciled": False,
-                    "centerline_scale": 1.0,
-                    "source": "projected bull with locked centerline + non-expansion ceiling",
-                })
-                if not centerline_conflict:
-                    previous_bull_multiple = min(previous_bull_multiple, actual_multiple)
-            source = "projected peak around locked structural centerline"
+            source = "current bear-conditioned projected trough (live-cycle exception)"
         else:
-            # Downside amplitude is anchored to the live 2026 trough when
-            # available, then decays independently around the fixed centerline.
-            if conditioned_cycle1_trough_amp is not None and cycle_id >= 1:
-                steps = max(cycle_id - 1, 0)
-                amp = conditioned_cycle1_trough_amp * (
-                    float(trough_decay["retention_per_cycle"]) ** steps
-                )
-                amp = float(max(amp, 0.03))
-            else:
-                amp = _project_anchor_amplitude(trough_decay, cycle_id)
-            if not (row.date == NEXT_TROUGH and conditioned_cycle1_trough_amp is not None):
-                amp = float(min(amp, previous_trough_amp))
-            previous_trough_amp = float(amp)
-            dev = -amp
+            amp = _project_symmetric_cycle_amplitude(symmetric_decay, cycle_id)
+            dev = amp if row.type == "peak" else -amp
             knot_price = float(center * np.exp(dev))
-            source = "projected trough around locked structural centerline"
-            latest_projected_trough_price = knot_price
-            latest_projected_trough_date = pd.Timestamp(row.date)
+            source = "projected symmetric cycle envelope around locked structural centerline"
 
         amplitude_by_cycle.setdefault(cycle_id, {})[row.type] = float(abs(dev))
         future_rows.append({
@@ -1336,6 +1289,14 @@ def _build_cycle_fit(
             "source": source,
         })
 
+    # Legacy diagnostics retained for UI/backward compatibility, but they are
+    # no longer used to forecast future peak/trough geometry.
+    peak_decay = _anchor_amplitude_decay(history_for_forecast, "peak")
+    trough_decay = _anchor_amplitude_decay(history_for_forecast, "trough")
+    bull_gain_history = _build_mature_bull_gain_history(data, training_end)
+    bull_gain_decay = _bull_gain_decay(bull_gain_history)
+    projected_bull_gain_rows = []
+    centerline_conflicts = []
     # Locked structural backbone: the displayed centerline is exactly the raw
     # fitted/extrapolated centerline for every date. No maturity rule may alter it.
     display_centerline = raw_structural_centerline.copy()
@@ -1479,6 +1440,7 @@ def _build_cycle_fit(
         "turning_points": anchors.copy(),
         "next_modeled_trough": NEXT_TROUGH.date().isoformat(),
         "future_cycle_amplitudes": amplitude_by_cycle,
+        "symmetric_cycle_amplitude_decay": symmetric_decay,
         "peak_amplitude_decay": peak_decay,
         "trough_amplitude_decay": trough_decay,
         "amplitude_anchor_table": amplitude_anchor_table,
@@ -1490,8 +1452,8 @@ def _build_cycle_fit(
         "amplitude_training_independent_of_structural_start": False,
         "bull_gain_decay": bull_gain_decay,
         "bull_gain_table": bull_gain_table,
-        "bull_gain_monotone_guardrail": True,
-        "bull_gain_guardrail_mode": "non-expansion ceiling only",
+        "bull_gain_monotone_guardrail": False,
+        "bull_gain_guardrail_mode": "diagnostic only; symmetric cycle envelope is the forecast",
         "bull_gain_ceiling_basis_multiple": float(bull_gain_decay.get("latest_multiple", np.nan)),
         "bull_gain_centerline_conflicts": pd.DataFrame(centerline_conflicts),
         "phase_shape_training_start": MATURE_PHASE_START.date().isoformat(),
