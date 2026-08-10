@@ -1,0 +1,28 @@
+IMPORTANT — ONE-TIME NAVIGATION MIGRATION
+
+Before deploying v3.17.2, delete the repository's old `pages/` directory entirely.
+The four old tracked page files are:
+
+  pages/1_Data_Management.py
+  pages/2_Price_Model.py
+  pages/2a_Calibrated_Price_Model.py
+  pages/3_BTC_Financial_Independence.py
+
+v3.17.2 contains equivalent/current page scripts under `app_pages/` instead.
+
+Why deletion is required:
+Streamlit treats a top-level `pages/` directory as a reserved legacy multipage-app
+signal and enters its `_mpa_v1` router before `streamlit_app.py` executes. A ZIP
+extraction can add/overwrite files, but it cannot delete already tracked files,
+so this one-time deletion must be committed to Git.
+
+After deletion, the layout should be:
+
+  streamlit_app.py
+  app_pages/
+    1_Data_Management.py
+    2_Price_Model.py
+    3_Calibrated_Price_Model.py
+    4_BTC_Financial_Independence.py
+
+Do NOT recreate a top-level `pages/` directory while this app uses st.navigation.

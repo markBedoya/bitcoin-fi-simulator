@@ -397,9 +397,7 @@ c5.metric("Bull / bear days", f'{diag.get("bull_days", 1064)} / {diag.get("bear_
 st.caption(
     f"Active Price Model fingerprint: **{active_model_fingerprint}**. "
     f"Backend model: **{diag.get('model_version', getattr(price_model_engine, 'PRICE_MODEL_ENGINE_VERSION', 'UNKNOWN'))}**. "
-    "This frozen model is the parent input to the Calibrated Price Model. BTC Financial Independence "
-    "uses the validated calibrated projection by default when one is available, with this frozen model "
-    "remaining selectable for comparison."
+    "BTC Financial Independence will use this exact model."
 )
 st.success(
     "Price Model backend capability check: PASS — locked structural centerline, "
