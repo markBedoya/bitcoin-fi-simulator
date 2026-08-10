@@ -3,8 +3,8 @@ import streamlit as st
 
 # Streamlit can keep imported modules alive across a Cloud hot-redeploy.  Force
 # the calibration engine forward when the source release is newer than the
-# in-memory module so pages cannot mix a v2 UI with a v1 result schema.
-_EXPECTED_CALIBRATION_VERSION = "walk-forward-calibration-v3.0.0-dynamic-cycle-ensemble"
+# in-memory module so pages cannot mix a newer UI with an older result schema.
+_EXPECTED_CALIBRATION_VERSION = "walk-forward-calibration-v5.0.0-independent-cycle-regimes"
 try:
     import src.walk_forward_calibration as _wfc
     if getattr(_wfc, "CALIBRATION_VERSION", None) != _EXPECTED_CALIBRATION_VERSION:

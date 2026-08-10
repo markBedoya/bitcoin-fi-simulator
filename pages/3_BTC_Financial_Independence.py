@@ -97,7 +97,7 @@ projection_source = st.radio(
     horizontal=True,
     help=(
         "The calibrated model uses a growing ensemble of cycle-aligned frozen-v3.12 parent models, "
-        "then applies separately validated structural and cycle-envelope learning. It is independent "
+        "then applies separately validated structural shrinkage, independent cycle-regime learning, and evidence-backed bear geometry. It is independent "
         "of the Price Model page's selected training start. Choose the frozen model for comparison."
     ),
 )
@@ -157,7 +157,7 @@ if not calibration_pass:
         )
     elif calibration_current and calibration.summary.get("status") == "PASS" and not calibration_geometry_valid:
         st.warning(
-            "The calibration passed historical validation but its current forward path failed peak/trough geometry validation. "
+            "The calibration passed historical validation but its current forward path failed its forward peak/trough and evidence-backed bear-drawdown validation. "
             "FI is therefore using the frozen v3.12 model until the calibrated path is geometrically valid."
         )
     else:

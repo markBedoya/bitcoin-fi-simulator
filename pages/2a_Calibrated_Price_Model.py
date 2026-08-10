@@ -11,7 +11,7 @@ from src.price_model import NEXT_TROUGH, fit_price_model
 from src.theme import REFERENCE_LINE_COLOR
 import src.walk_forward_calibration as _wfc
 
-_EXPECTED_CALIBRATION_VERSION = "walk-forward-calibration-v4.0.0-cycle-disciplined-learning"
+_EXPECTED_CALIBRATION_VERSION = "walk-forward-calibration-v5.0.0-independent-cycle-regimes"
 if getattr(_wfc, "CALIBRATION_VERSION", None) != _EXPECTED_CALIBRATION_VERSION:
     importlib.invalidate_caches()
     _wfc = importlib.reload(_wfc)
@@ -24,11 +24,11 @@ build_calibrated_projection_fingerprint = _wfc.build_calibrated_projection_finge
 calibration_is_current = _wfc.calibration_is_current
 run_walk_forward_calibration = _wfc.run_walk_forward_calibration
 
-st.title("Calibrated Price Model v4 — Cycle-Disciplined Learning")
+st.title("Calibrated Price Model v5 — Independent Cycle Regimes")
 st.caption(
     "Price Model v3.12 remains frozen. This production forecast learns from a growing cycle-aligned parent ensemble, "
-    "separates structural and cycle-envelope learning, measures maturity by Bitcoin cycle rather than calendar year, "
-    "and enforces mathematically valid future peak/trough geometry."
+    "treats each realized trough→peak→trough market regime as the primary independent learning unit, and applies "
+    "statistically shrunk structural, cycle-amplitude and bear-drawdown corrections to future Bitcoin prices."
 )
 
 try:
@@ -74,15 +74,16 @@ st.info(
     "scores every eligible cycle-aligned trough parent."
 )
 
-st.subheader("How v4 learns")
+st.subheader("How v5 learns")
 st.markdown(
     """
-- **Growing parent ensemble:** 2015, 2018 and 2022 are current trough-aligned parents; future confirmed troughs can join automatically. A young parent can receive a small maturity-matched historical prior before it owns enough out-of-sample evidence.
-- **Structural G has a learned trust weight:** the engine learns both a raw G and how much of G actually improved held-out structural forecasts. Weak evidence produces only a small centerline adjustment.
-- **K maturity is cycle-indexed:** repeated forecasts of the same realized peak/trough are collapsed before fitting the maturity trend. Trend confidence therefore comes from independent realized Bitcoin cycles, not from counting the same market event many times.
-- **Constant K and trend K are blended out of sample:** the engine learns how much to trust the maturity trend rather than choosing 100% constant or 100% trend.
-- **Next-cycle / second-cycle evidence:** cycle-envelope tests can look as far as 96 months when history permits, so the system can directly evaluate the next one or two projected cycles.
-- **Geometry is enforced mathematically:** if a very small K would make a projected trough exceed the preceding peak, the minimum K is derived from centerline growth and the raw peak/trough amplitudes. No target price or discretionary K floor is used.
+- **Independent cycle regimes:** repeated fake-today forecasts are collapsed into realized trough→peak→trough regimes. A completed 2017/2018 or 2021/2022 cycle counts once, not dozens of times.
+- **Partial current-cycle evidence:** the 2022 parent can earn real evidence from the completed 2025 peak even before the future bear trough is confirmed. Once that trough matures, the same regime automatically becomes a complete cycle.
+- **Direct turning-point calibration:** K is fitted to actual peak prices, actual trough prices and realized peak→trough drawdowns. It can no longer win the backtest simply by collapsing the cycle onto the centerline.
+- **Conservative statistical shrinkage:** structural trust uses a one-standard-error rule; constant K is continuously shrunk toward 1.0 according to the effective number of independent cycle regimes; trend trust also favors the simpler constant model unless held-out cycles justify extrapolation.
+- **Cycle maturity trend:** a time-varying K trend is allowed only after enough *complete* independent cycles exist and it improves whole-cycle holdouts. Until then, constant K is the disciplined default.
+- **Evidence-backed bear geometry:** future peaks must exceed following troughs, and completed-cycle drawdowns provide an uncertainty-shrunk minimum bear decline. The floor is learned from Bitcoin history rather than a hand-picked percentage.
+- **Growing parent ensemble:** new confirmed trough cycles can join automatically as Bitcoin history expands, while parent weights update as their own out-of-sample evidence matures.
     """
 )
 
@@ -143,15 +144,27 @@ c4.metric("Calibration status", summary["status"])
 
 k1, k2, k3, k4 = st.columns(4)
 k1.metric("Current cycle K", f"{summary['amplitude_factor']:.3f}×")
-k2.metric("Constant K", f"{summary['amplitude_constant_factor']:.3f}×")
-k3.metric("Trend trust weight", f"{summary['amplitude_trend_blend_weight']:.0%}")
-k4.metric("Envelope mode", summary["amplitude_mode"])
+k2.metric("Conservative constant K", f"{summary['amplitude_constant_factor']:.3f}×")
+k3.metric("Unshrunk best K", f"{summary.get('amplitude_unshrunk_best_factor', summary['amplitude_constant_factor']):.3f}×")
+k4.metric("Cycle K mode", summary["amplitude_mode"])
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Structural status", summary["growth_status"])
-m2.metric("Envelope status", summary["envelope_status"])
-m3.metric("Independent cycle points", f"{summary.get('independent_cycle_points', 0)}")
+m2.metric("Cycle-regime status", summary["envelope_status"])
+m3.metric("Complete / partial regimes", f"{summary.get('complete_cycle_regimes', 0)} / {summary.get('partial_cycle_regimes', 0)}")
 m4.metric("Cycle parents", f"{summary['cycle_parent_count']}")
+
+r1, r2, r3, r4 = st.columns(4)
+r1.metric("K sample confidence", f"{summary.get('amplitude_sample_confidence', 0.0):.0%}")
+r2.metric("Trend trust weight", f"{summary['amplitude_trend_blend_weight']:.0%}")
+r3.metric("Bear-floor confidence", f"{summary.get('drawdown_floor_confidence', 0.0):.0%}")
+r4.metric("Complete drawdown regimes", f"{summary.get('drawdown_regime_count', 0)}")
+
+st.caption(
+    f"Structural trust: best held-out alpha **{summary.get('structural_best_blend_weight', summary['structural_blend_weight']):.0%}**, "
+    f"conservative one-SE alpha **{summary['structural_blend_weight']:.0%}**. "
+    f"K one-SE diagnostic: **{summary.get('amplitude_one_se_factor', summary['amplitude_constant_factor']):.3f}×**."
+)
 
 if summary["amplitude_mode"] == "BLENDED_TREND":
     st.success(
@@ -164,13 +177,13 @@ if summary["amplitude_mode"] == "BLENDED_TREND":
 elif summary["amplitude_mode"] == "CONSTANT":
     st.info("Held-out cycle evidence currently prefers a near-constant K. The maturity trend remains visible and will be retested as new cycles mature.")
 else:
-    st.warning("Envelope calibration did not improve held-out cycle forecasts, so FI will not trust this calibration automatically.")
+    st.warning("Independent cycle-regime calibration did not improve held-out cycle forecasts, so FI will not trust this calibration automatically.")
 
 s1, s2, s3, s4 = st.columns(4)
 s1.metric("Raw structural OOS", f"{summary['raw_structural_cv_error']:.1%}")
 s2.metric("Effective structural OOS", f"{summary['calibrated_structural_cv_error']:.1%}")
-s3.metric("Raw envelope OOS", f"{summary['raw_envelope_cv_error']:.1%}")
-s4.metric("Calibrated envelope OOS", f"{summary['calibrated_envelope_cv_error']:.1%}")
+s3.metric("Raw cycle-regime OOS", f"{summary['raw_envelope_cv_error']:.1%}")
+s4.metric("Calibrated cycle-regime OOS", f"{summary['calibrated_envelope_cv_error']:.1%}")
 
 e1, e2, e3 = st.columns(3)
 e1.metric("Raw combined OOS", f"{summary['raw_cv_error']:.1%}")
@@ -178,7 +191,7 @@ e2.metric("Calibrated combined OOS", f"{summary['calibrated_cv_error']:.1%}")
 e3.metric("Combined improvement", f"{summary['cv_improvement']:+.1%}")
 
 if summary["status"] == "PASS":
-    st.success("Calibration validation: PASS — held-out cycle-envelope learning materially improves the frozen model. Geometry will be checked again on the actual forward path before FI uses it.")
+    st.success("Calibration validation: PASS — held-out independent-cycle learning materially improves the frozen model. Forward bear geometry will be checked again before FI uses it.")
 elif summary["status"] == "MODEST":
     st.warning("Calibration validation: MODEST — improvement exists but is not yet strong enough to become the FI default.")
 else:
@@ -218,6 +231,38 @@ else:
         }), hide_index=True, use_container_width=True,
     )
     st.caption("Envelope evidence can extend to 96 months when history permits, so older fake-today tests can evaluate a second future cycle rather than only the following 12 months.")
+
+st.subheader("Independent Bitcoin cycle regimes")
+regime_obs = calibration.observations.copy()
+if not regime_obs.empty and "metric_type" in regime_obs.columns:
+    regime_obs = regime_obs[regime_obs["metric_type"] == "independent_cycle_regime"].copy()
+else:
+    regime_obs = pd.DataFrame()
+if regime_obs.empty:
+    st.caption("No independent cycle-regime table is available yet.")
+else:
+    for col in ("peak_date", "trough_date"):
+        if col in regime_obs.columns:
+            regime_obs[col] = pd.to_datetime(regime_obs[col], errors="coerce").dt.date
+    if "actual_drawdown_log" in regime_obs.columns:
+        regime_obs["Actual bear drawdown"] = np.where(
+            np.isfinite(pd.to_numeric(regime_obs["actual_drawdown_log"], errors="coerce")),
+            1.0 - np.exp(-pd.to_numeric(regime_obs["actual_drawdown_log"], errors="coerce")),
+            np.nan,
+        )
+    cols = [
+        "regime_index", "peak_date", "trough_date", "complete", "realized_turning_points",
+        "peak_forecast_origins", "trough_forecast_origins", "Actual bear drawdown",
+    ]
+    cols = [c for c in cols if c in regime_obs.columns]
+    st.dataframe(
+        regime_obs[cols].style.format({"Actual bear drawdown": "{:.1%}"}),
+        hide_index=True, use_container_width=True,
+    )
+    st.caption(
+        "A complete regime contains both a realized peak and its following trough. The current regime may contribute a completed peak as partial evidence, "
+        "but it does not become a full maturity-trend observation until the following trough is confirmed."
+    )
 
 st.subheader("4Y vs 8Y rolling evidence")
 rows = []
@@ -294,21 +339,34 @@ st.session_state["active_calibrated_price_model_config"] = {
     "cycle_parents": summary["cycle_parents"],
 }
 
-st.subheader("Forward geometry validation")
+st.subheader("Forward cycle discipline")
 if geometry_valid:
-    st.success("PASS — every displayed calibrated peak remains above the following calibrated trough.")
+    st.success("PASS — every displayed peak→trough pair preserves both positive bear geometry and the evidence-backed minimum mature-cycle drawdown.")
 else:
-    st.error("FAIL — forward cycle geometry is invalid. FI will not use this calibrated path.")
+    st.error("FAIL — the forward calibrated cycle path violates its data-derived peak/trough discipline. FI will not use this path.")
+st.caption(
+    f"Bear-drawdown floor confidence: **{summary.get('drawdown_floor_confidence', 0.0):.0%}** from "
+    f"**{summary.get('drawdown_regime_count', 0)} complete regimes**. The drawdown trend changes about "
+    f"**{summary.get('drawdown_trend_change_per_cycle', 0.0):+.1%} per cycle** after shrinkage. "
+    "As more complete cycles mature, these values update automatically."
+)
 geometry_table = calibrated.diagnostics.get("geometry_constraint_table")
 if geometry_table is not None and not geometry_table.empty:
     gt = geometry_table.copy()
     st.dataframe(
         gt.style.format({
             "peak_raw_amplitude": "{:.3f}", "trough_raw_amplitude": "{:.3f}",
-            "calibrated_centerline_growth_log": "{:.3f}", "minimum_geometric_K": "{:.3f}×",
+            "calibrated_centerline_growth_log": "{:.3f}",
+            "expected_bear_drawdown_log": "{:.3f}", "required_bear_drawdown_log": "{:.3f}",
+            "required_bear_drawdown_pct": "{:.1%}", "projected_calibrated_drawdown_pct": "{:.1%}",
+            "minimum_geometric_K": "{:.3f}×", "minimum_drawdown_K": "{:.3f}×",
+            "minimum_effective_K": "{:.3f}×",
         }), hide_index=True, use_container_width=True,
     )
-    st.caption("The geometric minimum is derived from each peak→trough pair. It is not a manually chosen K floor or target Bitcoin price.")
+    st.caption(
+        "The pure geometric K only prevents inversion. The drawdown K adds an uncertainty-shrunk minimum decline learned from completed Bitcoin cycles. "
+        "Neither is a manually chosen K floor or target Bitcoin price."
+    )
 
 st.subheader("Calibrated Bitcoin future projection")
 st.caption(
@@ -351,7 +409,7 @@ if not turns.empty:
         "date", "type", "cycle", "raw_price_usd", "calibrated_price_usd",
         "raw_centerline_usd", "calibrated_centerline_usd",
         "raw_price_over_centerline", "calibrated_price_over_centerline",
-        "unconstrained_amplitude_factor_K", "minimum_geometric_K", "amplitude_factor_K", "geometry_constrained",
+        "unconstrained_amplitude_factor_K", "minimum_geometric_K", "minimum_drawdown_K", "minimum_effective_K", "amplitude_factor_K", "geometry_constrained",
     ]
     turn_cols = [c for c in turn_cols if c in turns.columns]
     st.dataframe(
@@ -359,14 +417,15 @@ if not turns.empty:
             "raw_price_usd": "${:,.0f}", "calibrated_price_usd": "${:,.0f}",
             "raw_centerline_usd": "${:,.0f}", "calibrated_centerline_usd": "${:,.0f}",
             "raw_price_over_centerline": "{:.3f}×", "calibrated_price_over_centerline": "{:.3f}×",
-            "unconstrained_amplitude_factor_K": "{:.3f}×", "minimum_geometric_K": "{:.3f}×", "amplitude_factor_K": "{:.3f}×",
+            "unconstrained_amplitude_factor_K": "{:.3f}×", "minimum_geometric_K": "{:.3f}×",
+            "minimum_drawdown_K": "{:.3f}×", "minimum_effective_K": "{:.3f}×", "amplitude_factor_K": "{:.3f}×",
         }), hide_index=True, use_container_width=True,
     )
 
 st.subheader("Model chain")
 st.code(
     "Frozen Price Model v3.12  →  Growing trough-aligned parent ensemble  →  "
-    "OOS structural trust + cycle-index envelope learning  →  Geometry-valid Calibrated Price Model  →  FI"
+    "OOS structural shrinkage + independent cycle-regime learning  →  Evidence-backed bear geometry  →  Calibrated Price Model  →  FI"
 )
 st.caption(
     f"Calibration engine: {CALIBRATION_VERSION}. New Bitcoin prices can mature existing 12–96 month tests, add new fake-today tests, "

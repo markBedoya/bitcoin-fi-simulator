@@ -1,3 +1,29 @@
+## v3.17.0 — independent cycle-regime calibration
+
+- Keeps the frozen Price Model v3.12 byte-for-byte unchanged.
+- Makes realized trough→peak→trough Bitcoin regimes the primary independent K-learning unit instead of pooled turning-point amplitude residuals.
+- Fits K against direct peak-price, trough-price, and realized peak→trough drawdown error so the optimizer can no longer win by collapsing K toward zero.
+- Adds continuous small-sample shrinkage of the best cycle-regime K toward neutral K=1.0 based on the effective number of independent regimes.
+- Uses a one-standard-error rule for structural G trust so a small structural improvement no longer automatically receives 100% correction weight.
+- Allows the 2022 trough parent to earn its own partial out-of-sample evidence as soon as the frozen model's 1000-observation training minimum is reached; the completed 2025 peak can contribute before the future trough is confirmed.
+- Fits K maturity trends only from complete independent cycle regimes; partial current-cycle evidence helps the level estimate but cannot manufacture trend confidence.
+- Learns an uncertainty-shrunk mature bear-drawdown relationship from complete cycles and converts it into a data-derived future K floor in addition to the pure no-inversion geometry floor.
+- Validates future geometry against both peak>trough and the evidence-backed minimum bear decline before FI can consume the calibrated path.
+- Adds diagnostics for complete/partial cycle regimes, unshrunk vs shrunk K, K sample confidence, expected/required bear drawdown, geometric K, drawdown K, and effective K.
+
+## v3.16.0 — cycle-disciplined dynamic calibration
+
+- Keeps the frozen Price Model v3.12 byte-for-byte unchanged.
+- Replaces calendar-year K extrapolation with independent Bitcoin cycle-index maturity learning.
+- Collapses repeated forecasts of the same realized turning point before fitting the K trend, preventing pseudo-replication from overstating confidence.
+- Learns an out-of-sample blend between constant K and trend K instead of choosing 100% one or the other.
+- Learns an out-of-sample structural trust weight so weak G evidence only partially adjusts the parent-ensemble centerline.
+- Extends cycle-envelope evidence to as much as 96 months when history permits and reports direct next-cycle / second-cycle validation.
+- Gives new trough-aligned parents a small maturity-matched historical prior when they do not yet own enough OOS evidence; their own evidence replaces the prior over time.
+- Adds a mathematical peak→trough geometry floor for K derived from calibrated-centerline growth and raw cycle amplitudes; no discretionary K/price floor is used.
+- FI now requires both calibration PASS and valid forward peak/trough geometry before using the calibrated path by default.
+- Adds forward diagnostics for unconstrained K, minimum geometric K, effective K, and whether each turning point was geometry-constrained.
+
 ## v3.15.0 — dynamic cycle-parent ensemble + maturity trend
 
 - Keeps the frozen Price Model v3.12 byte-for-byte unchanged.
