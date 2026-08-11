@@ -9,14 +9,16 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v3.3.3 — Plotted Cycle-Derived Anchors")
+st.title("Price Model v3.4 — Sequential Cycle Transitions")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
     "(1064 bull + 364 bear). The phase shape is learned from completed historical total-price "
     "moves. When the latest date is inside an unfinished cycle phase, the projection continues "
-    "from that exact phase progress instead of restarting the phase. The structural centerline is "
-    "the fixed backbone; completed future cycles use one symmetric, gradually decaying envelope around it. "
+    "from that exact phase progress instead of restarting the phase. Future turning-point PRICES are now "
+    "projected sequentially from the prior turning point using historically learned trough→peak gains and "
+    "peak→trough losses. The structural centerline remains a locked long-term reference, but no longer "
+    "creates future highs and lows by symmetric amplitude. "
     "The two early exploration anchor dates are derived by running the same fixed cycle clock backward: "
     "the earlier cycle start and the prior cycle peak. Both displayed prices come from Coin Metrics. Anchor shortcuts let you snap "
     "either training boundary to any anchor."
@@ -376,15 +378,13 @@ if leaderboard is not None and not leaderboard.empty:
 
 
 REQUIRED_BACKEND_DIAGNOSTICS = {
-    "amplitude_anchor_table",
-    "symmetric_cycle_amplitude_decay",
-    "peak_amplitude_decay",
-    "trough_amplitude_decay",
-    "bull_gain_decay",
-    "bull_gain_table",
+    "cycle_transition_history",
+    "bull_transition_model",
+    "bear_transition_model",
+    "turning_point_backtest",
+    "future_endpoint_method",
+    "future_endpoints_centerline_generated",
     "phase_shape_training_independent_of_structural_start",
-    "bull_gain_monotone_guardrail",
-    "bull_gain_guardrail_mode",
     "structural_centerline_locked",
 }
 
@@ -501,8 +501,8 @@ st.caption(
     "BTC Financial Independence will use this exact model."
 )
 st.success(
-    "Price Model backend capability check: PASS — locked structural centerline, "
-    "symmetric completed-cycle envelope, empirical phase shapes, and exact projection-tail "
+    "Price Model backend capability check: PASS — sequential turning-point endpoints, "
+    "locked structural reference centerline, empirical phase shapes, and exact projection-tail "
     "continuation are loaded."
 )
 
@@ -653,10 +653,11 @@ bi1.metric("Structural centerline", "LOCKED" if backbone_locked else "CHECK")
 bi2.metric("Future centerline scale", "1.000×")
 bi3.metric("Guardrail can move centerline", "NO" if backbone_locked else "CHECK")
 st.caption(
-    "The dashed structural/geometric centerline is once again the model backbone. "
-    "It is fitted/extrapolated from the selected training range and is never lowered, "
-    "raised, or reshaped by cycle-amplitude or bull-run guardrails. Future peaks and "
-    "troughs must adapt around this line—not the other way around."
+    "The dashed structural/geometric centerline remains the untouched long-term reference. "
+    "It is fitted/extrapolated from the selected training range and is never lowered, raised, "
+    "or reshaped by cycle rules. Future peaks and troughs are now generated independently by "
+    "sequential observed cycle transitions, so the centerline no longer mechanically forces "
+    "their price levels."
 )
 if backbone_locked and not centerline_adjusted:
     st.success("Structural backbone: PASS — the future centerline is the untouched structural model.")
@@ -683,86 +684,127 @@ m4.metric("Terminal exponent", f'{diag["terminal_exponent"]:.3f}')
 m5.metric("Next modeled trough", diag.get("next_modeled_trough", "2026-10-05"))
 
 st.caption(
-    "Future-cycle amplitude has been realigned around the structural centerline. "
-    "Each completed projected cycle now uses one symmetric log-amplitude: the peak is +A "
-    "above the locked centerline and the mature trough is -A below it. The live Oct-2026 "
-    "trough remains a one-cycle exception because it is conditioned from the bear market "
-    "already in progress. "
+    "Future turning-point prices are chained from the previous trough/peak using independent "
+    "historical cycle transitions. Bull and bear total log moves are learned separately and their "
+    "cycle-to-cycle maturity slopes are shrunk toward no further change when only a few completed "
+    "cycles exist. The empirical phase templates then shape the daily path between those endpoints. "
     f"Bull shape: {diag.get('bull_curve', 'empirical')}. "
     f"Bear shape: {diag.get('bear_curve', 'empirical')}."
 )
 
-sym_decay = diag.get("symmetric_cycle_amplitude_decay", {})
-st.subheader("Symmetric cycle-envelope diagnostics")
-if not sym_decay:
-    st.error("Symmetric cycle-envelope diagnostics are missing from the backend model.")
-else:
-    e1, e2, e3, e4 = st.columns(4)
-    e1.metric("Completed cycles used", int(sym_decay.get("observations", 0)))
-    e2.metric("Observed transitions", int(sym_decay.get("transitions", 0)))
-    e3.metric("Raw envelope retention / cycle", f"{float(sym_decay.get('raw_retention_per_cycle', float('nan'))):.1%}")
-    e4.metric(
-        "Effective envelope retention / cycle",
-        f"{float(sym_decay.get('retention_per_cycle', float('nan'))):.1%}",
-        help=(f"Sample confidence: {float(sym_decay.get('sample_confidence', float('nan'))):.0%}. "
-              "Small samples are shrunk toward no further compression."),
+transition_history = diag.get("cycle_transition_history")
+bull_transition = diag.get("bull_transition_model", {})
+bear_transition = diag.get("bear_transition_model", {})
+
+st.subheader("Sequential turning-point diagnostics")
+t1, t2, t3, t4, t5, t6 = st.columns(6)
+t1.metric("Bull transitions", int(bull_transition.get("observations", 0)))
+t2.metric("Bull maturity retention", f"{float(bull_transition.get('retention_per_cycle', float('nan'))):.1%}")
+t3.metric(
+    "Bull OOS trend weight",
+    f"{float(bull_transition.get('trend_weight', float('nan'))):.0%}",
+    help=f"Held-out same-phase validations: {int(bull_transition.get('oos_validations', 0))}",
+)
+t4.metric("Bear transitions", int(bear_transition.get("observations", 0)))
+t5.metric("Bear maturity retention", f"{float(bear_transition.get('retention_per_cycle', float('nan'))):.1%}")
+t6.metric(
+    "Bear OOS trend weight",
+    f"{float(bear_transition.get('trend_weight', float('nan'))):.0%}",
+    help=f"Held-out same-phase validations: {int(bear_transition.get('oos_validations', 0))}",
+)
+
+st.caption(
+    "Retention applies to the phase's total log move from one Bitcoin cycle to the next. "
+    "100% retention means no further maturity change; below 100% means the total bull gain or bear loss "
+    "is shrinking. The raw cycle trend is estimated from independent completed transitions. Its production "
+    "trend weight is then selected by genuine walk-forward next-cycle error (0% = ignore the trend, 100% = "
+    "use it fully). Future endpoint prices are not generated from centerline amplitude."
+)
+
+if transition_history is not None and not transition_history.empty:
+    transition_view = transition_history.copy().sort_values(["cycle", "start_date"])
+    transition_view["Observed move"] = np.where(
+        transition_view["phase"] == "bull",
+        np.exp(transition_view["log_move"]),
+        np.exp(-transition_view["log_move"]),
     )
-    st.caption(
-        "This is one cycle envelope, not separate peak and trough forecasts. That keeps the blue "
-        "structural line geometrically centered inside complete future cycles. The envelope may "
-        "shrink with maturity, but cycle rules never move the centerline."
+    transition_view["Move %"] = np.where(
+        transition_view["phase"] == "bull",
+        transition_view["Observed move"] - 1.0,
+        transition_view["Observed move"] - 1.0,
+    )
+    st.dataframe(
+        transition_view[[
+            "phase", "cycle", "start_date", "end_date", "start_price_usd",
+            "end_price_usd", "log_move", "Observed move", "Move %",
+        ]].style.format({
+            "cycle": "{:.0f}",
+            "start_price_usd": "${:,.2f}",
+            "end_price_usd": "${:,.2f}",
+            "log_move": "{:.4f}",
+            "Observed move": "{:.3f}×",
+            "Move %": "{:+.1%}",
+        }),
+        hide_index=True,
+        use_container_width=True,
     )
 
-    cycle_amp_table = sym_decay.get("cycle_amplitudes")
-    if cycle_amp_table is not None and not cycle_amp_table.empty:
-        cycle_view = cycle_amp_table.copy()
-        cycle_view["Peak multiple"] = np.exp(cycle_view["peak_amplitude"])
-        cycle_view["Trough multiple"] = np.exp(-cycle_view["trough_amplitude"])
-        cycle_view["Symmetric envelope multiple"] = np.exp(cycle_view["cycle_amplitude"])
+anchor_table_for_transitions = diag.get("cycle_anchor_table")
+if anchor_table_for_transitions is not None and not anchor_table_for_transitions.empty:
+    projected_turns = anchor_table_for_transitions[
+        anchor_table_for_transitions["source"].astype(str).str.contains(
+            "projected sequential|current bear-conditioned sequential", case=False, regex=True, na=False
+        )
+    ].copy()
+    if not projected_turns.empty:
+        projected_turns["Change from prior turn"] = np.where(
+            projected_turns["phase_start_price_usd"].notna(),
+            projected_turns["knot_price_usd"] / projected_turns["phase_start_price_usd"] - 1.0,
+            np.nan,
+        )
+        st.markdown("**Projected turning-point chain**")
         st.dataframe(
-            cycle_view[["cycle", "peak_amplitude", "trough_amplitude", "cycle_amplitude",
-                        "Peak multiple", "Trough multiple", "Symmetric envelope multiple"]].style.format({
-                "cycle": "{:.0f}", "peak_amplitude": "{:.4f}", "trough_amplitude": "{:.4f}",
-                "cycle_amplitude": "{:.4f}", "Peak multiple": "{:.3f}×",
-                "Trough multiple": "{:.3f}×", "Symmetric envelope multiple": "{:.3f}×",
-            }), hide_index=True, use_container_width=True,
+            projected_turns[[
+                "date", "type", "cycle", "phase_start_date", "phase_start_price_usd",
+                "knot_price_usd", "Change from prior turn", "transition_log_move",
+                "transition_model_source", "source",
+            ]].style.format({
+                "cycle": "{:.0f}",
+                "phase_start_price_usd": "${:,.0f}",
+                "knot_price_usd": "${:,.0f}",
+                "Change from prior turn": "{:+.1%}",
+                "transition_log_move": "{:.4f}",
+            }, na_rep="—"),
+            hide_index=True,
+            use_container_width=True,
         )
 
-    amplitude_knots = diag.get("amplitude_anchor_table")
-    if amplitude_knots is not None and not amplitude_knots.empty:
-        amplitude_view = amplitude_knots[amplitude_knots["type"].isin(["peak", "trough"])].copy().sort_values("date")
-        if not amplitude_view.empty:
-            amplitude_view["Observed / projected"] = np.where(amplitude_view["actual_price_usd"].notna(), "Observed", "Projected")
-            amplitude_view["Price / centerline"] = amplitude_view["knot_price_usd"] / amplitude_view["structural_centerline_usd"]
-            amplitude_view["Log deviation"] = amplitude_view["log_deviation"]
-            st.dataframe(
-                amplitude_view[["date", "type", "cycle", "Observed / projected", "knot_price_usd",
-                                "structural_centerline_usd", "Price / centerline", "Log deviation", "source"]].style.format({
-                    "knot_price_usd": "${:,.0f}", "structural_centerline_usd": "${:,.0f}",
-                    "Price / centerline": "{:.3f}×", "Log deviation": "{:+.4f}",
-                }, na_rep="—"), hide_index=True, use_container_width=True,
-            )
-            projected = amplitude_view[amplitude_view["Observed / projected"] == "Projected"]
-            complete_future = projected[~projected["source"].astype(str).str.contains("live-cycle exception", na=False)]
-            symmetry_pass = True
-            for cycle_id, grp in complete_future.groupby("cycle"):
-                pks = grp[grp["type"] == "peak"]
-                trs = grp[grp["type"] == "trough"]
-                if not pks.empty and not trs.empty:
-                    pa = abs(float(pks.iloc[0]["log_deviation"]))
-                    ta = abs(float(trs.iloc[0]["log_deviation"]))
-                    symmetry_pass = symmetry_pass and abs(pa - ta) < 1e-9
-            if symmetry_pass:
-                st.success("Future envelope symmetry: PASS — complete projected cycles use equal log distance above and below the locked centerline.")
-            else:
-                st.error("Future envelope symmetry: FAIL — projected peak/trough geometry is not centered.")
+backtest_turns = diag.get("turning_point_backtest")
+if backtest_turns is not None and not backtest_turns.empty:
+    st.markdown("**Known-outcome turning-point backtest**")
+    st.caption(
+        "When your fake training cutoff is before a historical turning point whose actual price is now known, "
+        "this compares the sequential forecast with that later outcome. Those later prices are diagnostics only "
+        "and are never used to fit the selected historical cutoff."
+    )
+    st.dataframe(
+        backtest_turns.style.format({
+            "projected_price_usd": "${:,.0f}",
+            "actual_price_usd": "${:,.0f}",
+            "error_pct": "{:+.1%}",
+            "projected_change_from_prior_pct": "{:+.1%}",
+            "actual_change_from_prior_pct": "{:+.1%}",
+        }, na_rep="—"),
+        hide_index=True,
+        use_container_width=True,
+    )
 
 st.subheader("Structural backbone integrity")
 b1, b2, b3 = st.columns(3)
 b1.metric("Structural centerline", "LOCKED")
 b2.metric("Future centerline scale", "1.000×")
 b3.metric("Cycle rules can move centerline", "NO")
-st.success("Structural backbone: PASS — cycle-envelope calculations do not alter the structural centerline.")
+st.success("Structural backbone: PASS — sequential cycle-transition calculations do not alter the structural centerline.")
 st.caption(
     f"Empirical phase-shape dataset starts at {diag.get('phase_shape_training_start', '—')} and is independent "
     f"of the structural start date: {bool(diag.get('phase_shape_training_independent_of_structural_start', False))}."

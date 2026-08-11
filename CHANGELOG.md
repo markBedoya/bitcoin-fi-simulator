@@ -1,3 +1,16 @@
+## v3.19.0 — sequential turning-point price engine
+
+- Replaces centerline ± symmetric amplitude as the primary generator of future peak/trough prices.
+- Projects each future turning point sequentially from the previous actual/projected turning point: trough→peak from learned bull log gains and peak→trough from learned bear log losses.
+- Builds bull/bear transition histories only from completed anchor-to-anchor moves available by the selected training cutoff, preventing future-price leakage.
+- Fits maturity on independent Bitcoin cycle ids and learns how much of each bull/bear trend to apply using walk-forward held-out next-cycle errors.
+- Uses no extrapolated maturity trend when fewer than three same-phase observations exist; the latest observed phase magnitude remains the neutral fallback until a trend can be tested out of sample.
+- Keeps the structural power-law centerline locked and visible as a long-term reference, but changing the centerline no longer changes projected turning-point prices.
+- Retains the existing fixed 1428-day timing and empirical bull/bear phase-shape interpolation between sequentially generated endpoints.
+- Retains the live 2025→2026 partial-bear conditioner as a current-cycle evidence override; later cycles chain from its projected trough.
+- Adds a projected turning-point chain table and known-outcome backtest table to the Price Model page.
+- Adds regression tests for sequential endpoint chaining, centerline independence, no look-ahead leakage, cycle direction, continuity, exact sparse endpoint scoring, and existing anchor/timing/phase behavior.
+
 ## v3.18.3 — plot the cycle-derived 2011 trough anchor
 
 - Promotes the cycle-derived 2011-02-14 point from a shortcut/catalog boundary to a true historical trough/intersection anchor.

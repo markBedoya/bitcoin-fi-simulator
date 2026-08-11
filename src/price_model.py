@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-PRICE_MODEL_ENGINE_VERSION = "price-model-v3.3.3-plotted-cycle-start-anchor"
+PRICE_MODEL_ENGINE_VERSION = "price-model-v3.4.0-sequential-transition-endpoints"
 
 GENESIS = pd.Timestamp("2009-01-03")
 FIXED_CYCLE_DAYS = 1428
@@ -772,6 +772,305 @@ def _build_mature_bull_gain_history(data: pd.DataFrame, training_end: pd.Timesta
     return pd.DataFrame(rows, columns=cols)
 
 
+def _build_cycle_transition_history(
+    data: pd.DataFrame,
+    training_start: pd.Timestamp,
+    training_end: pd.Timestamp,
+) -> pd.DataFrame:
+    """Build independent observed trough->peak and peak->trough transitions.
+
+    Future turning-point prices are learned from these *actual anchor-to-anchor
+    price moves*, not from distance around the structural centerline.  The
+    selected training start controls which completed cycles are eligible, while
+    the training end prevents look-ahead leakage.
+    """
+    columns = [
+        "phase", "cycle", "start_date", "end_date", "start_type", "end_type",
+        "start_price_usd", "end_price_usd", "price_multiple", "log_move",
+        "drawdown_pct", "source",
+    ]
+    schedule = sorted(historical_cycle_anchors(data), key=lambda item: item[0])
+    rows = []
+    for (start_date, start_type, start_cycle), (end_date, end_type, _) in zip(
+        schedule[:-1], schedule[1:]
+    ):
+        if (start_type, end_type) not in [("trough", "peak"), ("peak", "trough")]:
+            continue
+        if start_date < training_start or end_date > training_end:
+            continue
+        start_lookup = _lookup_price_near(data, start_date)
+        end_lookup = _lookup_price_near(data, end_date)
+        if start_lookup is None or end_lookup is None:
+            continue
+        actual_start, start_price = start_lookup
+        actual_end, end_price = end_lookup
+        if min(start_price, end_price) <= 0:
+            continue
+
+        phase = "bull" if start_type == "trough" else "bear"
+        if phase == "bull":
+            if end_price <= start_price:
+                continue
+            log_move = float(np.log(end_price / start_price))
+            drawdown = np.nan
+        else:
+            if end_price >= start_price:
+                continue
+            log_move = float(np.log(start_price / end_price))
+            drawdown = float(end_price / start_price - 1.0)
+
+        rows.append({
+            "phase": phase,
+            # A Bitcoin cycle is identified by its starting trough / following
+            # peak.  The bear that follows that peak therefore shares the same
+            # cycle id. This makes 2025 peak -> 2026 trough cycle 0, followed by
+            # 2026 trough -> 2029 peak cycle 1.
+            "cycle": int(start_cycle),
+            "start_date": actual_start,
+            "end_date": actual_end,
+            "start_type": start_type,
+            "end_type": end_type,
+            "start_price_usd": float(start_price),
+            "end_price_usd": float(end_price),
+            "price_multiple": float(end_price / start_price),
+            "log_move": log_move,
+            "drawdown_pct": drawdown,
+            "source": "observed anchor-to-anchor transition inside selected training window",
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
+def _build_transition_prior_history(
+    data: pd.DataFrame,
+    training_end: pd.Timestamp,
+) -> pd.DataFrame:
+    """Historical phase prior used only if a selected window has no same-phase sample.
+
+    This fallback never uses prices after ``training_end``.  It keeps short but
+    otherwise valid training windows operational without letting the structural
+    centerline resume control of turning-point prices.
+    """
+    data_start = pd.Timestamp(data["date"].min())
+    return _build_cycle_transition_history(data, data_start, training_end)
+
+
+def _fit_transition_maturity(
+    history: pd.DataFrame,
+    phase: str,
+    prior_history: pd.DataFrame | None = None,
+) -> dict:
+    """Fit an OOS-gated maturity trend in total phase log moves.
+
+    ``log_move`` is positive for both phases: log(peak/trough) for bulls and
+    log(peak/trough) for bears. A robust pairwise slope is fit to
+    log(log_move) across independent cycle ids. How much of that trend is
+    allowed into the production forecast is then learned by walk-forward
+    validation on earlier independent transitions.
+
+    With fewer than three observed same-phase cycles there is no held-out
+    transition capable of validating a trend, so the production forecast uses
+    the latest observed phase magnitude with no extrapolated maturity slope.
+    As soon as a third observation exists, candidate trend weights from 0..1
+    compete on true next-cycle prediction error.
+    """
+    if phase not in {"bull", "bear"}:
+        raise ValueError("phase must be 'bull' or 'bear'")
+
+    subset = history[history["phase"] == phase].copy() if history is not None else pd.DataFrame()
+    source_mode = "selected training window"
+    if subset.empty and prior_history is not None and not prior_history.empty:
+        subset = prior_history[prior_history["phase"] == phase].copy()
+        source_mode = "pre-window historical prior (no same-phase transition in selected window)"
+
+    if subset.empty:
+        fallback_move = float(np.log(4.0)) if phase == "bull" else float(np.log(3.0))
+        return {
+            "phase": phase,
+            "observations": 0,
+            "transitions": 0,
+            "oos_validations": 0,
+            "sample_confidence": 0.0,
+            "trend_weight": 0.0,
+            "latest_cycle": 0.0,
+            "latest_log_move": fallback_move,
+            "raw_log_slope_per_cycle": 0.0,
+            "effective_log_slope_per_cycle": 0.0,
+            "raw_retention_per_cycle": 1.0,
+            "retention_per_cycle": 1.0,
+            "oos_error_no_trend": np.nan,
+            "oos_error_selected": np.nan,
+            "source_mode": "neutral transition fallback",
+            "history": pd.DataFrame(),
+        }
+
+    subset = (
+        subset.sort_values(["cycle", "end_date"])
+        .drop_duplicates("cycle", keep="last")
+        .reset_index(drop=True)
+    )
+    cycles = subset["cycle"].to_numpy(dtype=float)
+    moves = np.maximum(subset["log_move"].to_numpy(dtype=float), 1e-9)
+
+    def robust_slope(c, m):
+        slopes = []
+        log_m = np.log(np.maximum(np.asarray(m, dtype=float), 1e-12))
+        c = np.asarray(c, dtype=float)
+        for i in range(len(log_m) - 1):
+            for j in range(i + 1, len(log_m)):
+                dc = c[j] - c[i]
+                if dc > 1e-12:
+                    slopes.append((log_m[j] - log_m[i]) / dc)
+        return float(np.median(slopes)) if slopes else 0.0
+
+    raw_slope = robust_slope(cycles, moves)
+
+    # Learn trend strength from genuine next-cycle forecasts. Each validation
+    # only sees phase transitions that had completed before the held-out cycle.
+    candidate_weights = np.linspace(0.0, 1.0, 21)
+    candidate_errors = {float(a): [] for a in candidate_weights}
+    for holdout_idx in range(2, len(moves)):
+        c_hist = cycles[:holdout_idx]
+        m_hist = moves[:holdout_idx]
+        slope_hist = robust_slope(c_hist, m_hist)
+        steps = max(float(cycles[holdout_idx] - c_hist[-1]), 0.0)
+        actual_move = float(moves[holdout_idx])
+        for alpha in candidate_weights:
+            predicted_move = float(m_hist[-1]) * np.exp(float(alpha) * slope_hist * steps)
+            err = float(np.log(max(predicted_move, 1e-12) / actual_move))
+            candidate_errors[float(alpha)].append(err)
+
+    oos_validations = max(len(moves) - 2, 0)
+    if oos_validations > 0:
+        mse_by_alpha = {
+            alpha: float(np.mean(np.square(errors)))
+            for alpha, errors in candidate_errors.items() if errors
+        }
+        best_mse = min(mse_by_alpha.values())
+        # If two weights are numerically tied, prefer the smaller trend weight.
+        trend_weight = min(
+            alpha for alpha, mse in mse_by_alpha.items()
+            if abs(mse - best_mse) <= 1e-12
+        )
+        no_trend_error = float(np.sqrt(mse_by_alpha.get(0.0, np.nan)))
+        selected_error = float(np.sqrt(mse_by_alpha[trend_weight]))
+    else:
+        trend_weight = 0.0
+        no_trend_error = np.nan
+        selected_error = np.nan
+
+    effective_slope = float(trend_weight * raw_slope)
+    transition_count = max(len(moves) - 1, 0)
+    # Kept as a descriptive metric for older UI consumers; production trend
+    # strength is ``trend_weight`` learned above, not this sample-size ratio.
+    sample_confidence = float(oos_validations / (oos_validations + 1.0)) if oos_validations else 0.0
+
+    recent_retention = np.nan
+    if len(moves) >= 2:
+        dc = cycles[-1] - cycles[-2]
+        if dc > 1e-12:
+            recent_retention = float((moves[-1] / moves[-2]) ** (1.0 / dc))
+
+    return {
+        "phase": phase,
+        "observations": int(len(moves)),
+        "transitions": int(transition_count),
+        "oos_validations": int(oos_validations),
+        "sample_confidence": sample_confidence,
+        "trend_weight": float(trend_weight),
+        "latest_cycle": float(cycles[-1]),
+        "latest_log_move": float(moves[-1]),
+        "raw_log_slope_per_cycle": raw_slope,
+        "effective_log_slope_per_cycle": effective_slope,
+        "raw_retention_per_cycle": float(np.exp(raw_slope)),
+        "retention_per_cycle": float(np.exp(effective_slope)),
+        "recent_retention_per_cycle": recent_retention,
+        "oos_error_no_trend": no_trend_error,
+        "oos_error_selected": selected_error,
+        "source_mode": source_mode,
+        "history": subset.copy(),
+    }
+
+
+def _project_transition_log_move(model: dict, phase_cycle: int) -> float:
+    """Project a positive total log move for one future bull or bear phase."""
+    steps = max(float(phase_cycle) - float(model["latest_cycle"]), 0.0)
+    projected = float(model["latest_log_move"]) * float(model["retention_per_cycle"]) ** steps
+    return float(max(projected, 1e-6))
+
+
+def _phase_cycle_for_target(target_type: str, target_cycle: int) -> int:
+    """Return the cycle id of the transition that ends at a target turning point."""
+    if target_type == "peak":
+        return int(target_cycle)
+    if target_type == "trough":
+        return int(target_cycle) - 1
+    raise ValueError(f"Unsupported target turning-point type: {target_type}")
+
+
+def _observed_phase_extreme(
+    data: pd.DataFrame,
+    phase_start: pd.Timestamp,
+    training_end: pd.Timestamp,
+    target_type: str,
+) -> float | None:
+    """Logical no-reversal guard: future extrema cannot undo an observed extreme."""
+    seg = data[(data["date"] >= phase_start) & (data["date"] <= training_end)]["price_usd"].dropna()
+    if seg.empty:
+        return None
+    if target_type == "peak":
+        return float(seg.max())
+    if target_type == "trough":
+        return float(seg.min())
+    return None
+
+
+def _build_turning_point_backtest_table(
+    data: pd.DataFrame,
+    training_end: pd.Timestamp,
+    future_rows: list[dict],
+) -> pd.DataFrame:
+    """Compare projected future anchors with actual prices when history now knows them.
+
+    These outcomes are diagnostics only; they are never fed back into the fit for
+    the selected fake-today cutoff.
+    """
+    columns = [
+        "date", "type", "cycle", "projected_price_usd", "actual_price_usd",
+        "error_pct", "projected_change_from_prior_pct", "actual_change_from_prior_pct",
+    ]
+    historical_dates = {
+        (pd.Timestamp(d), t) for d, t, _ in historical_cycle_anchors(data)
+    }
+    rows = []
+    for row in future_rows:
+        date = pd.Timestamp(row["date"])
+        if date <= training_end or (date, row["type"]) not in historical_dates:
+            continue
+        lookup = _lookup_price_near(data, date)
+        if lookup is None:
+            continue
+        actual_date, actual_price = lookup
+        if actual_date > pd.Timestamp(data["date"].max()):
+            continue
+        projected = float(row["knot_price_usd"])
+        prior_price = float(row.get("phase_start_price_usd", np.nan))
+        rows.append({
+            "date": actual_date,
+            "type": row["type"],
+            "cycle": int(row["cycle"]),
+            "projected_price_usd": projected,
+            "actual_price_usd": float(actual_price),
+            "error_pct": float(projected / actual_price - 1.0),
+            "projected_change_from_prior_pct": (
+                float(projected / prior_price - 1.0) if np.isfinite(prior_price) and prior_price > 0 else np.nan
+            ),
+            "actual_change_from_prior_pct": (
+                float(actual_price / prior_price - 1.0) if np.isfinite(prior_price) and prior_price > 0 else np.nan
+            ),
+        })
+    return pd.DataFrame(rows, columns=columns)
+
+
 def _bull_gain_decay(history: pd.DataFrame) -> dict:
     """Fit monotone decay in completed bull-run *log gains*.
 
@@ -1374,30 +1673,67 @@ def _build_cycle_fit(
     )
     history_for_forecast = amplitude_history.copy()
 
-    # Complete future cycles use ONE symmetric log-amplitude around the locked
-    # structural centerline. This restores the geometric meaning of "centerline":
-    # for a complete projected cycle, peak and trough are equal log distances
-    # above and below it. The live Oct-2026 trough is the only exception because
-    # it is conditioned from the already-partially-observed current bear market.
+    # ---------------------------------------------------------------------
+    # Sequential turning-point engine
+    # ---------------------------------------------------------------------
+    # Future endpoint PRICES are chained from the previous turning point using
+    # observed trough->peak bull log gains and peak->trough bear log losses.
+    # The structural centerline remains a locked long-term reference, but it no
+    # longer manufactures future peaks/troughs via +/- residual amplitude.
+    transition_history = _build_cycle_transition_history(
+        data=data,
+        training_start=training_start,
+        training_end=training_end,
+    )
+    transition_prior_history = _build_transition_prior_history(
+        data=data,
+        training_end=training_end,
+    )
+    bull_transition_model = _fit_transition_maturity(
+        transition_history, "bull", prior_history=transition_prior_history
+    )
+    bear_transition_model = _fit_transition_maturity(
+        transition_history, "bear", prior_history=transition_prior_history
+    )
+
     future_schedule = schedule[schedule["date"] > training_end].copy()
     future_rows = []
     amplitude_by_cycle = {}
-    symmetric_decay = _symmetric_cycle_amplitude_decay(history_for_forecast)
+    projected_turn_prices = {}
 
-    conditioned_cycle1_trough_amp = None
-    if current_partial_phase is not None and NEXT_TROUGH in center_series.index:
-        trough_center = float(center_series.loc[NEXT_TROUGH])
-        trough_price = float(current_partial_phase["projected_trough_price_usd"])
-        conditioned_cycle1_trough_amp = max(
-            abs(float(np.log(trough_price / trough_center))), 0.03
-        )
+    # Legacy centerline-envelope diagnostics are retained for compatibility and
+    # comparison only. They are no longer used to generate future endpoints.
+    symmetric_decay = _symmetric_cycle_amplitude_decay(history_for_forecast)
 
     for row in future_schedule.itertuples(index=False):
         if row.date > all_dates.max():
             continue
         cycle_id = int(row.cycle)
+        phase_cycle = _phase_cycle_for_target(row.type, cycle_id)
+        phase = "bull" if row.type == "peak" else "bear"
+        transition_model = bull_transition_model if phase == "bull" else bear_transition_model
+        transition_log_move = _project_transition_log_move(transition_model, phase_cycle)
         center = float(center_series.loc[row.date]) if row.date in center_series.index else np.nan
         raw_center = center
+
+        prior_candidates = schedule[schedule["date"] < row.date].sort_values("date")
+        prior_turn = prior_candidates.iloc[-1] if not prior_candidates.empty else None
+        phase_start_date = pd.Timestamp(prior_turn["date"]) if prior_turn is not None else None
+        phase_start_price = np.nan
+        projection_base_price = np.nan
+        base_source = ""
+
+        if phase_start_date is not None:
+            if phase_start_date in projected_turn_prices:
+                phase_start_price = float(projected_turn_prices[phase_start_date])
+                projection_base_price = phase_start_price
+                base_source = "previous projected turning point"
+            elif training_start <= phase_start_date <= training_end:
+                prior_lookup = _lookup_price_near(data, phase_start_date)
+                if prior_lookup is not None and prior_lookup[0] <= training_end:
+                    phase_start_price = float(prior_lookup[1])
+                    projection_base_price = phase_start_price
+                    base_source = "previous observed turning point"
 
         if (
             current_partial_phase is not None
@@ -1405,14 +1741,60 @@ def _build_cycle_fit(
             and row.type == "trough"
         ):
             knot_price = float(current_partial_phase["projected_trough_price_usd"])
-            dev = float(np.log(knot_price / center))
-            amp = abs(dev)
-            source = "current bear-conditioned projected trough (live-cycle exception)"
+            transition_log_move = float(current_partial_phase["fitted_total_log_decline"])
+            if not np.isfinite(phase_start_price):
+                phase_start_price = float(current_partial_phase["peak_price_usd"])
+            projection_base_price = phase_start_price
+            base_source = "observed current-cycle peak"
+            source = "current bear-conditioned sequential trough (live-cycle evidence)"
         else:
-            amp = _project_symmetric_cycle_amplitude(symmetric_decay, cycle_id)
-            dev = amp if row.type == "peak" else -amp
-            knot_price = float(center * np.exp(dev))
-            source = "projected symmetric cycle envelope around locked structural centerline"
+            if np.isfinite(projection_base_price) and projection_base_price > 0:
+                if phase == "bull":
+                    knot_price = float(projection_base_price * np.exp(transition_log_move))
+                else:
+                    knot_price = float(projection_base_price * np.exp(-transition_log_move))
+            else:
+                # If the selected structural start begins after the current
+                # phase started, do not reach backward outside the chosen window
+                # for a hidden price anchor. Continue from the latest actual
+                # price using only the learned *remaining* fraction of the phase.
+                projection_base_price = float(train["price_usd"].iloc[-1])
+                duration = FIXED_BULL_DAYS if phase == "bull" else FIXED_BEAR_DAYS
+                implied_phase_start = row.date - pd.Timedelta(days=duration)
+                progress = float(np.clip(
+                    (training_end - implied_phase_start).days / duration, 0.0, 1.0
+                ))
+                template_values = bull_template if phase == "bull" else bear_template
+                template_slopes = _pchip_slopes(phase_grid, template_values)
+                completion = _template_value(
+                    phase_grid, template_values, progress, slopes=template_slopes
+                )
+                remaining_fraction = float(np.clip(1.0 - completion, 0.0, 1.0))
+                signed_remaining = transition_log_move * remaining_fraction
+                knot_price = float(
+                    projection_base_price
+                    * np.exp(signed_remaining if phase == "bull" else -signed_remaining)
+                )
+                base_source = "latest actual boundary + remaining empirical phase fraction"
+
+            # A future peak cannot be below a price already observed during the
+            # same bull phase, and a future trough cannot be above a low already
+            # observed during the same bear phase. This is a logical extrema
+            # condition, not a manually selected drawdown/gain target.
+            if phase_start_date is not None and phase_start_date <= training_end:
+                observed_extreme = _observed_phase_extreme(
+                    data, phase_start_date, training_end, row.type
+                )
+                if observed_extreme is not None:
+                    if row.type == "peak":
+                        knot_price = max(knot_price, observed_extreme)
+                    else:
+                        knot_price = min(knot_price, observed_extreme)
+
+            source = f"projected sequential {phase} transition from prior turning point"
+
+        dev = float(np.log(knot_price / center))
+        projected_turn_prices[pd.Timestamp(row.date)] = float(knot_price)
 
         amplitude_by_cycle.setdefault(cycle_id, {})[row.type] = float(abs(dev))
         future_rows.append({
@@ -1426,8 +1808,23 @@ def _build_cycle_fit(
             "centerline_scale": 1.0,
             "log_deviation": dev,
             "knot_price_usd": knot_price,
+            "phase": phase,
+            "phase_cycle": phase_cycle,
+            "phase_start_date": phase_start_date,
+            "phase_start_price_usd": phase_start_price,
+            "projection_base_price_usd": projection_base_price,
+            "transition_log_move": float(transition_log_move),
+            "transition_multiple": float(np.exp(transition_log_move)),
+            "transition_model_source": transition_model.get("source_mode"),
+            "projection_base_source": base_source,
             "source": source,
         })
+
+    turning_point_backtest = _build_turning_point_backtest_table(
+        data=data,
+        training_end=training_end,
+        future_rows=future_rows,
+    )
 
     # Legacy diagnostics retained for UI/backward compatibility, but they are
     # no longer used to forecast future peak/trough geometry.
@@ -1593,14 +1990,21 @@ def _build_cycle_fit(
         "bull_gain_decay": bull_gain_decay,
         "bull_gain_table": bull_gain_table,
         "bull_gain_monotone_guardrail": False,
-        "bull_gain_guardrail_mode": "diagnostic only; symmetric cycle envelope is the forecast",
+        "bull_gain_guardrail_mode": "legacy diagnostic only; sequential transition engine is the forecast",
         "bull_gain_ceiling_basis_multiple": float(bull_gain_decay.get("latest_multiple", np.nan)),
         "bull_gain_centerline_conflicts": pd.DataFrame(centerline_conflicts),
+        "cycle_transition_history": transition_history,
+        "cycle_transition_prior_history": transition_prior_history,
+        "bull_transition_model": bull_transition_model,
+        "bear_transition_model": bear_transition_model,
+        "turning_point_backtest": turning_point_backtest,
+        "future_endpoint_method": "sequential anchor-to-anchor bull gains and bear losses",
+        "future_endpoints_centerline_generated": False,
         "phase_shape_training_start": MATURE_PHASE_START.date().isoformat(),
         "phase_shape_training_independent_of_structural_start": True,
-        "future_peak_amplitude_monotone": True,
-        "future_trough_amplitude_monotone": True,
-        "future_cycle_centered": True,
+        "future_peak_amplitude_monotone": False,
+        "future_trough_amplitude_monotone": False,
+        "future_cycle_centered": False,
         "future_centerline_reconciled": False,
         "future_centerline_reconciliation_applied": False,
         "future_centerline_min_scale": 1.0,
