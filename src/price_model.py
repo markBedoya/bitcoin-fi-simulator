@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-PRICE_MODEL_ENGINE_VERSION = "price-model-v3.2.0-symmetric-cycle-envelope"
+PRICE_MODEL_ENGINE_VERSION = "price-model-v3.3.2-cycle-derived-observed-start"
 
 GENESIS = pd.Timestamp("2009-01-03")
 FIXED_CYCLE_DAYS = 1428
@@ -24,6 +24,120 @@ HISTORICAL_CYCLE_ANCHORS = [
     (pd.Timestamp("2022-11-07"), "trough", 0),
     (pd.Timestamp("2025-10-06"), "peak", 0),
 ]
+
+FIRST_FIXED_TROUGH = pd.Timestamp("2015-01-14")
+
+# The two early exploration anchors are derived by running the SAME fixed
+# 1428-day cycle clock backward from the current schedule.  They are therefore
+# not hand-picked historical dates.  Three full cycles before NEXT_TROUGH lands
+# on the schedule-implied trough immediately before the current Jan-2015 market
+# trough.  From there, 364 bear days gives the preceding peak and 1064 bull days
+# gives the preceding cycle start.
+SCHEDULED_PRE_2015_TROUGH = NEXT_TROUGH - pd.Timedelta(days=3 * FIXED_CYCLE_DAYS)
+SCHEDULED_PRE_2015_PEAK = SCHEDULED_PRE_2015_TROUGH - pd.Timedelta(days=FIXED_BEAR_DAYS)
+SCHEDULED_CYCLE_START = SCHEDULED_PRE_2015_PEAK - pd.Timedelta(days=FIXED_BULL_DAYS)
+# Backward-compatible alias for the v3.18.1 internal name. The anchor is no longer a $0 reference.
+SCHEDULED_ZERO_START = SCHEDULED_CYCLE_START
+
+
+def _cycle_derived_pre_2015_peak_anchor(data: pd.DataFrame):
+    """Return the schedule-derived pre-2015 peak with its observed BTC price.
+
+    The DATE comes only from the fixed cycle clock.  The PRICE is the nearest
+    actual Coin Metrics observation on that date (within 3 days), so no price
+    level is invented or hard-coded.
+    """
+    if data is None or data.empty:
+        return None
+    clean = data[["date", "price_usd"]].dropna().copy()
+    clean = clean[clean["price_usd"] > 0]
+    if clean.empty:
+        return None
+    nearest = clean.iloc[(clean["date"] - SCHEDULED_PRE_2015_PEAK).abs().argsort()[:1]].iloc[0]
+    actual_date = pd.Timestamp(nearest["date"])
+    if abs((actual_date - SCHEDULED_PRE_2015_PEAK).days) > 3:
+        return None
+    return SCHEDULED_PRE_2015_PEAK, "peak", -3, float(nearest["price_usd"]), actual_date
+
+
+def historical_cycle_anchors(data: pd.DataFrame | None = None):
+    """Historical anchors extended by the cycle-clock-derived early peak date."""
+    anchors = list(HISTORICAL_CYCLE_ANCHORS)
+    early = _cycle_derived_pre_2015_peak_anchor(data) if data is not None else None
+    if early is not None:
+        early_date, early_type, early_cycle, _, _ = early
+        anchors.insert(0, (early_date, early_type, early_cycle))
+    return anchors
+
+
+def get_price_model_anchor_catalog(data: pd.DataFrame) -> pd.DataFrame:
+    """Return user-facing shortcuts for the cycle-derived and observed anchors.
+
+    The early cycle-start and pre-2015 peak DATES are derived from the fixed
+    cycle clock. Their displayed prices come from the imported Coin Metrics data
+    at those derived dates (nearest observation within 3 days).
+    """
+    columns = ["label", "date", "type", "cycle", "price_usd", "source"]
+    if data is None or data.empty:
+        return pd.DataFrame(columns=columns)
+
+    clean = data[["date", "price_usd"]].dropna().copy()
+    clean = clean[clean["price_usd"] > 0].sort_values("date").reset_index(drop=True)
+    if clean.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+
+    nearest_start = clean.iloc[(clean["date"] - SCHEDULED_CYCLE_START).abs().argsort()[:1]].iloc[0]
+    actual_start_price_date = pd.Timestamp(nearest_start["date"])
+    if abs((actual_start_price_date - SCHEDULED_CYCLE_START).days) <= 3:
+        start_source = "cycle-derived date; Coin Metrics price on derived date"
+        if actual_start_price_date != SCHEDULED_CYCLE_START:
+            start_source += f" (nearest observation {actual_start_price_date.date().isoformat()})"
+        rows.append({
+            "label": "Cycle-derived start",
+            "date": SCHEDULED_CYCLE_START,
+            "type": "cycle_start",
+            "cycle": -3,
+            "price_usd": float(nearest_start["price_usd"]),
+            "source": start_source,
+        })
+
+    early = _cycle_derived_pre_2015_peak_anchor(clean)
+    if early is not None:
+        early_date, _, early_cycle, early_price, actual_price_date = early
+        source = "cycle-derived date; Coin Metrics price on derived date"
+        if actual_price_date != early_date:
+            source += f" (nearest observation {actual_price_date.date().isoformat()})"
+        rows.append({
+            "label": "Cycle-derived pre-2015 peak",
+            "date": early_date,
+            "type": "peak",
+            "cycle": early_cycle,
+            "price_usd": early_price,
+            "source": source,
+        })
+
+    for date, anchor_type, cycle in HISTORICAL_CYCLE_ANCHORS:
+        nearest = clean.iloc[(clean["date"] - date).abs().argsort()[:1]].iloc[0]
+        actual_date = pd.Timestamp(nearest["date"])
+        if abs((actual_date - date).days) > 3:
+            continue
+        rows.append({
+            "label": f"{date.year} {anchor_type}",
+            "date": actual_date,
+            "type": anchor_type,
+            "cycle": cycle,
+            "price_usd": float(nearest["price_usd"]),
+            "source": "historical market anchor",
+        })
+
+    return (
+        pd.DataFrame(rows)
+        .drop_duplicates(subset=["date", "type"], keep="first")
+        .sort_values("date")
+        .reset_index(drop=True)
+    )
 
 # Mature amplitude anchors provide candidate turning points, but amplitude
 # decay is evaluated only where the selected structural centerline is actually
@@ -95,7 +209,7 @@ def _fit_centerline(train: pd.DataFrame, future_dates: pd.DatetimeIndex):
     }
 
 
-def _fixed_cycle_anchors(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+def _fixed_cycle_anchors(start: pd.Timestamp, end: pd.Timestamp, data: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Return historical actual turning-point dates plus the deterministic future
     1428-day schedule.
@@ -106,7 +220,7 @@ def _fixed_cycle_anchors(start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame
     """
     rows = [
         {"date": date, "type": anchor_type, "cycle": cycle}
-        for date, anchor_type, cycle in HISTORICAL_CYCLE_ANCHORS
+        for date, anchor_type, cycle in historical_cycle_anchors(data)
     ]
 
     cycle = 1
@@ -320,7 +434,7 @@ def _learn_empirical_phase_templates(
     is used when projecting future paths.
     """
     grid = np.linspace(0.0, 1.0, 401)
-    schedule = sorted(HISTORICAL_CYCLE_ANCHORS, key=lambda item: item[0])
+    schedule = sorted(historical_cycle_anchors(data), key=lambda item: item[0])
     bull_curves = []
     bear_curves = []
     overlay_rows = []
@@ -1132,7 +1246,7 @@ def _build_cycle_fit(
 ):
     raw_structural_centerline = np.asarray(structural_centerline, dtype=float).copy()
     center_series = pd.Series(raw_structural_centerline, index=all_dates)
-    schedule = _fixed_cycle_anchors(training_start, all_dates.max())
+    schedule = _fixed_cycle_anchors(training_start, all_dates.max(), data=data)
     (
         phase_grid,
         bull_template,
@@ -1502,7 +1616,7 @@ def fit_price_model(prices, training_start, training_end, projection_years):
     # unfinished segment is heading.  Model through one look-ahead anchor, then
     # trim the public daily output back to the requested horizon.  Without this,
     # the projection became flat after the last in-horizon turning point.
-    lookahead_schedule = _fixed_cycle_anchors(training_start, projection_end)
+    lookahead_schedule = _fixed_cycle_anchors(training_start, projection_end, data=data)
     later_anchors = lookahead_schedule.loc[
         lookahead_schedule["date"] > projection_end, "date"
     ]
@@ -1607,7 +1721,7 @@ def _score_projection_endpoint_exact(
         raise ValueError("Select at least 1,000 daily training observations.")
 
     target_date = training_end + pd.DateOffset(years=projection_years)
-    schedule = _fixed_cycle_anchors(training_start, target_date)
+    schedule = _fixed_cycle_anchors(training_start, target_date, data=data)
     future_anchor_dates = schedule.loc[
         (schedule["date"] > training_end) & (schedule["date"] <= target_date),
         "date",

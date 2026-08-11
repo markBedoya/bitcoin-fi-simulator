@@ -1,3 +1,28 @@
+## v3.18.2 — observed price at cycle-derived start
+
+- Keeps the early cycle-start date derived from the fixed 1428-day schedule (2011-02-14).
+- Replaces the temporary theoretical $0 display with the actual imported Coin Metrics price on that derived date (nearest observation within 3 days).
+- The pre-2015 peak remains cycle-date-derived with its price sourced from Coin Metrics.
+
+## v3.18.1 — cycle-derived early anchors
+
+- Replaces the data-discovered early peak and dataset-start shortcut with two dates derived by running the same fixed 1428-day cycle clock backward from the current schedule.
+- Adds a cycle-derived pre-2015 peak date of 2014-01-13; its price is still the observed Coin Metrics price on that derived date.
+- Adds a cycle-start $0 reference date of 2011-02-14. The $0 value is explicitly theoretical and is never inserted into log-price fitting; selecting it as a training start fits the real Bitcoin observations from that date forward.
+- Keeps the existing observed 2015/2017/2018/2021/2022/2025 historical anchors unchanged.
+- Updates anchor shortcut diagnostics and regression tests to verify both early dates are consequences of the fixed 1064-day bull / 364-day bear schedule rather than data-picked dates.
+
+## v3.18.0 — Price Model anchor exploration
+
+- Pauses calibrated-model development and resumes targeted Price Model research changes.
+- Extends the historical fitted-path anchor sequence by one data-derived peak before the Jan-14-2015 trough.
+- Derives that early peak from the active Coin Metrics dataset as the highest observed pre-2015-trough price; no early peak price is hard-coded.
+- Adds the first usable Coin Metrics observation as a user-facing dataset-start anchor shortcut.
+- Adds Start, End, and Apply Range anchor controls so either training boundary can snap to any anchor without dragging the date slider.
+- Adds a Historical Anchor Catalog with exact active-dataset dates/prices and source descriptions.
+- Keeps mature phase-shape, mature amplitude, future 1428-day timing, centerline, and symmetric future-envelope logic unchanged.
+- Adds regression coverage for the data-derived dataset-start and pre-2015 peak anchors.
+
 ## v3.17.2 — reserved `pages/` routing migration
 
 - Moves all Streamlit page scripts from the reserved `pages/` directory to `app_pages/`.

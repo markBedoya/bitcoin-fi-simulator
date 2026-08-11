@@ -9,14 +9,17 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v3.2.0 — Locked Centerline + Symmetric Cycle Envelope")
+st.title("Price Model v3.3.2 — Cycle-Derived Anchor Exploration")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
     "(1064 bull + 364 bear). The phase shape is learned from completed historical total-price "
     "moves. When the latest date is inside an unfinished cycle phase, the projection continues "
     "from that exact phase progress instead of restarting the phase. The structural centerline is "
-    "the fixed backbone; completed future cycles use one symmetric, gradually decaying envelope around it."
+    "the fixed backbone; completed future cycles use one symmetric, gradually decaying envelope around it. "
+    "The two early exploration anchor dates are derived by running the same fixed cycle clock backward: "
+    "the earlier cycle start and the prior cycle peak. Both displayed prices come from Coin Metrics. Anchor shortcuts let you snap "
+    "either training boundary to any anchor."
 )
 
 try:
@@ -27,6 +30,44 @@ except Exception as exc:
 
 min_date = prices["date"].min().date()
 max_date = prices["date"].max().date()
+
+# Streamlit Cloud can retain an older imported local module across a hot deploy.
+# Reload once before using the cycle-derived anchor-catalog capability so the page cannot
+# fail merely because the process still has v3.2 resident in memory.
+if not hasattr(price_model_engine, "get_price_model_anchor_catalog"):
+    importlib.invalidate_caches()
+    price_model_engine = importlib.reload(price_model_engine)
+
+anchor_catalog = price_model_engine.get_price_model_anchor_catalog(prices)
+anchor_options = []
+anchor_lookup = {}
+for row in anchor_catalog.itertuples(index=False):
+    label = f"{row.label} — {pd.Timestamp(row.date).date().isoformat()} — ${float(row.price_usd):,.2f}"
+    anchor_options.append(label)
+    anchor_lookup[label] = pd.Timestamp(row.date).date()
+
+
+def _clear_range_search_state():
+    st.session_state.pop("conservative_search_summary", None)
+    st.session_state.pop("conservative_search_leaderboard", None)
+    st.session_state.pop("leaderboard_selected_row", None)
+
+
+def _apply_anchor_boundary(which: str, anchor_date):
+    current_start, current_end = st.session_state.price_model_training_range
+    anchor_date = pd.Timestamp(anchor_date).date()
+    if which == "start":
+        if anchor_date >= current_end:
+            st.warning("Start anchor must be earlier than the current training end.")
+            return
+        st.session_state.price_model_training_range = (anchor_date, current_end)
+    else:
+        if anchor_date <= current_start:
+            st.warning("End anchor must be later than the current training start.")
+            return
+        st.session_state.price_model_training_range = (current_start, anchor_date)
+    _clear_range_search_state()
+    st.rerun()
 
 # Exact endpoint scores are reusable across the 4/5/6/7/8-year minimum searches.
 # The cache key includes the data endpoint, horizon, model version, and candidate
@@ -116,10 +157,51 @@ with st.sidebar:
 
     if st.button("Reset training range to all data", use_container_width=True):
         st.session_state.price_model_training_range = (min_date, max_date)
-        st.session_state.pop("conservative_search_summary", None)
-        st.session_state.pop("conservative_search_leaderboard", None)
-        st.session_state.pop("leaderboard_selected_row", None)
+        _clear_range_search_state()
         st.rerun()
+
+    st.subheader("Anchor shortcuts")
+    st.caption(
+        "Snap either training boundary to an anchor. The early cycle-start and pre-2015 peak DATES "
+        "are derived from the same 1428-day cycle clock used by the projection. Their PRICES come "
+        "from the imported Coin Metrics observations on those derived dates."
+    )
+    if anchor_options:
+        start_anchor_choice = st.selectbox(
+            "Start anchor",
+            anchor_options,
+            index=0,
+            key="price_model_start_anchor_choice",
+        )
+        if st.button("Set training start to selected anchor", use_container_width=True):
+            _apply_anchor_boundary("start", anchor_lookup[start_anchor_choice])
+
+        end_anchor_choice = st.selectbox(
+            "End anchor",
+            anchor_options,
+            index=len(anchor_options) - 1,
+            key="price_model_end_anchor_choice",
+        )
+        if st.button("Set training end to selected anchor", use_container_width=True):
+            _apply_anchor_boundary("end", anchor_lookup[end_anchor_choice])
+
+        if st.button("Apply selected anchor-to-anchor range", type="primary", use_container_width=True):
+            selected_start = anchor_lookup[start_anchor_choice]
+            selected_end = anchor_lookup[end_anchor_choice]
+            if selected_start >= selected_end:
+                st.warning("Selected start anchor must be earlier than the selected end anchor.")
+            else:
+                st.session_state.price_model_training_range = (selected_start, selected_end)
+                _clear_range_search_state()
+                st.rerun()
+
+        if st.button("Set training end to latest data", use_container_width=True):
+            current_start, _ = st.session_state.price_model_training_range
+            st.session_state.price_model_training_range = (current_start, max_date)
+            _clear_range_search_state()
+            st.rerun()
+
+    st.divider()
 
     if st.button(
         "Find most conservative start month (8 yr min)",
@@ -195,6 +277,25 @@ with st.sidebar:
         )
 
     log_scale = st.toggle("Logarithmic price scale", value=True)
+
+
+with st.expander("Historical anchor catalog", expanded=False):
+    st.caption(
+        "These are the shortcut dates and prices currently available to the Price Model. The early "
+        "The early cycle-start and pre-2015 peak dates are derived by running the fixed cycle schedule backward. "
+        "Both anchor prices are observed Coin Metrics data on those derived dates. "
+        "The remaining turning points are the model's existing historical market anchors."
+    )
+    anchor_display = anchor_catalog.copy()
+    if not anchor_display.empty:
+        anchor_display["date"] = pd.to_datetime(anchor_display["date"]).dt.date
+        st.dataframe(
+            anchor_display[["label", "date", "type", "price_usd", "source"]].style.format(
+                {"price_usd": "${:,.2f}"}
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
 
 leaderboard = st.session_state.get("conservative_search_leaderboard")
