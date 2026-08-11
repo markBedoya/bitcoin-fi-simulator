@@ -1,3 +1,11 @@
+## v3.18.3 — plot the cycle-derived 2011 trough anchor
+
+- Promotes the cycle-derived 2011-02-14 point from a shortcut/catalog boundary to a true historical trough/intersection anchor.
+- Uses the actual imported Coin Metrics price on the derived date (nearest positive observation within 3 days).
+- The Price Model chart now shows the 2011 trough with the same historical-anchor marker whenever the selected training range includes it.
+- The historical fitted path is constrained to intersect the observed 2011 anchor price exactly.
+- Mature phase-shape and amplitude-learning windows remain unchanged, so the early anchor does not alter mature-cycle template learning.
+
 ## v3.18.2 — observed price at cycle-derived start
 
 - Keeps the early cycle-start date derived from the fixed 1428-day schedule (2011-02-14).

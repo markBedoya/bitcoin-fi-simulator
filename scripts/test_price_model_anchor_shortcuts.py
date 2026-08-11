@@ -11,6 +11,7 @@ from src.price_model import (
     SCHEDULED_CYCLE_START,
     SCHEDULED_ZERO_START,
     _fixed_cycle_anchors,
+    historical_cycle_anchors,
     fit_price_model,
     get_price_model_anchor_catalog,
 )
@@ -45,10 +46,11 @@ for d, value in {
     data.loc[data["date"] == pd.Timestamp(d), "price_usd"] = value
 
 catalog = get_price_model_anchor_catalog(data)
-start = catalog[catalog["label"] == "Cycle-derived start"]
+start = catalog[catalog["label"] == "Cycle-derived 2011 trough"]
 assert len(start) == 1
 assert pd.Timestamp(start.iloc[0]["date"]) == SCHEDULED_CYCLE_START
 assert abs(float(start.iloc[0]["price_usd"]) - 0.71) < 1e-12
+assert start.iloc[0]["type"] == "trough"
 
 pre = catalog[catalog["label"] == "Cycle-derived pre-2015 peak"]
 assert len(pre) == 1
@@ -70,6 +72,9 @@ schedule = _fixed_cycle_anchors(
     pd.Timestamp("2030-01-01"),
     data=data,
 )
+scheduled_start = schedule[(schedule["date"] == SCHEDULED_CYCLE_START) & (schedule["type"] == "trough")]
+assert len(scheduled_start) == 1
+assert int(scheduled_start.iloc[0]["cycle"]) == -3
 early = schedule[(schedule["date"] == SCHEDULED_PRE_2015_PEAK) & (schedule["type"] == "peak")]
 assert len(early) == 1
 assert int(early.iloc[0]["cycle"]) == -3
@@ -84,6 +89,14 @@ result = fit_price_model(
     projection_years=3,
 )
 anchor_table = result.diagnostics["cycle_anchor_table"]
+model_start = anchor_table[
+    (pd.to_datetime(anchor_table["requested_anchor_date"]) == SCHEDULED_CYCLE_START)
+    & (anchor_table["type"] == "trough")
+    & (anchor_table["source"] == "historical market anchor")
+]
+assert len(model_start) == 1
+assert abs(float(model_start.iloc[0]["actual_price_usd"]) - 0.71) < 1e-12
+
 model_early = anchor_table[
     (pd.to_datetime(anchor_table["requested_anchor_date"]) == SCHEDULED_PRE_2015_PEAK)
     & (anchor_table["type"] == "peak")
@@ -92,4 +105,4 @@ model_early = anchor_table[
 assert len(model_early) == 1
 assert abs(float(model_early.iloc[0]["actual_price_usd"]) - 876.54) < 1e-9
 
-print("Cycle-derived observed start and pre-2015 peak shortcuts verified.")
+print("Cycle-derived 2011 trough and pre-2015 peak are plotted/intersection anchors.")

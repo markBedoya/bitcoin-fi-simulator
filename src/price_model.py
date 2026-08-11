@@ -2,7 +2,7 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-PRICE_MODEL_ENGINE_VERSION = "price-model-v3.3.2-cycle-derived-observed-start"
+PRICE_MODEL_ENGINE_VERSION = "price-model-v3.3.3-plotted-cycle-start-anchor"
 
 GENESIS = pd.Timestamp("2009-01-03")
 FIXED_CYCLE_DAYS = 1428
@@ -40,6 +40,27 @@ SCHEDULED_CYCLE_START = SCHEDULED_PRE_2015_PEAK - pd.Timedelta(days=FIXED_BULL_D
 SCHEDULED_ZERO_START = SCHEDULED_CYCLE_START
 
 
+def _cycle_derived_start_anchor(data: pd.DataFrame):
+    """Return the schedule-derived 2011 trough with its observed BTC price.
+
+    The DATE is derived only from the fixed 1428-day cycle clock. The PRICE is
+    the nearest positive Coin Metrics observation on that date (within 3 days).
+    This makes the 2011 point a true plotted/intersection anchor without
+    inventing a historical price.
+    """
+    if data is None or data.empty:
+        return None
+    clean = data[["date", "price_usd"]].dropna().copy()
+    clean = clean[clean["price_usd"] > 0]
+    if clean.empty:
+        return None
+    nearest = clean.iloc[(clean["date"] - SCHEDULED_CYCLE_START).abs().argsort()[:1]].iloc[0]
+    actual_date = pd.Timestamp(nearest["date"])
+    if abs((actual_date - SCHEDULED_CYCLE_START).days) > 3:
+        return None
+    return SCHEDULED_CYCLE_START, "trough", -3, float(nearest["price_usd"]), actual_date
+
+
 def _cycle_derived_pre_2015_peak_anchor(data: pd.DataFrame):
     """Return the schedule-derived pre-2015 peak with its observed BTC price.
 
@@ -61,12 +82,17 @@ def _cycle_derived_pre_2015_peak_anchor(data: pd.DataFrame):
 
 
 def historical_cycle_anchors(data: pd.DataFrame | None = None):
-    """Historical anchors extended by the cycle-clock-derived early peak date."""
+    """Historical anchors plus the two cycle-clock-derived early anchors."""
     anchors = list(HISTORICAL_CYCLE_ANCHORS)
-    early = _cycle_derived_pre_2015_peak_anchor(data) if data is not None else None
-    if early is not None:
-        early_date, early_type, early_cycle, _, _ = early
-        anchors.insert(0, (early_date, early_type, early_cycle))
+    if data is not None:
+        early_start = _cycle_derived_start_anchor(data)
+        early_peak = _cycle_derived_pre_2015_peak_anchor(data)
+        if early_peak is not None:
+            early_date, early_type, early_cycle, _, _ = early_peak
+            anchors.insert(0, (early_date, early_type, early_cycle))
+        if early_start is not None:
+            start_date, start_type, start_cycle, _, _ = early_start
+            anchors.insert(0, (start_date, start_type, start_cycle))
     return anchors
 
 
@@ -88,18 +114,18 @@ def get_price_model_anchor_catalog(data: pd.DataFrame) -> pd.DataFrame:
 
     rows = []
 
-    nearest_start = clean.iloc[(clean["date"] - SCHEDULED_CYCLE_START).abs().argsort()[:1]].iloc[0]
-    actual_start_price_date = pd.Timestamp(nearest_start["date"])
-    if abs((actual_start_price_date - SCHEDULED_CYCLE_START).days) <= 3:
-        start_source = "cycle-derived date; Coin Metrics price on derived date"
-        if actual_start_price_date != SCHEDULED_CYCLE_START:
+    cycle_start = _cycle_derived_start_anchor(clean)
+    if cycle_start is not None:
+        start_date, _, start_cycle, start_price, actual_start_price_date = cycle_start
+        start_source = "cycle-derived trough date; Coin Metrics price on derived date"
+        if actual_start_price_date != start_date:
             start_source += f" (nearest observation {actual_start_price_date.date().isoformat()})"
         rows.append({
-            "label": "Cycle-derived start",
-            "date": SCHEDULED_CYCLE_START,
-            "type": "cycle_start",
-            "cycle": -3,
-            "price_usd": float(nearest_start["price_usd"]),
+            "label": "Cycle-derived 2011 trough",
+            "date": start_date,
+            "type": "trough",
+            "cycle": start_cycle,
+            "price_usd": start_price,
             "source": start_source,
         })
 

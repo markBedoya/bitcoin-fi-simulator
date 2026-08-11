@@ -9,7 +9,7 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v3.3.2 — Cycle-Derived Anchor Exploration")
+st.title("Price Model v3.3.3 — Plotted Cycle-Derived Anchors")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
@@ -162,7 +162,7 @@ with st.sidebar:
 
     st.subheader("Anchor shortcuts")
     st.caption(
-        "Snap either training boundary to an anchor. The early cycle-start and pre-2015 peak DATES "
+        "Snap either training boundary to an anchor. The 2011 trough and pre-2015 peak DATES "
         "are derived from the same 1428-day cycle clock used by the projection. Their PRICES come "
         "from the imported Coin Metrics observations on those derived dates."
     )
@@ -283,7 +283,7 @@ with st.expander("Historical anchor catalog", expanded=False):
     st.caption(
         "These are the shortcut dates and prices currently available to the Price Model. The early "
         "The early cycle-start and pre-2015 peak dates are derived by running the fixed cycle schedule backward. "
-        "Both anchor prices are observed Coin Metrics data on those derived dates. "
+        "Both early anchor prices are observed Coin Metrics data on those cycle-derived dates. The 2011 trough is also a plotted historical intersection anchor when it falls inside the selected training range. "
         "The remaining turning points are the model's existing historical market anchors."
     )
     anchor_display = anchor_catalog.copy()
