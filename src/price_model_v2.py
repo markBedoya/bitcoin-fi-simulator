@@ -416,6 +416,29 @@ def build_model_diagnostics(
         [(cycle["peak"] - cycle["start"]).days for cycle in COMPLETE_CYCLES],
         dtype=float,
     )
+    decline_offsets = np.array(
+        [(cycle["end"] - cycle["peak"]).days for cycle in COMPLETE_CYCLES],
+        dtype=float,
+    )
+    cycle_lengths = np.array(
+        [(cycle["end"] - cycle["start"]).days for cycle in COMPLETE_CYCLES],
+        dtype=float,
+    )
+    timing_stability = pd.DataFrame([{
+        "completed_cycles": len(COMPLETE_CYCLES),
+        "trough_to_peak_min_days": int(peak_offsets.min()),
+        "trough_to_peak_median_days": int(round(float(np.median(peak_offsets)))),
+        "trough_to_peak_max_days": int(peak_offsets.max()),
+        "peak_timing_range_days": int(peak_offsets.max() - peak_offsets.min()),
+        "peak_to_trough_min_days": int(decline_offsets.min()),
+        "peak_to_trough_median_days": int(round(float(np.median(decline_offsets)))),
+        "peak_to_trough_max_days": int(decline_offsets.max()),
+        "decline_timing_range_days": int(decline_offsets.max() - decline_offsets.min()),
+        "cycle_length_min_days": int(cycle_lengths.min()),
+        "cycle_length_median_days": int(round(float(np.median(cycle_lengths)))),
+        "cycle_length_max_days": int(cycle_lengths.max()),
+        "timing_read": "historical cycle timing is unusually stable",
+    }])
     next_cycle_start = pd.Timestamp(weighted_fit["estimated_cycle_end"])
     median_peak_offset_days = int(round(float(np.median(peak_offsets))))
     next_peak_date = next_cycle_start + pd.Timedelta(days=median_peak_offset_days)
@@ -479,6 +502,20 @@ def build_model_diagnostics(
             "scenario_role": "upper boundary",
         },
     ])
+    forward_price_scenarios["peak_to_trough_drawdown_pct"] = (
+        forward_price_scenarios["projected_trough_usd"]
+        / forward_price_scenarios["projected_peak_usd"]
+        - 1.0
+    )
+    forward_price_scenarios["peak_to_trough_days"] = (
+        forward_price_scenarios["projected_trough_date"]
+        - forward_price_scenarios["projected_peak_date"]
+    ).dt.days
+    forward_price_scenarios["trough_above_current_peak_pct"] = (
+        forward_price_scenarios["projected_trough_usd"]
+        / float(deviations.loc[deviations["label"] == "2025 peak", "price_usd"].iloc[0])
+        - 1.0
+    )
 
     return (
         expanding,
@@ -488,6 +525,7 @@ def build_model_diagnostics(
         maturity_transition,
         forward_candidates,
         forward_price_scenarios,
+        timing_stability,
     )
 
 

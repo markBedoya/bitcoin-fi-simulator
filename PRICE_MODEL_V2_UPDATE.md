@@ -47,3 +47,8 @@ The compact export now also includes `NEXT-CYCLE PRICE ENVELOPE`. It evaluates
 the bounded-convergence and regime-hold multipliers against the weighted
 backbone on the historically timed next peak date. The rejected unbounded model
 is intentionally excluded from dollar projections.
+
+The envelope now reports the implied peak-to-trough drawdown and how far the
+projected trough remains above the confirmed 2025 peak. `CYCLE TIMING STABILITY`
+shows completed-cycle min/median/max offsets so forecast-date sensitivity is
+visible instead of hidden behind a single median.

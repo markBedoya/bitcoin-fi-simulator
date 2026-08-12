@@ -31,6 +31,7 @@ weighted_fit, weighted_curve = fit_progress_weighted_backbone(prices)
     maturity_transition_df,
     forward_candidates_df,
     forward_price_scenarios_df,
+    timing_stability_df,
 ) = build_model_diagnostics(
     prices, fits_df, weighted_fit
 )
@@ -213,10 +214,19 @@ st.dataframe(
         "trough_backbone_usd": "${:,.0f}",
         "trough_multiple": "{:.3f}×",
         "projected_trough_usd": "${:,.0f}",
+        "peak_to_trough_drawdown_pct": "{:.1%}",
+        "trough_above_current_peak_pct": "{:.1%}",
     }),
     use_container_width=True,
     hide_index=True,
 )
+
+st.subheader("Cycle timing stability")
+st.caption(
+    "Completed cycles show how sensitive the projected dates are to historical timing. "
+    "Narrow min-to-max ranges make timing a small source of one-cycle uncertainty."
+)
+st.dataframe(timing_stability_df, use_container_width=True, hide_index=True)
 
 st.subheader("Forward structure tests")
 st.caption(
@@ -302,5 +312,7 @@ copy_text = (
     + forward_candidates_df.to_csv(index=False, sep="\t")
     + "\nNEXT-CYCLE PRICE ENVELOPE\n"
     + forward_price_scenarios_df.to_csv(index=False, sep="\t")
+    + "\nCYCLE TIMING STABILITY\n"
+    + timing_stability_df.to_csv(index=False, sep="\t")
 )
 st.code(copy_text, language="text")

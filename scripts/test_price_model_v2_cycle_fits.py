@@ -26,7 +26,7 @@ def main():
     fits, curves = fit_cycle_combo_centerlines(prices)
     comparison, spread = build_common_date_comparison(fits, prices)
     weighted, weighted_curve = fit_progress_weighted_backbone(prices)
-    expanding, deviations, geometry, floor, maturity, candidates, price_scenarios = build_model_diagnostics(prices, fits, weighted)
+    expanding, deviations, geometry, floor, maturity, candidates, price_scenarios, timing = build_model_diagnostics(prices, fits, weighted)
 
     assert len(fits) == 9, f"Expected 9 fits, got {len(fits)}"
     assert not curves.empty, "Expected non-empty curve output"
@@ -88,6 +88,11 @@ def main():
     assert price_scenarios['projected_trough_date'].nunique() == 1
     assert price_scenarios.iloc[0]['peak_multiple'] < price_scenarios.iloc[-1]['peak_multiple']
     assert price_scenarios.iloc[1]['scenario_role'] == 'planning midpoint; not independently fitted'
+    assert np.isfinite(price_scenarios['peak_to_trough_drawdown_pct']).all()
+    assert (price_scenarios['peak_to_trough_days'] > 0).all()
+    assert timing.iloc[0]['peak_timing_range_days'] <= 14
+    assert timing.iloc[0]['decline_timing_range_days'] <= 14
+    assert timing.iloc[0]['timing_read'] == 'historical cycle timing is unusually stable'
 
     print('PASS: Price Model v2 expanded cycle fit outputs look valid.')
 
