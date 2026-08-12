@@ -8,6 +8,7 @@ from src.price_model_v2 import (
     LIVE_STARTS,
     get_cycle_anchor_df,
     fit_cycle_combo_centerlines,
+    build_common_date_comparison,
 )
 
 st.title("Price Model v2 — Cycle-by-Cycle Power Law View")
@@ -33,6 +34,7 @@ except Exception as exc:
 
 anchor_df = get_cycle_anchor_df(prices)
 fits_df, curves_df = fit_cycle_combo_centerlines(prices)
+comparison_df, spread_df = build_common_date_comparison(fits_df, prices)
 
 palette = [
     "#F48FB1", "#81C784", "#FFB74D", "#64B5F6", "#BA68C8",
@@ -223,6 +225,84 @@ st.dataframe(
     use_container_width=True,
     hide_index=True,
 )
+
+
+
+st.subheader("Common-date centerline comparison")
+st.caption(
+    "Every fitted power-law centerline is evaluated on the exact same dates. "
+    "This is the table to copy back into ChatGPT so we can judge whether the fitted fair-value "
+    "paths are converging toward a common structure. The first row is the actual Bitcoin price "
+    "at each checkpoint for reference."
+)
+
+comparison_display = comparison_df.copy()
+comparison_display["fit_start"] = pd.to_datetime(comparison_display["fit_start"], errors="coerce").dt.date
+comparison_display["fit_end"] = pd.to_datetime(comparison_display["fit_end"], errors="coerce").dt.date
+checkpoint_columns = [
+    c for c in comparison_display.columns
+    if " | " in c
+]
+comparison_format = {c: "${:,.0f}" for c in checkpoint_columns}
+comparison_format["slope"] = "{:.4f}"
+st.dataframe(
+    comparison_display.style.format(comparison_format, na_rep="—"),
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.subheader("Checkpoint convergence summary")
+st.caption(
+    "This collapses the nine fitted centerlines at each common date into their minimum, median, "
+    "maximum, and spread. A narrowing spread over time would be evidence that different training "
+    "windows are converging toward a similar structural centerline."
+)
+spread_display = spread_df.copy()
+spread_display["date"] = pd.to_datetime(spread_display["date"]).dt.date
+st.dataframe(
+    spread_display.style.format(
+        {
+            "actual_btc_usd": "${:,.0f}",
+            "centerline_min_usd": "${:,.0f}",
+            "centerline_median_usd": "${:,.0f}",
+            "centerline_max_usd": "${:,.0f}",
+            "max_min_ratio": "{:.2f}x",
+            "range_pct_of_median": "{:.1%}",
+            "median_vs_actual_ratio": "{:.2f}x",
+        },
+        na_rep="—",
+    ),
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.subheader("Copy/paste results for analysis")
+st.caption(
+    "Copy everything in the block below and paste it back into ChatGPT. It contains both the "
+    "common-date matrix and the convergence summary in tab-separated format."
+)
+
+copy_matrix = comparison_display.copy()
+for col in checkpoint_columns:
+    copy_matrix[col] = pd.to_numeric(copy_matrix[col], errors="coerce").round(2)
+copy_matrix["slope"] = pd.to_numeric(copy_matrix["slope"], errors="coerce").round(6)
+copy_matrix = copy_matrix.fillna("")
+
+copy_spread = spread_display.copy()
+for col in ["actual_btc_usd", "centerline_min_usd", "centerline_median_usd", "centerline_max_usd"]:
+    copy_spread[col] = pd.to_numeric(copy_spread[col], errors="coerce").round(2)
+for col in ["max_min_ratio", "range_pct_of_median", "median_vs_actual_ratio"]:
+    copy_spread[col] = pd.to_numeric(copy_spread[col], errors="coerce").round(6)
+copy_spread = copy_spread.fillna("")
+
+copy_text = (
+    "COMMON-DATE CENTERLINE COMPARISON\n"
+    + copy_matrix.to_csv(index=False, sep="\t")
+    + "\nCHECKPOINT CONVERGENCE SUMMARY\n"
+    + copy_spread.to_csv(index=False, sep="\t")
+)
+st.code(copy_text, language="text")
+
 
 st.subheader("Anchor points used on this page")
 st.dataframe(

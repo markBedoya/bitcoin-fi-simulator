@@ -1,3 +1,18 @@
+## v3.20.4 — Common-date centerline comparison
+
+- Added a **Common-date centerline comparison** table to Price Model v2.
+- Evaluates Actual BTC plus all 9 exploratory power-law fits at the same checkpoints:
+  - 2011 trough
+  - 2014 peak
+  - 2015 trough
+  - 2018 trough
+  - 2022 trough
+  - 2025 peak
+  - latest live Bitcoin data
+- Added a **Checkpoint convergence summary** with actual BTC, cross-fit minimum, median, maximum, max/min ratio, range as a percentage of median, and median-vs-actual ratio.
+- Added a plain-text tab-separated **Copy/paste results for analysis** block so the complete result can be pasted directly back into ChatGPT.
+- Extended the offline Price Model v2 regression test to validate the new comparison and convergence outputs.
+
 ## v3.20.3 — Restore explicit Streamlit navigation
 
 - Fixed the v3.20.2 packaging regression that overwrote the explicit `st.navigation(...)` router with an older single-page `streamlit_app.py`.

@@ -203,3 +203,82 @@ def fit_cycle_combo_centerlines(prices: pd.DataFrame) -> tuple[pd.DataFrame, pd.
     fits_df = pd.DataFrame(fit_rows)
     curves_df = pd.concat(curve_rows, ignore_index=True) if curve_rows else pd.DataFrame()
     return fits_df, curves_df
+
+
+def build_common_date_comparison(
+    fits_df: pd.DataFrame,
+    prices: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Evaluate every fitted power law at the same structural checkpoint dates.
+
+    Returns:
+        comparison: one row per fit plus an Actual BTC row.
+        spread_summary: cross-fit min/median/max/spread at each checkpoint.
+    """
+    latest_date = pd.Timestamp(prices["date"].max())
+    checkpoint_specs = [
+        ("2011 trough", pd.Timestamp("2011-02-14")),
+        ("2014 peak", pd.Timestamp("2014-01-13")),
+        ("2015 trough", pd.Timestamp("2015-01-14")),
+        ("2018 trough", pd.Timestamp("2018-12-15")),
+        ("2022 trough", pd.Timestamp("2022-11-07")),
+        ("2025 peak", pd.Timestamp("2025-10-06")),
+        ("Live", latest_date),
+    ]
+
+    price_lookup = prices.set_index("date")["price_usd"]
+    actual_row = {
+        "fit_group": "Actual BTC",
+        "label": "Actual Bitcoin price",
+        "fit_start": pd.NaT,
+        "fit_end": pd.NaT,
+        "slope": np.nan,
+    }
+    for label, date in checkpoint_specs:
+        actual = price_lookup.get(date, np.nan)
+        actual_row[f"{label} | {date.date()}"] = float(actual) if pd.notna(actual) else np.nan
+
+    rows = [actual_row]
+    for _, fit in fits_df.iterrows():
+        row = {
+            "fit_group": fit["fit_group"],
+            "label": fit["label"],
+            "fit_start": pd.Timestamp(fit["fit_start"]),
+            "fit_end": pd.Timestamp(fit["fit_end"]),
+            "slope": float(fit["slope"]),
+        }
+        for checkpoint_label, date in checkpoint_specs:
+            days = float((date - GENESIS).days)
+            value = np.exp(float(fit["intercept"]) + float(fit["slope"]) * np.log(days))
+            row[f"{checkpoint_label} | {date.date()}"] = float(value)
+        rows.append(row)
+
+    comparison = pd.DataFrame(rows)
+
+    fit_only = comparison[comparison["fit_group"] != "Actual BTC"].copy()
+    spread_rows = []
+    for checkpoint_label, date in checkpoint_specs:
+        col = f"{checkpoint_label} | {date.date()}"
+        vals = pd.to_numeric(fit_only[col], errors="coerce").dropna()
+        actual = price_lookup.get(date, np.nan)
+        if vals.empty:
+            continue
+        minimum = float(vals.min())
+        median = float(vals.median())
+        maximum = float(vals.max())
+        spread_rows.append(
+            {
+                "checkpoint": checkpoint_label,
+                "date": date,
+                "actual_btc_usd": float(actual) if pd.notna(actual) else np.nan,
+                "centerline_min_usd": minimum,
+                "centerline_median_usd": median,
+                "centerline_max_usd": maximum,
+                "max_min_ratio": maximum / minimum if minimum > 0 else np.nan,
+                "range_pct_of_median": (maximum - minimum) / median if median > 0 else np.nan,
+                "median_vs_actual_ratio": median / float(actual) if pd.notna(actual) and float(actual) > 0 else np.nan,
+            }
+        )
+
+    spread_summary = pd.DataFrame(spread_rows)
+    return comparison, spread_summary

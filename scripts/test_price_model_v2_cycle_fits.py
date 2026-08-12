@@ -1,7 +1,11 @@
 import numpy as np
 import pandas as pd
 
-from src.price_model_v2 import get_cycle_anchor_df, fit_cycle_combo_centerlines
+from src.price_model_v2 import (
+    get_cycle_anchor_df,
+    fit_cycle_combo_centerlines,
+    build_common_date_comparison,
+)
 
 
 def synthetic_prices():
@@ -18,6 +22,7 @@ def main():
     prices = synthetic_prices()
     anchors = get_cycle_anchor_df(prices)
     fits, curves = fit_cycle_combo_centerlines(prices)
+    comparison, spread = build_common_date_comparison(fits, prices)
 
     assert len(fits) == 9, f"Expected 9 fits, got {len(fits)}"
     assert not curves.empty, "Expected non-empty curve output"
@@ -32,6 +37,14 @@ def main():
         'live_2011', 'live_2015', 'live_2018',
     }
     assert set(fits['fit_id']) == expected_ids, set(fits['fit_id'])
+    assert len(comparison) == 10, f"Expected Actual BTC + 9 fit rows, got {len(comparison)}"
+    assert comparison.iloc[0]['fit_group'] == 'Actual BTC'
+    checkpoint_cols = [c for c in comparison.columns if ' | ' in c]
+    assert len(checkpoint_cols) == 7, checkpoint_cols
+    assert len(spread) == 7, f"Expected 7 checkpoint summary rows, got {len(spread)}"
+    assert (spread['centerline_min_usd'] > 0).all()
+    assert (spread['centerline_max_usd'] >= spread['centerline_median_usd']).all()
+    assert (spread['centerline_median_usd'] >= spread['centerline_min_usd']).all()
 
     print('PASS: Price Model v2 expanded cycle fit outputs look valid.')
 
