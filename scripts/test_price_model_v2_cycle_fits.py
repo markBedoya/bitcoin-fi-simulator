@@ -26,7 +26,7 @@ def main():
     fits, curves = fit_cycle_combo_centerlines(prices)
     comparison, spread = build_common_date_comparison(fits, prices)
     weighted, weighted_curve = fit_progress_weighted_backbone(prices)
-    expanding, deviations, geometry, floor, maturity, candidates, price_scenarios, timing, floor_sensitivity = build_model_diagnostics(prices, fits, weighted)
+    expanding, deviations, geometry, floor, maturity, candidates, price_scenarios, timing, floor_sensitivity, multi_cycle = build_model_diagnostics(prices, fits, weighted)
 
     assert len(fits) == 9, f"Expected 9 fits, got {len(fits)}"
     assert not curves.empty, "Expected non-empty curve output"
@@ -101,6 +101,23 @@ def main():
     assert floor_sensitivity['projected_trough_usd'].is_monotonic_increasing
     assert np.isfinite(floor_sensitivity['drawdown_from_upper_peak_pct']).all()
     assert floor_sensitivity['trough_range_span_pct'].nunique() == 1
+    assert multi_cycle['horizon_cycle'].nunique() == 5
+    assert len(multi_cycle) == 45
+    assert multi_cycle['projected_peak_usd'].gt(0).all()
+    assert multi_cycle['projected_trough_usd'].gt(0).all()
+    assert multi_cycle['projected_peak_date'].max().year >= 2045
+    assert multi_cycle['projected_trough_date'].max().year >= 2046
+    bounded_lower = multi_cycle[
+        (multi_cycle['peak_path'] == 'bounded_convergence_lower')
+        & (multi_cycle['floor_path'] == 'robust_floor_hold')
+    ]
+    assert bounded_lower['peak_multiple'].is_monotonic_decreasing
+    assert (bounded_lower['peak_multiple'] >= 1.0).all()
+    recovery = multi_cycle[
+        (multi_cycle['peak_path'] == 'geometric_planning_midpoint')
+        & (multi_cycle['floor_path'] == 'half_gap_recovery_to_completed_median')
+    ]
+    assert recovery['floor_multiple'].is_monotonic_increasing
 
     print('PASS: Price Model v2 expanded cycle fit outputs look valid.')
 

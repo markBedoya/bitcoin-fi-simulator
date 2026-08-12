@@ -226,7 +226,7 @@ def build_model_diagnostics(
     prices: pd.DataFrame,
     fits_df: pd.DataFrame,
     weighted_fit: dict,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Return the compact diagnostics used to learn the mature-cycle geometry.
 
     October 2025 is treated as the confirmed current-cycle peak.  The latest
@@ -568,6 +568,65 @@ def build_model_diagnostics(
         - 1.0
     )
 
+    # Extend the bounded structures across five cycles as a structural stress
+    # test. The lower peak path compounds the observed retention of excess above
+    # 1.0x. The upper path allows the 2025 regime to persist for one more cycle,
+    # then converges by the same bounded rule. Floor paths are deliberately kept
+    # independent: fixed partial, fixed robust, or a labeled half-gap recovery
+    # toward the completed mature median.
+    multi_cycle_rows = []
+    lower_excess = current_peak_excess
+    upper_excess = current_peak_excess
+    recovery_floor = robust_floor
+    future_cycle_count = 5
+    for horizon_cycle in range(1, future_cycle_count + 1):
+        cycle_start = next_cycle_start + pd.Timedelta(
+            days=(horizon_cycle - 1) * int(weighted_fit["expected_cycle_days"])
+        )
+        peak_date = cycle_start + pd.Timedelta(days=median_peak_offset_days)
+        trough_date = cycle_start + pd.Timedelta(days=int(weighted_fit["expected_cycle_days"]))
+        lower_excess *= recent_excess_retention
+        if horizon_cycle == 1:
+            upper_excess = current_peak_excess
+        else:
+            upper_excess *= recent_excess_retention
+        lower_multiple = 1.0 + lower_excess
+        upper_multiple = 1.0 + upper_excess
+        midpoint_multiple = float(np.sqrt(lower_multiple * upper_multiple))
+        if horizon_cycle > 1:
+            recovery_floor += 0.5 * (mature_floor - recovery_floor)
+        peak_backbone_h = backbone_at(peak_date)
+        trough_backbone_h = backbone_at(trough_date)
+        for peak_path, peak_multiple_h in [
+            ("bounded_convergence_lower", lower_multiple),
+            ("geometric_planning_midpoint", midpoint_multiple),
+            ("one_cycle_regime_hold_upper", upper_multiple),
+        ]:
+            for floor_path, floor_multiple_h in [
+                ("conservative_forming_floor_hold", forming_floor),
+                ("robust_floor_hold", robust_floor),
+                ("half_gap_recovery_to_completed_median", recovery_floor),
+            ]:
+                peak_usd_h = peak_backbone_h * peak_multiple_h
+                trough_usd_h = trough_backbone_h * floor_multiple_h
+                multi_cycle_rows.append({
+                    "horizon_cycle": horizon_cycle,
+                    "cycle_start": cycle_start,
+                    "projected_peak_date": peak_date,
+                    "projected_trough_date": trough_date,
+                    "peak_path": peak_path,
+                    "floor_path": floor_path,
+                    "peak_multiple": peak_multiple_h,
+                    "floor_multiple": floor_multiple_h,
+                    "peak_backbone_usd": peak_backbone_h,
+                    "trough_backbone_usd": trough_backbone_h,
+                    "projected_peak_usd": peak_usd_h,
+                    "projected_trough_usd": trough_usd_h,
+                    "peak_to_trough_drawdown_pct": trough_usd_h / peak_usd_h - 1.0,
+                    "structural_status": "bounded diagnostic; not production projection",
+                })
+    multi_cycle_stress_test = pd.DataFrame(multi_cycle_rows)
+
     return (
         expanding,
         deviations,
@@ -578,6 +637,7 @@ def build_model_diagnostics(
         forward_price_scenarios,
         timing_stability,
         floor_sensitivity,
+        multi_cycle_stress_test,
     )
 
 

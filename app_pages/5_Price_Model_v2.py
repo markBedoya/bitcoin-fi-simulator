@@ -33,6 +33,7 @@ weighted_fit, weighted_curve = fit_progress_weighted_backbone(prices)
     forward_price_scenarios_df,
     timing_stability_df,
     floor_sensitivity_df,
+    multi_cycle_stress_test_df,
 ) = build_model_diagnostics(
     prices, fits_df, weighted_fit
 )
@@ -202,6 +203,25 @@ st.dataframe(
     hide_index=True,
 )
 
+st.subheader("Bounded multi-cycle stress test")
+st.caption(
+    "Five future cycles test whether the valid peak and floor structures remain coherent through 2046. "
+    "This is a sparse anchor diagnostic, not yet the production daily 20-year projection."
+)
+st.dataframe(
+    multi_cycle_stress_test_df.style.format({
+        "peak_multiple": "{:.3f}×",
+        "floor_multiple": "{:.3f}×",
+        "peak_backbone_usd": "${:,.0f}",
+        "trough_backbone_usd": "${:,.0f}",
+        "projected_peak_usd": "${:,.0f}",
+        "projected_trough_usd": "${:,.0f}",
+        "peak_to_trough_drawdown_pct": "{:.1%}",
+    }),
+    use_container_width=True,
+    hide_index=True,
+)
+
 st.subheader("Next-cycle price envelope")
 st.caption(
     "The two valid boundary structures are multiplied by the progress-weighted backbone at the historically timed "
@@ -335,5 +355,7 @@ copy_text = (
     + timing_stability_df.to_csv(index=False, sep="\t")
     + "\nFUTURE TROUGH-FLOOR SENSITIVITY\n"
     + floor_sensitivity_df.to_csv(index=False, sep="\t")
+    + "\nBOUNDED MULTI-CYCLE STRESS TEST\n"
+    + multi_cycle_stress_test_df.to_csv(index=False, sep="\t")
 )
 st.code(copy_text, language="text")
