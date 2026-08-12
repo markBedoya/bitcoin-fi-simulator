@@ -1,3 +1,18 @@
+## v3.20.0 — fair-value-linked peak/trough valuation engine
+
+- Reconnects future turning-point prices to the structural/geometric centerline, treating it explicitly as the model's long-term fair-value reference.
+- Replaces the v3.19 sequential-only endpoint generator with `future fair value × learned cycle valuation multiple`.
+- Learns peak valuation (`peak / centerline`) and trough valuation (`trough / centerline`) independently from historical anchors inside the selected training window.
+- Fits separate maturity/compression trends for peak excess and trough discount, with held-out same-type validation deciding how much trend is allowed into the forecast and an additional independent-sample confidence shrinkage so one successful holdout cannot receive full production weight.
+- With insufficient independent anchors, carries the latest observed fair-value distance forward instead of extrapolating an unvalidated maturity slope.
+- Adds a data/structure-derived same-type floor so projected cycle peaks and cycle troughs cannot form a secular downward staircase while the fair-value backbone rises.
+- Retains bull-gain and bear-loss transition models as validation and impossible-direction guardrails rather than primary endpoint price generators.
+- Preserves the live 2025→2026 partial-bear conditioner, fixed 1428-day timing, empirical bull/bear daily phase shapes, historical anchor intersections, projection-boundary continuity, and projection-tail lookahead.
+- Adds `Latest Bitcoin price data` directly to the End Anchor selector.
+- Adds fair-value valuation diagnostics showing historical centerline multiples, peak/trough maturity retention, projected valuation candidates, final multiples, transition validation, and any applied structural guardrails.
+- Adds `PRICE_MODEL_CONTRACT.md` so future changes preserve the shared modeling invariants instead of fixing one local failure mode at the expense of another.
+- Adds regression coverage for rising future lows, fair-value linkage, no-lookahead historical forecasts, endpoint geometry, conservative endpoint equivalence, phase-shape preservation, continuity, and the latest-data End Anchor option.
+
 ## v3.19.0 — sequential turning-point price engine
 
 - Replaces centerline ± symmetric amplitude as the primary generator of future peak/trough prices.

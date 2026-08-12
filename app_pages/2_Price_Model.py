@@ -9,19 +9,17 @@ from src.financial_independence import build_rebased_btc_paths
 from src.active_model_config import build_model_fingerprint
 from src.theme import REFERENCE_LINE_COLOR, REFERENCE_LINE_WIDTH, REFERENCE_LINE_DASH
 
-st.title("Price Model v3.4 — Sequential Cycle Transitions")
+st.title("Price Model v3.5 — Fair-Value Cycle Valuations")
 st.caption(
     "All Bitcoin price history is always visible. The selected range controls only model fitting. "
     "Historical turning points anchor the fitted path; future timing remains fixed at 1428 days "
-    "(1064 bull + 364 bear). The phase shape is learned from completed historical total-price "
-    "moves. When the latest date is inside an unfinished cycle phase, the projection continues "
-    "from that exact phase progress instead of restarting the phase. Future turning-point PRICES are now "
-    "projected sequentially from the prior turning point using historically learned trough→peak gains and "
-    "peak→trough losses. The structural centerline remains a locked long-term reference, but no longer "
-    "creates future highs and lows by symmetric amplitude. "
-    "The two early exploration anchor dates are derived by running the same fixed cycle clock backward: "
-    "the earlier cycle start and the prior cycle peak. Both displayed prices come from Coin Metrics. Anchor shortcuts let you snap "
-    "either training boundary to any anchor."
+    "(1064 bull + 364 bear). The structural/geometric centerline is the model's long-term fair-value "
+    "reference. Historical peaks and troughs are measured as separate valuation multiples above and "
+    "below that centerline, and their maturity/compression trends are learned independently. Future "
+    "turning-point prices are structural fair value × learned peak/trough valuation multiple. Historical "
+    "bull gains and bear losses remain independent validation/geometry checks, while empirical phase "
+    "shapes determine the daily path between turning points. The two early exploration anchor dates are "
+    "derived by running the same fixed cycle clock backward, and their displayed prices come from Coin Metrics."
 )
 
 try:
@@ -47,6 +45,15 @@ for row in anchor_catalog.itertuples(index=False):
     label = f"{row.label} — {pd.Timestamp(row.date).date().isoformat()} — ${float(row.price_usd):,.2f}"
     anchor_options.append(label)
     anchor_lookup[label] = pd.Timestamp(row.date).date()
+
+latest_row = prices.sort_values("date").iloc[-1]
+latest_end_label = (
+    f"Latest Bitcoin price data — {pd.Timestamp(latest_row['date']).date().isoformat()} — "
+    f"${float(latest_row['price_usd']):,.2f}"
+)
+end_anchor_options = anchor_options + [latest_end_label]
+end_anchor_lookup = dict(anchor_lookup)
+end_anchor_lookup[latest_end_label] = pd.Timestamp(latest_row["date"]).date()
 
 
 def _clear_range_search_state():
@@ -180,16 +187,16 @@ with st.sidebar:
 
         end_anchor_choice = st.selectbox(
             "End anchor",
-            anchor_options,
-            index=len(anchor_options) - 1,
+            end_anchor_options,
+            index=len(end_anchor_options) - 1,
             key="price_model_end_anchor_choice",
         )
         if st.button("Set training end to selected anchor", use_container_width=True):
-            _apply_anchor_boundary("end", anchor_lookup[end_anchor_choice])
+            _apply_anchor_boundary("end", end_anchor_lookup[end_anchor_choice])
 
         if st.button("Apply selected anchor-to-anchor range", type="primary", use_container_width=True):
             selected_start = anchor_lookup[start_anchor_choice]
-            selected_end = anchor_lookup[end_anchor_choice]
+            selected_end = end_anchor_lookup[end_anchor_choice]
             if selected_start >= selected_end:
                 st.warning("Selected start anchor must be earlier than the selected end anchor.")
             else:
@@ -378,6 +385,9 @@ if leaderboard is not None and not leaderboard.empty:
 
 
 REQUIRED_BACKEND_DIAGNOSTICS = {
+    "cycle_valuation_history",
+    "peak_valuation_model",
+    "trough_valuation_model",
     "cycle_transition_history",
     "bull_transition_model",
     "bear_transition_model",
@@ -501,9 +511,9 @@ st.caption(
     "BTC Financial Independence will use this exact model."
 )
 st.success(
-    "Price Model backend capability check: PASS — sequential turning-point endpoints, "
-    "locked structural reference centerline, empirical phase shapes, and exact projection-tail "
-    "continuation are loaded."
+    "Price Model backend capability check: PASS — fair-value-linked turning-point endpoints, "
+    "independent peak/trough maturity learning, transition validation, empirical phase shapes, "
+    "and exact projection-tail continuation are loaded."
 )
 
 fig = go.Figure()
@@ -645,24 +655,23 @@ else:
         "projection until the failed check is resolved."
     )
 
-st.subheader("Structural backbone integrity")
+st.subheader("Fair-value backbone integrity")
 backbone_locked = bool(diag.get("structural_centerline_locked", False))
 centerline_adjusted = bool(diag.get("future_centerline_reconciliation_applied", False))
 bi1, bi2, bi3 = st.columns(3)
-bi1.metric("Structural centerline", "LOCKED" if backbone_locked else "CHECK")
+bi1.metric("Structural / fair-value centerline", "LOCKED" if backbone_locked else "CHECK")
 bi2.metric("Future centerline scale", "1.000×")
-bi3.metric("Guardrail can move centerline", "NO" if backbone_locked else "CHECK")
+bi3.metric("Cycle rules can move centerline", "NO" if backbone_locked else "CHECK")
 st.caption(
-    "The dashed structural/geometric centerline remains the untouched long-term reference. "
-    "It is fitted/extrapolated from the selected training range and is never lowered, raised, "
-    "or reshaped by cycle rules. Future peaks and troughs are now generated independently by "
-    "sequential observed cycle transitions, so the centerline no longer mechanically forces "
-    "their price levels."
+    "The dashed structural/geometric centerline is the model's fair-value reference and remains the untouched "
+    "power-law backbone. Future peaks and troughs are explicitly attached to it through separately learned "
+    "peak/fair-value and trough/fair-value valuation multiples. Cycle rules can change those valuation multiples, "
+    "but cannot move or reshape the centerline itself."
 )
 if backbone_locked and not centerline_adjusted:
-    st.success("Structural backbone: PASS — the future centerline is the untouched structural model.")
+    st.success("Fair-value backbone: PASS — the future centerline is the untouched structural model.")
 else:
-    st.error("Structural backbone: FAIL — a future rule altered the structural centerline.")
+    st.error("Fair-value backbone: FAIL — a future rule altered the structural centerline.")
 
 lookahead_used = bool(diag.get("projection_tail_uses_lookahead_anchor", False))
 lookahead_date = diag.get("projection_lookahead_anchor_date")
@@ -684,41 +693,71 @@ m4.metric("Terminal exponent", f'{diag["terminal_exponent"]:.3f}')
 m5.metric("Next modeled trough", diag.get("next_modeled_trough", "2026-10-05"))
 
 st.caption(
-    "Future turning-point prices are chained from the previous trough/peak using independent "
-    "historical cycle transitions. Bull and bear total log moves are learned separately and their "
-    "cycle-to-cycle maturity slopes are shrunk toward no further change when only a few completed "
-    "cycles exist. The empirical phase templates then shape the daily path between those endpoints. "
-    f"Bull shape: {diag.get('bull_curve', 'empirical')}. "
-    f"Bear shape: {diag.get('bear_curve', 'empirical')}."
+    "Future endpoint = structural fair value at the turning-point date × learned cycle valuation multiple. "
+    "Peak and trough valuation behavior are learned independently. Their distance from fair value is allowed "
+    "to compress with maturity only when held-out same-type anchors support that trend. Historical bull gains "
+    "and bear losses are retained as validation and direction guardrails, not as the primary price generator. "
+    f"Bull shape: {diag.get('bull_curve', 'empirical')}. Bear shape: {diag.get('bear_curve', 'empirical')}."
 )
 
+valuation_history = diag.get("cycle_valuation_history")
+peak_valuation = diag.get("peak_valuation_model", {})
+trough_valuation = diag.get("trough_valuation_model", {})
 transition_history = diag.get("cycle_transition_history")
 bull_transition = diag.get("bull_transition_model", {})
 bear_transition = diag.get("bear_transition_model", {})
 
-st.subheader("Sequential turning-point diagnostics")
-t1, t2, t3, t4, t5, t6 = st.columns(6)
-t1.metric("Bull transitions", int(bull_transition.get("observations", 0)))
-t2.metric("Bull maturity retention", f"{float(bull_transition.get('retention_per_cycle', float('nan'))):.1%}")
-t3.metric(
-    "Bull OOS trend weight",
-    f"{float(bull_transition.get('trend_weight', float('nan'))):.0%}",
-    help=f"Held-out same-phase validations: {int(bull_transition.get('oos_validations', 0))}",
+st.subheader("Fair-value cycle valuation diagnostics")
+v1, v2, v3, v4, v5, v6 = st.columns(6)
+v1.metric("Peak valuations", int(peak_valuation.get("observations", 0)))
+v2.metric("Latest peak / fair value", f"{float(peak_valuation.get('latest_multiple', float('nan'))):.3f}×")
+v3.metric(
+    "Peak maturity retention",
+    f"{float(peak_valuation.get('retention_per_cycle', float('nan'))):.1%}",
+    help=(f"Selected OOS trend weight: {float(peak_valuation.get('selected_oos_trend_weight', 0.0)):.0%}; " f"sample confidence: {float(peak_valuation.get('trend_sample_confidence', 0.0)):.0%}; " f"effective weight: {float(peak_valuation.get('trend_weight', 0.0)):.0%}"),
 )
-t4.metric("Bear transitions", int(bear_transition.get("observations", 0)))
-t5.metric("Bear maturity retention", f"{float(bear_transition.get('retention_per_cycle', float('nan'))):.1%}")
-t6.metric(
-    "Bear OOS trend weight",
-    f"{float(bear_transition.get('trend_weight', float('nan'))):.0%}",
-    help=f"Held-out same-phase validations: {int(bear_transition.get('oos_validations', 0))}",
+v4.metric("Trough valuations", int(trough_valuation.get("observations", 0)))
+v5.metric("Latest trough / fair value", f"{float(trough_valuation.get('latest_multiple', float('nan'))):.3f}×")
+v6.metric(
+    "Trough maturity retention",
+    f"{float(trough_valuation.get('retention_per_cycle', float('nan'))):.1%}",
+    help=(f"Selected OOS trend weight: {float(trough_valuation.get('selected_oos_trend_weight', 0.0)):.0%}; " f"sample confidence: {float(trough_valuation.get('trend_sample_confidence', 0.0)):.0%}; " f"effective weight: {float(trough_valuation.get('trend_weight', 0.0)):.0%}"),
 )
 
 st.caption(
-    "Retention applies to the phase's total log move from one Bitcoin cycle to the next. "
-    "100% retention means no further maturity change; below 100% means the total bull gain or bear loss "
-    "is shrinking. The raw cycle trend is estimated from independent completed transitions. Its production "
-    "trend weight is then selected by genuine walk-forward next-cycle error (0% = ignore the trend, 100% = "
-    "use it fully). Future endpoint prices are not generated from centerline amplitude."
+    "For peaks, the learned magnitude is log(peak / fair value). For troughs it is log(fair value / trough). "
+    "100% retention means the latest observed distance from fair value is carried forward. Below 100% means "
+    "that distance compresses toward fair value from one cycle to the next. Compression strength is selected "
+    "from held-out same-type anchor prediction and then shrunk again by the amount of independent validation evidence, "
+    "so a single successful holdout cannot receive full production weight."
+)
+
+if valuation_history is not None and not valuation_history.empty:
+    valuation_view = valuation_history.copy().sort_values(["date", "type"])
+    st.dataframe(
+        valuation_view[[
+            "date", "type", "cycle", "actual_price_usd", "structural_centerline_usd",
+            "valuation_multiple", "signed_log_deviation", "eligible_for_maturity",
+        ]].style.format({
+            "cycle": "{:.0f}",
+            "actual_price_usd": "${:,.2f}",
+            "structural_centerline_usd": "${:,.2f}",
+            "valuation_multiple": "{:.3f}×",
+            "signed_log_deviation": "{:+.4f}",
+        }),
+        hide_index=True,
+        use_container_width=True,
+    )
+
+st.subheader("Transition validation")
+t1, t2, t3, t4 = st.columns(4)
+t1.metric("Bull transitions", int(bull_transition.get("observations", 0)))
+t2.metric("Bull expected retention", f"{float(bull_transition.get('retention_per_cycle', float('nan'))):.1%}")
+t3.metric("Bear transitions", int(bear_transition.get("observations", 0)))
+t4.metric("Bear expected retention", f"{float(bear_transition.get('retention_per_cycle', float('nan'))):.1%}")
+st.caption(
+    "These sequential transition statistics do not set future endpoint prices. They tell us whether the fair-value "
+    "valuation forecast implies a sensible bull gain / bear loss and repair only impossible phase direction."
 )
 
 if transition_history is not None and not transition_history.empty:
@@ -728,11 +767,7 @@ if transition_history is not None and not transition_history.empty:
         np.exp(transition_view["log_move"]),
         np.exp(-transition_view["log_move"]),
     )
-    transition_view["Move %"] = np.where(
-        transition_view["phase"] == "bull",
-        transition_view["Observed move"] - 1.0,
-        transition_view["Observed move"] - 1.0,
-    )
+    transition_view["Move %"] = transition_view["Observed move"] - 1.0
     st.dataframe(
         transition_view[[
             "phase", "cycle", "start_date", "end_date", "start_price_usd",
@@ -749,31 +784,35 @@ if transition_history is not None and not transition_history.empty:
         use_container_width=True,
     )
 
-anchor_table_for_transitions = diag.get("cycle_anchor_table")
-if anchor_table_for_transitions is not None and not anchor_table_for_transitions.empty:
-    projected_turns = anchor_table_for_transitions[
-        anchor_table_for_transitions["source"].astype(str).str.contains(
-            "projected sequential|current bear-conditioned sequential", case=False, regex=True, na=False
-        )
-    ].copy()
-    if not projected_turns.empty:
+anchor_table_for_projection = diag.get("cycle_anchor_table")
+if anchor_table_for_projection is not None and not anchor_table_for_projection.empty:
+    projected_turns = anchor_table_for_projection[
+        pd.to_datetime(anchor_table_for_projection["date"]) > pd.Timestamp(training_end)
+    ].copy().sort_values("date")
+    if not projected_turns.empty and "valuation_multiple" in projected_turns.columns:
         projected_turns["Change from prior turn"] = np.where(
             projected_turns["phase_start_price_usd"].notna(),
             projected_turns["knot_price_usd"] / projected_turns["phase_start_price_usd"] - 1.0,
             np.nan,
         )
-        st.markdown("**Projected turning-point chain**")
+        st.markdown("**Projected fair-value turning points**")
         st.dataframe(
             projected_turns[[
-                "date", "type", "cycle", "phase_start_date", "phase_start_price_usd",
-                "knot_price_usd", "Change from prior turn", "transition_log_move",
-                "transition_model_source", "source",
+                "date", "type", "cycle", "structural_centerline_usd",
+                "projected_valuation_multiple_before_guardrails", "valuation_candidate_price_usd",
+                "valuation_multiple", "knot_price_usd", "Change from prior turn",
+                "expected_transition_log_move", "implied_transition_log_move",
+                "guardrail_applied", "guardrail_reason",
             ]].style.format({
                 "cycle": "{:.0f}",
-                "phase_start_price_usd": "${:,.0f}",
+                "structural_centerline_usd": "${:,.0f}",
+                "projected_valuation_multiple_before_guardrails": "{:.3f}×",
+                "valuation_candidate_price_usd": "${:,.0f}",
+                "valuation_multiple": "{:.3f}×",
                 "knot_price_usd": "${:,.0f}",
                 "Change from prior turn": "{:+.1%}",
-                "transition_log_move": "{:.4f}",
+                "expected_transition_log_move": "{:.4f}",
+                "implied_transition_log_move": "{:.4f}",
             }, na_rep="—"),
             hide_index=True,
             use_container_width=True,
@@ -784,8 +823,8 @@ if backtest_turns is not None and not backtest_turns.empty:
     st.markdown("**Known-outcome turning-point backtest**")
     st.caption(
         "When your fake training cutoff is before a historical turning point whose actual price is now known, "
-        "this compares the sequential forecast with that later outcome. Those later prices are diagnostics only "
-        "and are never used to fit the selected historical cutoff."
+        "this compares the fair-value valuation forecast with that later outcome. Those later prices are diagnostics "
+        "only and are never used to fit the selected historical cutoff."
     )
     st.dataframe(
         backtest_turns.style.format({
@@ -799,12 +838,6 @@ if backtest_turns is not None and not backtest_turns.empty:
         use_container_width=True,
     )
 
-st.subheader("Structural backbone integrity")
-b1, b2, b3 = st.columns(3)
-b1.metric("Structural centerline", "LOCKED")
-b2.metric("Future centerline scale", "1.000×")
-b3.metric("Cycle rules can move centerline", "NO")
-st.success("Structural backbone: PASS — sequential cycle-transition calculations do not alter the structural centerline.")
 st.caption(
     f"Empirical phase-shape dataset starts at {diag.get('phase_shape_training_start', '—')} and is independent "
     f"of the structural start date: {bool(diag.get('phase_shape_training_independent_of_structural_start', False))}."

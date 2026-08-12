@@ -32,48 +32,50 @@ def make_prices(future_peak_override=None):
 
 prices = make_prices()
 cutoff = pd.Timestamp("2025-10-06")
-result = fit_price_model(prices, SCHEDULED_CYCLE_START, cutoff, 10)
+start = pd.Timestamp("2015-01-14")
+result = fit_price_model(prices, start, cutoff, 10)
 diag = result.diagnostics
 
-# The exact failure that motivated v3.4: after ending at the 2025 peak, the
-# next trough must be generated from the peak->trough transition model, not from
-# centerline +/- amplitude.
+assert diag["future_endpoints_centerline_generated"] is True
+assert not diag["cycle_valuation_history"].empty
+assert diag["peak_valuation_model"]["observations"] >= 3
+assert diag["trough_valuation_model"]["observations"] >= 3
+
 future = diag["cycle_anchor_table"]
 future = future[future["date"] > cutoff].sort_values("date")
 trough_2026 = future[(future["date"] == pd.Timestamp("2026-10-05")) & (future["type"] == "trough")].iloc[0]
-assert "projected sequential bear transition" in trough_2026["source"]
-assert abs(float(trough_2026["phase_start_price_usd"]) / 124_828.0 - 1.0) < 1e-12
-assert float(trough_2026["knot_price_usd"]) < 124_828.0
-
-bear_model = diag["bear_transition_model"]
-expected_bear_move = float(bear_model["latest_log_move"]) * float(bear_model["retention_per_cycle"])
-expected_trough = 124_828.0 * np.exp(-expected_bear_move)
-assert abs(float(trough_2026["knot_price_usd"]) / expected_trough - 1.0) < 1e-12
-
-# The next peak must chain from that projected trough, and the next trough must
-# chain from that projected peak.
 peak_2029 = future[(future["date"] == pd.Timestamp("2029-09-03")) & (future["type"] == "peak")].iloc[0]
 trough_2030 = future[(future["date"] == pd.Timestamp("2030-09-02")) & (future["type"] == "trough")].iloc[0]
-assert abs(float(peak_2029["phase_start_price_usd"]) / float(trough_2026["knot_price_usd"]) - 1.0) < 1e-12
-assert abs(float(trough_2030["phase_start_price_usd"]) / float(peak_2029["knot_price_usd"]) - 1.0) < 1e-12
-assert float(peak_2029["knot_price_usd"]) > float(trough_2026["knot_price_usd"])
-assert float(trough_2030["knot_price_usd"]) < float(peak_2029["knot_price_usd"])
+trough_2034 = future[(future["date"] == pd.Timestamp("2034-07-31")) & (future["type"] == "trough")].iloc[0]
 
-# Centerline is a reference only: changing the supplied future centerline by a
-# large factor must not change sequential turning-point prices.
-train = prices[(prices["date"] >= SCHEDULED_CYCLE_START) & (prices["date"] <= cutoff)].copy()
+# The screenshot failure is repaired by attaching the next trough to fair value
+# through the learned trough multiple, not by keeping it near the preceding peak.
+assert float(trough_2026["knot_price_usd"]) < 124_828.0
+assert float(trough_2026["valuation_multiple"]) < 1.0
+assert float(peak_2029["valuation_multiple"]) > 1.0
+assert float(trough_2030["valuation_multiple"]) < 1.0
+
+# Rising structural fair value + non-expanding trough discount must produce
+# rising cycle lows rather than the downward staircase exposed in v3.4.
+assert float(trough_2030["knot_price_usd"]) > float(trough_2026["knot_price_usd"])
+assert float(trough_2034["knot_price_usd"]) > float(trough_2030["knot_price_usd"])
+
+# Centerline is economically connected again. Scale FUTURE centerline only;
+# historical valuation learning stays identical, and future endpoints move.
+train = prices[(prices["date"] >= start) & (prices["date"] <= cutoff)].copy()
 future_dates = pd.date_range(cutoff + pd.Timedelta(days=1), pd.Timestamp("2030-09-02"), freq="D")
 centerline, _ = _fit_centerline(train, future_dates)
 all_dates = pd.DatetimeIndex(train["date"].tolist() + future_dates.tolist())
-fit_a = _build_cycle_fit(prices, train, all_dates, centerline, SCHEDULED_CYCLE_START, cutoff)
-fit_b = _build_cycle_fit(prices, train, all_dates, centerline * 3.0, SCHEDULED_CYCLE_START, cutoff)
-knots_a = fit_a[3]
-knots_b = fit_b[3]
-fa = knots_a[knots_a["source"].astype(str).str.contains("projected sequential", na=False)][["date", "knot_price_usd"]]
-fb = knots_b[knots_b["source"].astype(str).str.contains("projected sequential", na=False)][["date", "knot_price_usd"]]
-merged = fa.merge(fb, on="date", suffixes=("_a", "_b"))
-assert not merged.empty
-assert np.allclose(merged["knot_price_usd_a"], merged["knot_price_usd_b"], rtol=1e-12, atol=1e-9)
+scaled = centerline.copy()
+scaled[len(train):] *= 1.25
+fit_a = _build_cycle_fit(prices, train, all_dates, centerline, start, cutoff)
+fit_b = _build_cycle_fit(prices, train, all_dates, scaled, start, cutoff)
+ka = fit_a[3]
+kb = fit_b[3]
+a = ka[(ka["date"] == pd.Timestamp("2026-10-05")) & (ka["type"] == "trough")].iloc[0]
+b = kb[(kb["date"] == pd.Timestamp("2026-10-05")) & (kb["type"] == "trough")].iloc[0]
+assert float(b["knot_price_usd"]) > float(a["knot_price_usd"])
+assert abs(float(b["projected_valuation_multiple_before_guardrails"]) - float(a["projected_valuation_multiple_before_guardrails"])) < 1e-12
 
 # No future-price leakage: changing the 2025 actual price after a 2022 fake
 # cutoff changes the diagnostic actual outcome, but not the forecast produced at
@@ -87,4 +89,4 @@ changed_peak = changed.diagnostics["cycle_anchor_table"]
 changed_peak = changed_peak[(changed_peak["date"] == pd.Timestamp("2025-10-06")) & (changed_peak["type"] == "peak")].iloc[0]
 assert abs(float(base_peak["knot_price_usd"]) / float(changed_peak["knot_price_usd"]) - 1.0) < 1e-12
 
-print("Sequential turning-point endpoint, centerline-independence, and no-lookahead checks passed.")
+print("Fair-value endpoint, rising-low, centerline-linkage, and no-lookahead checks passed.")
