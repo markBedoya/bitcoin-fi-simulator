@@ -226,7 +226,7 @@ def build_model_diagnostics(
     prices: pd.DataFrame,
     fits_df: pd.DataFrame,
     weighted_fit: dict,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Return the compact diagnostics used to learn the mature-cycle geometry.
 
     October 2025 is treated as the confirmed current-cycle peak.  The latest
@@ -668,6 +668,79 @@ def build_model_diagnostics(
             })
     backbone_sensitivity = pd.DataFrame(backbone_sensitivity_rows)
 
+    # Test a decay mechanism tied to observed model recalibration rather than an
+    # arbitrary terminal retention. The completed-history exponent is compared
+    # with the progress-weighted exponent. Paths are integrated piecewise in
+    # log-time so exponent changes never create price discontinuities.
+    completed_exponent = float(
+        expanding.loc[expanding["fit_id"] == "cycles_0_2", "slope"].iloc[0]
+    )
+    raw_exponent_retention = float(weighted_fit["slope"]) / completed_exponent
+    recent_exponent_retention = float(np.clip(raw_exponent_retention, 0.0, 1.0))
+    recursive_rows = []
+    recursive_paths = [
+        ("learned_exponent_hold", "hold current learned exponent"),
+        ("one_time_recalibration_then_hold", "apply observed retention once, then hold"),
+        ("repeat_observed_recalibration", "repeat observed retention once per future cycle"),
+    ]
+
+    def recursive_backbone_at(target_date: pd.Timestamp, path_name: str) -> tuple[float, float, int]:
+        target_date = pd.Timestamp(target_date)
+        price_level = live_centerline
+        segment_start = latest_date
+        cycle_number = 0
+        active_exponent = float(weighted_fit["slope"])
+        boundaries = [next_cycle_start]
+        for boundary_number in range(1, future_cycle_count + 1):
+            boundaries.append(
+                next_cycle_start
+                + pd.Timedelta(days=boundary_number * int(weighted_fit["expected_cycle_days"]))
+            )
+        for boundary in boundaries:
+            segment_end = min(target_date, boundary)
+            if segment_end > segment_start:
+                start_days = float((segment_start - GENESIS).days)
+                end_days = float((segment_end - GENESIS).days)
+                price_level *= (end_days / start_days) ** active_exponent
+                segment_start = segment_end
+            if target_date <= boundary:
+                break
+            cycle_number += 1
+            if path_name == "one_time_recalibration_then_hold":
+                active_exponent = float(weighted_fit["slope"]) * recent_exponent_retention
+            elif path_name == "repeat_observed_recalibration":
+                active_exponent = float(weighted_fit["slope"]) * recent_exponent_retention ** cycle_number
+        return price_level, active_exponent, cycle_number
+
+    for path_name, path_role in recursive_paths:
+        for anchor_date in anchor_dates:
+            anchor_date = pd.Timestamp(anchor_date)
+            projected_backbone, active_exponent, cycle_number = recursive_backbone_at(
+                anchor_date, path_name
+            )
+            years_from_live = (anchor_date - latest_date).days / 365.2425
+            recursive_rows.append({
+                "recursive_path": path_name,
+                "anchor_type": "peak" if anchor_date in peak_dates_set else "trough",
+                "anchor_date": anchor_date,
+                "future_cycle": cycle_number,
+                "completed_history_exponent": completed_exponent,
+                "current_weighted_exponent": float(weighted_fit["slope"]),
+                "raw_exponent_retention": raw_exponent_retention,
+                "observed_exponent_retention": recent_exponent_retention,
+                "active_segment_exponent": active_exponent,
+                "projected_backbone_usd": projected_backbone,
+                "cagr_from_live_actual_pct": (
+                    (projected_backbone / latest_price) ** (1.0 / years_from_live) - 1.0
+                ),
+                "cagr_from_live_centerline_pct": (
+                    (projected_backbone / live_centerline) ** (1.0 / years_from_live) - 1.0
+                ),
+                "continuity_rule": "piecewise log-time integration; no boundary reset",
+                "path_role": path_role,
+            })
+    recursive_exponent_candidates = pd.DataFrame(recursive_rows)
+
     return (
         expanding,
         deviations,
@@ -680,6 +753,7 @@ def build_model_diagnostics(
         floor_sensitivity,
         multi_cycle_stress_test,
         backbone_sensitivity,
+        recursive_exponent_candidates,
     )
 
 

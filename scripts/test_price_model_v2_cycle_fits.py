@@ -26,7 +26,7 @@ def main():
     fits, curves = fit_cycle_combo_centerlines(prices)
     comparison, spread = build_common_date_comparison(fits, prices)
     weighted, weighted_curve = fit_progress_weighted_backbone(prices)
-    expanding, deviations, geometry, floor, maturity, candidates, price_scenarios, timing, floor_sensitivity, multi_cycle, backbone_sensitivity = build_model_diagnostics(prices, fits, weighted)
+    expanding, deviations, geometry, floor, maturity, candidates, price_scenarios, timing, floor_sensitivity, multi_cycle, backbone_sensitivity, recursive_exponents = build_model_diagnostics(prices, fits, weighted)
 
     assert len(fits) == 9, f"Expected 9 fits, got {len(fits)}"
     assert not curves.empty, "Expected non-empty curve output"
@@ -131,6 +131,22 @@ def main():
         backbone_sensitivity['anchor_date'] == backbone_sensitivity['anchor_date'].max()
     ].sort_values('exponent_retention')
     assert terminal['projected_backbone_usd'].is_monotonic_increasing
+    assert set(recursive_exponents['recursive_path']) == {
+        'learned_exponent_hold',
+        'one_time_recalibration_then_hold',
+        'repeat_observed_recalibration',
+    }
+    assert len(recursive_exponents) == 30
+    assert recursive_exponents['observed_exponent_retention'].between(0, 1).all()
+    assert recursive_exponents['projected_backbone_usd'].gt(0).all()
+    recursive_terminal = recursive_exponents[
+        recursive_exponents['anchor_date'] == recursive_exponents['anchor_date'].max()
+    ].set_index('recursive_path')['projected_backbone_usd']
+    assert recursive_terminal['repeat_observed_recalibration'] <= recursive_terminal['one_time_recalibration_then_hold']
+    assert recursive_terminal['one_time_recalibration_then_hold'] <= recursive_terminal['learned_exponent_hold']
+    assert recursive_exponents['continuity_rule'].eq(
+        'piecewise log-time integration; no boundary reset'
+    ).all()
 
     print('PASS: Price Model v2 expanded cycle fit outputs look valid.')
 

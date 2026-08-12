@@ -35,6 +35,7 @@ weighted_fit, weighted_curve = fit_progress_weighted_backbone(prices)
     floor_sensitivity_df,
     multi_cycle_stress_test_df,
     backbone_sensitivity_df,
+    recursive_exponent_candidates_df,
 ) = build_model_diagnostics(
     prices, fits_df, weighted_fit
 )
@@ -240,6 +241,26 @@ st.dataframe(
     hide_index=True,
 )
 
+st.subheader("Recursive exponent candidates")
+st.caption(
+    "These paths use the observed completed-history to progress-weighted slope retention. Piecewise log-time "
+    "integration preserves continuity when an exponent changes at a future cycle boundary."
+)
+st.dataframe(
+    recursive_exponent_candidates_df.style.format({
+        "completed_history_exponent": "{:.3f}",
+        "current_weighted_exponent": "{:.3f}",
+        "raw_exponent_retention": "{:.2%}",
+        "observed_exponent_retention": "{:.2%}",
+        "active_segment_exponent": "{:.3f}",
+        "projected_backbone_usd": "${:,.0f}",
+        "cagr_from_live_actual_pct": "{:.1%}",
+        "cagr_from_live_centerline_pct": "{:.1%}",
+    }),
+    use_container_width=True,
+    hide_index=True,
+)
+
 st.subheader("Next-cycle price envelope")
 st.caption(
     "The two valid boundary structures are multiplied by the progress-weighted backbone at the historically timed "
@@ -377,5 +398,7 @@ copy_text = (
     + multi_cycle_stress_test_df.to_csv(index=False, sep="\t")
     + "\nFORWARD-BACKBONE SENSITIVITY\n"
     + backbone_sensitivity_df.to_csv(index=False, sep="\t")
+    + "\nRECURSIVE EXPONENT CANDIDATES\n"
+    + recursive_exponent_candidates_df.to_csv(index=False, sep="\t")
 )
 st.code(copy_text, language="text")
