@@ -26,7 +26,7 @@ def main():
     fits, curves = fit_cycle_combo_centerlines(prices)
     comparison, spread = build_common_date_comparison(fits, prices)
     weighted, weighted_curve = fit_progress_weighted_backbone(prices)
-    expanding, deviations, geometry, floor, maturity, candidates = build_model_diagnostics(prices, fits, weighted)
+    expanding, deviations, geometry, floor, maturity, candidates, price_scenarios = build_model_diagnostics(prices, fits, weighted)
 
     assert len(fits) == 9, f"Expected 9 fits, got {len(fits)}"
     assert not curves.empty, "Expected non-empty curve output"
@@ -79,6 +79,15 @@ def main():
         'next_peak_multiple',
     ].iloc[0] >= 1.0
     assert candidates['current_cycle_is_partial'].all()
+    assert list(price_scenarios['scenario']) == [
+        'bounded_convergence_lower', 'geometric_midpoint', 'regime_hold_upper'
+    ]
+    assert (price_scenarios['projected_peak_usd'] > 0).all()
+    assert (price_scenarios['projected_trough_usd'] > 0).all()
+    assert price_scenarios['projected_peak_date'].nunique() == 1
+    assert price_scenarios['projected_trough_date'].nunique() == 1
+    assert price_scenarios.iloc[0]['peak_multiple'] < price_scenarios.iloc[-1]['peak_multiple']
+    assert price_scenarios.iloc[1]['scenario_role'] == 'planning midpoint; not independently fitted'
 
     print('PASS: Price Model v2 expanded cycle fit outputs look valid.')
 

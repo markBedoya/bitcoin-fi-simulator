@@ -24,6 +24,9 @@ This update:
 - compares a one-cycle regime hold with bounded convergence toward the centerline;
 - rejects an unbounded amplitude trend when it predicts a future peak below the centerline;
 - adds a compact tab-separated copy/paste results block;
+- converts only structurally valid envelope candidates into a next-cycle dollar range;
+- learns next-peak timing from the median completed trough-to-peak offset;
+- labels the geometric midpoint as planning math rather than a third fitted model;
 
 Delete `app_pages/2a_Price_Model_v2.py` from the GitHub repository if it still exists. The active page is `app_pages/5_Price_Model_v2.py`.
 # Forward structure diagnostics
@@ -37,3 +40,10 @@ cycle peak below the 1.0x centerline.
 The current cycle remains partial. These rows test the shape of the future
 envelope; they do not yet select a production projection or publish dollar
 price forecasts.
+
+# Next-cycle price envelope
+
+The compact export now also includes `NEXT-CYCLE PRICE ENVELOPE`. It evaluates
+the bounded-convergence and regime-hold multipliers against the weighted
+backbone on the historically timed next peak date. The rejected unbounded model
+is intentionally excluded from dollar projections.

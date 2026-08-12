@@ -30,6 +30,7 @@ weighted_fit, weighted_curve = fit_progress_weighted_backbone(prices)
     floor_assessment_df,
     maturity_transition_df,
     forward_candidates_df,
+    forward_price_scenarios_df,
 ) = build_model_diagnostics(
     prices, fits_df, weighted_fit
 )
@@ -199,6 +200,24 @@ st.dataframe(
     hide_index=True,
 )
 
+st.subheader("Next-cycle price envelope")
+st.caption(
+    "The two valid boundary structures are multiplied by the progress-weighted backbone at the historically timed "
+    "next peak. The midpoint is only a planning reference; it is not a separately fitted model."
+)
+st.dataframe(
+    forward_price_scenarios_df.style.format({
+        "peak_backbone_usd": "${:,.0f}",
+        "peak_multiple": "{:.3f}×",
+        "projected_peak_usd": "${:,.0f}",
+        "trough_backbone_usd": "${:,.0f}",
+        "trough_multiple": "{:.3f}×",
+        "projected_trough_usd": "${:,.0f}",
+    }),
+    use_container_width=True,
+    hide_index=True,
+)
+
 st.subheader("Forward structure tests")
 st.caption(
     "These are boundary-shape tests, not price forecasts. The model keeps the downside floor separate from "
@@ -281,5 +300,7 @@ copy_text = (
     + maturity_transition_df.to_csv(index=False, sep="\t")
     + "\nFORWARD STRUCTURE CANDIDATES\n"
     + forward_candidates_df.to_csv(index=False, sep="\t")
+    + "\nNEXT-CYCLE PRICE ENVELOPE\n"
+    + forward_price_scenarios_df.to_csv(index=False, sep="\t")
 )
 st.code(copy_text, language="text")

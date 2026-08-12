@@ -226,7 +226,7 @@ def build_model_diagnostics(
     prices: pd.DataFrame,
     fits_df: pd.DataFrame,
     weighted_fit: dict,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Return the compact diagnostics used to learn the mature-cycle geometry.
 
     October 2025 is treated as the confirmed current-cycle peak.  The latest
@@ -407,6 +407,79 @@ def build_model_diagnostics(
     forward_candidates["recent_peak_excess_retention"] = recent_excess_retention
     forward_candidates["current_cycle_is_partial"] = True
 
+    # Translate only the structurally valid envelope candidates into a single
+    # forward cycle. Timing is learned separately from completed-cycle geometry:
+    # the next peak occurs at the historical median trough-to-peak offset, not at
+    # the estimated cycle boundary. The midpoint is descriptive scenario math,
+    # not a third fitted law.
+    peak_offsets = np.array(
+        [(cycle["peak"] - cycle["start"]).days for cycle in COMPLETE_CYCLES],
+        dtype=float,
+    )
+    next_cycle_start = pd.Timestamp(weighted_fit["estimated_cycle_end"])
+    median_peak_offset_days = int(round(float(np.median(peak_offsets))))
+    next_peak_date = next_cycle_start + pd.Timedelta(days=median_peak_offset_days)
+    next_trough_date = next_cycle_start + pd.Timedelta(days=int(weighted_fit["expected_cycle_days"]))
+
+    def backbone_at(date: pd.Timestamp) -> float:
+        model_days = float((date - GENESIS).days)
+        return float(np.exp(float(weighted_fit["intercept"]) + float(weighted_fit["slope"]) * np.log(model_days)))
+
+    peak_backbone = backbone_at(next_peak_date)
+    trough_backbone = backbone_at(next_trough_date)
+    valid = forward_candidates[forward_candidates["structurally_valid"]].copy()
+    lower_peak_multiple = float(valid["next_peak_multiple"].min())
+    upper_peak_multiple = float(valid["next_peak_multiple"].max())
+    midpoint_peak_multiple = float(np.sqrt(lower_peak_multiple * upper_peak_multiple))
+    projected_floor_multiple = robust_floor
+    forward_price_scenarios = pd.DataFrame([
+        {
+            "scenario": "bounded_convergence_lower",
+            "next_cycle_start": next_cycle_start,
+            "projected_peak_date": next_peak_date,
+            "peak_timing_basis": "median completed trough-to-peak offset",
+            "peak_offset_days": median_peak_offset_days,
+            "peak_backbone_usd": peak_backbone,
+            "peak_multiple": lower_peak_multiple,
+            "projected_peak_usd": peak_backbone * lower_peak_multiple,
+            "projected_trough_date": next_trough_date,
+            "trough_backbone_usd": trough_backbone,
+            "trough_multiple": projected_floor_multiple,
+            "projected_trough_usd": trough_backbone * projected_floor_multiple,
+            "scenario_role": "lower boundary",
+        },
+        {
+            "scenario": "geometric_midpoint",
+            "next_cycle_start": next_cycle_start,
+            "projected_peak_date": next_peak_date,
+            "peak_timing_basis": "median completed trough-to-peak offset",
+            "peak_offset_days": median_peak_offset_days,
+            "peak_backbone_usd": peak_backbone,
+            "peak_multiple": midpoint_peak_multiple,
+            "projected_peak_usd": peak_backbone * midpoint_peak_multiple,
+            "projected_trough_date": next_trough_date,
+            "trough_backbone_usd": trough_backbone,
+            "trough_multiple": projected_floor_multiple,
+            "projected_trough_usd": trough_backbone * projected_floor_multiple,
+            "scenario_role": "planning midpoint; not independently fitted",
+        },
+        {
+            "scenario": "regime_hold_upper",
+            "next_cycle_start": next_cycle_start,
+            "projected_peak_date": next_peak_date,
+            "peak_timing_basis": "median completed trough-to-peak offset",
+            "peak_offset_days": median_peak_offset_days,
+            "peak_backbone_usd": peak_backbone,
+            "peak_multiple": upper_peak_multiple,
+            "projected_peak_usd": peak_backbone * upper_peak_multiple,
+            "projected_trough_date": next_trough_date,
+            "trough_backbone_usd": trough_backbone,
+            "trough_multiple": projected_floor_multiple,
+            "projected_trough_usd": trough_backbone * projected_floor_multiple,
+            "scenario_role": "upper boundary",
+        },
+    ])
+
     return (
         expanding,
         deviations,
@@ -414,6 +487,7 @@ def build_model_diagnostics(
         floor_assessment,
         maturity_transition,
         forward_candidates,
+        forward_price_scenarios,
     )
 
 
