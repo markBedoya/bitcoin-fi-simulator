@@ -23,7 +23,7 @@ except Exception as exc:
 anchor_df = get_cycle_anchor_df(prices)
 fits_df, curves_df = fit_cycle_combo_centerlines(prices)
 weighted_fit, weighted_curve = fit_progress_weighted_backbone(prices)
-expanding_df, deviations_df, cycle_geometry_df, floor_assessment_df = build_model_diagnostics(
+expanding_df, deviations_df, cycle_geometry_df, floor_assessment_df, maturity_transition_df = build_model_diagnostics(
     prices, fits_df, weighted_fit
 )
 
@@ -61,7 +61,8 @@ col4.metric("Live ÷ centerline", f"{weighted_fit['live_actual_to_centerline']:.
 floor = floor_assessment_df.iloc[0]
 st.info(
     f"October 6, 2025 is treated as the confirmed cycle peak. The current ${floor['current_price_usd']:,.0f} area is treated "
-    f"as a forming bottom with about {int(floor['remaining_expected_days'])} days left in the expected cycle. It is "
+    f"as the lowest observed post-peak price (on {floor['forming_trough_date'].date()}) and the forming bottom, with about "
+    f"{int(floor['remaining_expected_days'])} days left in the expected cycle. It is "
     f"{floor['current_multiple']:.3f}× the weighted backbone versus a {floor['mature_completed_trough_median']:.3f}× median "
     "for the completed 2015, 2018, and 2022 troughs. The current observation remains partial evidence until the cycle closes."
 )
@@ -205,6 +206,29 @@ st.dataframe(
         "trough_multiple": "{:.3f}×",
         "peak_to_trough_multiple_ratio": "{:.2f}×",
         "log_peak_to_trough_amplitude": "{:.3f}",
+        "peak_compression_vs_prior": "{:.1%}",
+        "amplitude_change_vs_prior": "{:.3f}",
+    }),
+    use_container_width=True,
+    hide_index=True,
+)
+
+st.subheader("Maturity transition")
+st.caption("Separates the downward backbone recalibration from the much larger collapse in peak strength.")
+st.dataframe(
+    maturity_transition_df.style.format({
+        "early_peak_median_cycles_0_1": "{:.3f}×",
+        "cycle_2_peak_multiple": "{:.3f}×",
+        "cycle_3_peak_multiple": "{:.3f}×",
+        "cycle_2_vs_early_peak_pct": "{:.1%}",
+        "cycle_3_vs_early_peak_pct": "{:.1%}",
+        "cycle_3_vs_cycle_2_peak_pct": "{:.1%}",
+        "completed_trough_min": "{:.3f}×",
+        "completed_trough_max": "{:.3f}×",
+        "forming_trough_multiple": "{:.3f}×",
+        "completed_cycle_backbone_live_usd": "${:,.0f}",
+        "weighted_backbone_live_usd": "${:,.0f}",
+        "backbone_recalibration_pct": "{:.1%}",
     }),
     use_container_width=True,
     hide_index=True,
@@ -228,5 +252,7 @@ copy_text = (
     + cycle_geometry_df.to_csv(index=False, sep="\t")
     + "\nFORMING-BOTTOM ASSESSMENT\n"
     + floor_assessment_df.to_csv(index=False, sep="\t")
+    + "\nMATURITY-TRANSITION SUMMARY\n"
+    + maturity_transition_df.to_csv(index=False, sep="\t")
 )
 st.code(copy_text, language="text")

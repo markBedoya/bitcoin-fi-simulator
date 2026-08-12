@@ -2,6 +2,13 @@
 
 Replace the matching repository files with the files in this package.
 
+The ZIP preserves the repository paths:
+
+- `app_pages/5_Price_Model_v2.py`
+- `src/price_model_v2.py`
+- `scripts/test_price_model_v2_cycle_fits.py`
+- `scripts/test_navigation_routes.py`
+
 This update:
 
 - reduces Price Model V2 to the useful chart and diagnostics;
@@ -12,6 +19,9 @@ This update:
 - measures peak compression separately from the mature-cycle trough floor;
 - shows how close the forming bottom is to the median 2015/2018/2022 trough multiple;
 - keeps the forming trough partial until the expected cycle closes;
+- preserves the lowest observed post-peak price as the forming trough even if price rebounds;
+- measures the backbone's downward recalibration separately from peak compression;
+- adds a compact maturity-transition summary instead of prematurely fitting a four-point forward curve;
 - adds a compact tab-separated copy/paste results block;
 - fixes the Price Model V2 navigation route test.
 
