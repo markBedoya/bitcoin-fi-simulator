@@ -168,6 +168,25 @@ def main():
     assert len(cycle_start_rows) == 3
     assert cycle_start_rows['left_anchor_type'].eq('live actual').all()
     assert cycle_start_rows['right_anchor_type'].eq('cycle-start floor').all()
+    expected_cycle_start_multipliers = {
+        'conservative': floor_sensitivity.loc[
+            floor_sensitivity['floor_path'] == 'conservative_forming_floor_hold',
+            'trough_multiple',
+        ].iloc[0],
+        'central': floor_sensitivity.loc[
+            floor_sensitivity['floor_path'] == 'robust_partial_completed_blend',
+            'trough_multiple',
+        ].iloc[0],
+        'upper': floor_sensitivity.loc[
+            floor_sensitivity['floor_path'] == 'robust_partial_completed_blend',
+            'trough_multiple',
+        ].iloc[0],
+    }
+    actual_cycle_start_multipliers = cycle_start_rows.set_index('scenario')['cycle_multiplier']
+    for scenario, expected_multiplier in expected_cycle_start_multipliers.items():
+        assert np.isclose(
+            actual_cycle_start_multipliers.loc[scenario], expected_multiplier
+        ), (scenario, actual_cycle_start_multipliers.loc[scenario], expected_multiplier)
 
     print('PASS: Price Model v2 expanded cycle fit outputs look valid.')
 
