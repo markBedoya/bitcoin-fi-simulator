@@ -226,7 +226,7 @@ def build_model_diagnostics(
     prices: pd.DataFrame,
     fits_df: pd.DataFrame,
     weighted_fit: dict,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Return the compact diagnostics used to learn the mature-cycle geometry.
 
     October 2025 is treated as the confirmed current-cycle peak.  The latest
@@ -517,6 +517,57 @@ def build_model_diagnostics(
         - 1.0
     )
 
+    # Keep floor uncertainty separate from peak uncertainty. These three levels
+    # are all observed-data summaries, not newly fitted decay laws: the partial
+    # forming low, the robust partial/completed blend, and the completed mature
+    # trough median. This makes the sensitivity explicit before extending the
+    # envelope across many future cycles.
+    current_peak_price = float(
+        deviations.loc[deviations["label"] == "2025 peak", "price_usd"].iloc[0]
+    )
+    floor_sensitivity = pd.DataFrame([
+        {
+            "floor_path": "conservative_forming_floor_hold",
+            "trough_multiple": forming_floor,
+            "evidence_basis": "partial June 2026 forming trough",
+            "projected_trough_date": next_trough_date,
+            "projected_trough_usd": trough_backbone * forming_floor,
+            "assumption_role": "lower floor boundary",
+        },
+        {
+            "floor_path": "robust_partial_completed_blend",
+            "trough_multiple": robust_floor,
+            "evidence_basis": "median of partial floor and completed mature median",
+            "projected_trough_date": next_trough_date,
+            "projected_trough_usd": trough_backbone * robust_floor,
+            "assumption_role": "baseline floor",
+        },
+        {
+            "floor_path": "completed_mature_median",
+            "trough_multiple": mature_floor,
+            "evidence_basis": "median completed 2015, 2018, and 2022 troughs",
+            "projected_trough_date": next_trough_date,
+            "projected_trough_usd": trough_backbone * mature_floor,
+            "assumption_role": "gently rising floor boundary",
+        },
+    ])
+    lower_peak_usd = peak_backbone * lower_peak_multiple
+    upper_peak_usd = peak_backbone * upper_peak_multiple
+    floor_sensitivity["drawdown_from_lower_peak_pct"] = (
+        floor_sensitivity["projected_trough_usd"] / lower_peak_usd - 1.0
+    )
+    floor_sensitivity["drawdown_from_upper_peak_pct"] = (
+        floor_sensitivity["projected_trough_usd"] / upper_peak_usd - 1.0
+    )
+    floor_sensitivity["trough_above_current_peak_pct"] = (
+        floor_sensitivity["projected_trough_usd"] / current_peak_price - 1.0
+    )
+    floor_sensitivity["trough_range_span_pct"] = (
+        floor_sensitivity["projected_trough_usd"].max()
+        / floor_sensitivity["projected_trough_usd"].min()
+        - 1.0
+    )
+
     return (
         expanding,
         deviations,
@@ -526,6 +577,7 @@ def build_model_diagnostics(
         forward_candidates,
         forward_price_scenarios,
         timing_stability,
+        floor_sensitivity,
     )
 
 

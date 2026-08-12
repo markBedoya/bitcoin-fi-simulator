@@ -26,7 +26,7 @@ def main():
     fits, curves = fit_cycle_combo_centerlines(prices)
     comparison, spread = build_common_date_comparison(fits, prices)
     weighted, weighted_curve = fit_progress_weighted_backbone(prices)
-    expanding, deviations, geometry, floor, maturity, candidates, price_scenarios, timing = build_model_diagnostics(prices, fits, weighted)
+    expanding, deviations, geometry, floor, maturity, candidates, price_scenarios, timing, floor_sensitivity = build_model_diagnostics(prices, fits, weighted)
 
     assert len(fits) == 9, f"Expected 9 fits, got {len(fits)}"
     assert not curves.empty, "Expected non-empty curve output"
@@ -93,6 +93,14 @@ def main():
     assert timing.iloc[0]['peak_timing_range_days'] <= 14
     assert timing.iloc[0]['decline_timing_range_days'] <= 14
     assert timing.iloc[0]['timing_read'] == 'historical cycle timing is unusually stable'
+    assert list(floor_sensitivity['floor_path']) == [
+        'conservative_forming_floor_hold',
+        'robust_partial_completed_blend',
+        'completed_mature_median',
+    ]
+    assert floor_sensitivity['projected_trough_usd'].is_monotonic_increasing
+    assert np.isfinite(floor_sensitivity['drawdown_from_upper_peak_pct']).all()
+    assert floor_sensitivity['trough_range_span_pct'].nunique() == 1
 
     print('PASS: Price Model v2 expanded cycle fit outputs look valid.')
 

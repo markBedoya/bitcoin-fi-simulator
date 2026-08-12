@@ -32,6 +32,7 @@ weighted_fit, weighted_curve = fit_progress_weighted_backbone(prices)
     forward_candidates_df,
     forward_price_scenarios_df,
     timing_stability_df,
+    floor_sensitivity_df,
 ) = build_model_diagnostics(
     prices, fits_df, weighted_fit
 )
@@ -228,6 +229,24 @@ st.caption(
 )
 st.dataframe(timing_stability_df, use_container_width=True, hide_index=True)
 
+st.subheader("Future trough-floor sensitivity")
+st.caption(
+    "The 2030 trough is recalculated at three evidence-backed floor levels. This isolates downside-floor uncertainty "
+    "from the already-stable timing and from the separate peak-multiplier scenarios."
+)
+st.dataframe(
+    floor_sensitivity_df.style.format({
+        "trough_multiple": "{:.3f}×",
+        "projected_trough_usd": "${:,.0f}",
+        "drawdown_from_lower_peak_pct": "{:.1%}",
+        "drawdown_from_upper_peak_pct": "{:.1%}",
+        "trough_above_current_peak_pct": "{:.1%}",
+        "trough_range_span_pct": "{:.1%}",
+    }),
+    use_container_width=True,
+    hide_index=True,
+)
+
 st.subheader("Forward structure tests")
 st.caption(
     "These are boundary-shape tests, not price forecasts. The model keeps the downside floor separate from "
@@ -314,5 +333,7 @@ copy_text = (
     + forward_price_scenarios_df.to_csv(index=False, sep="\t")
     + "\nCYCLE TIMING STABILITY\n"
     + timing_stability_df.to_csv(index=False, sep="\t")
+    + "\nFUTURE TROUGH-FLOOR SENSITIVITY\n"
+    + floor_sensitivity_df.to_csv(index=False, sep="\t")
 )
 st.code(copy_text, language="text")
