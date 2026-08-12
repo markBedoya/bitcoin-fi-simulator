@@ -293,7 +293,8 @@ st.plotly_chart(projection_fig, use_container_width=True)
 
 projection_anchor_summary_df = continuous_projection_df[
     continuous_projection_df["date"].isin(
-        recursive_exponent_candidates_df["anchor_date"].unique()
+        list(recursive_exponent_candidates_df["anchor_date"].unique())
+        + [pd.Timestamp(weighted_fit["estimated_cycle_end"])]
     )
 ].copy()
 st.dataframe(

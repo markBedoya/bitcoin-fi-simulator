@@ -787,6 +787,16 @@ def build_model_diagnostics(
             "multiple": latest_price / live_centerline,
             "anchor_type": "live actual",
         }]
+        first_cycle_selection = multi_cycle_stress_test[
+            (multi_cycle_stress_test["horizon_cycle"] == 1)
+            & (multi_cycle_stress_test["peak_path"] == spec["peak_path"])
+            & (multi_cycle_stress_test["floor_path"] == spec["floor_path"])
+        ].iloc[0]
+        anchors_for_scenario.append({
+            "date": next_cycle_start,
+            "multiple": float(first_cycle_selection["floor_multiple"]),
+            "anchor_type": "cycle-start floor",
+        })
         for horizon_cycle in range(1, future_cycle_count + 1):
             selected = multi_cycle_stress_test[
                 (multi_cycle_stress_test["horizon_cycle"] == horizon_cycle)

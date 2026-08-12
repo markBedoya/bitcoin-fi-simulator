@@ -158,6 +158,16 @@ def main():
     assert continuous_projection['projection_status'].eq(
         'candidate envelope; not calibrated probability interval'
     ).all()
+    projected_wide = continuous_projection.pivot(
+        index='date', columns='scenario', values='projected_price_usd'
+    )
+    assert (projected_wide['conservative'] <= projected_wide['central']).all()
+    assert (projected_wide['central'] <= projected_wide['upper']).all()
+    cycle_start = pd.Timestamp(weighted['estimated_cycle_end'])
+    cycle_start_rows = continuous_projection[continuous_projection['date'] == cycle_start]
+    assert len(cycle_start_rows) == 3
+    assert cycle_start_rows['left_anchor_type'].eq('live actual').all()
+    assert cycle_start_rows['right_anchor_type'].eq('cycle-start floor').all()
 
     print('PASS: Price Model v2 expanded cycle fit outputs look valid.')
 
