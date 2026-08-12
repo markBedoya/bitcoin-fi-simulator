@@ -34,6 +34,7 @@ weighted_fit, weighted_curve = fit_progress_weighted_backbone(prices)
     timing_stability_df,
     floor_sensitivity_df,
     multi_cycle_stress_test_df,
+    backbone_sensitivity_df,
 ) = build_model_diagnostics(
     prices, fits_df, weighted_fit
 )
@@ -222,6 +223,23 @@ st.dataframe(
     hide_index=True,
 )
 
+st.subheader("Forward-backbone sensitivity")
+st.caption(
+    "All paths begin at the same live centerline. Reduced-exponent paths test long-run growth compression; "
+    "they are sensitivities, not separately fitted models."
+)
+st.dataframe(
+    backbone_sensitivity_df.style.format({
+        "exponent_retention": "{:.0%}",
+        "effective_exponent": "{:.3f}",
+        "projected_backbone_usd": "${:,.0f}",
+        "cagr_from_live_actual_pct": "{:.1%}",
+        "cagr_from_live_centerline_pct": "{:.1%}",
+    }),
+    use_container_width=True,
+    hide_index=True,
+)
+
 st.subheader("Next-cycle price envelope")
 st.caption(
     "The two valid boundary structures are multiplied by the progress-weighted backbone at the historically timed "
@@ -357,5 +375,7 @@ copy_text = (
     + floor_sensitivity_df.to_csv(index=False, sep="\t")
     + "\nBOUNDED MULTI-CYCLE STRESS TEST\n"
     + multi_cycle_stress_test_df.to_csv(index=False, sep="\t")
+    + "\nFORWARD-BACKBONE SENSITIVITY\n"
+    + backbone_sensitivity_df.to_csv(index=False, sep="\t")
 )
 st.code(copy_text, language="text")

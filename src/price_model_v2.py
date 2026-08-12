@@ -226,7 +226,7 @@ def build_model_diagnostics(
     prices: pd.DataFrame,
     fits_df: pd.DataFrame,
     weighted_fit: dict,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Return the compact diagnostics used to learn the mature-cycle geometry.
 
     October 2025 is treated as the confirmed current-cycle peak.  The latest
@@ -627,6 +627,47 @@ def build_model_diagnostics(
                 })
     multi_cycle_stress_test = pd.DataFrame(multi_cycle_rows)
 
+    # Long-horizon dollar outcomes are increasingly dominated by the backbone,
+    # not the cycle envelope. Anchor every sensitivity path to the same live
+    # centerline, then retain 100%, 90%, or 80% of the learned log-time exponent.
+    # The reduced-exponent paths are transparent stress tests, not fitted laws.
+    live_model_days = float((latest_date - GENESIS).days)
+    live_centerline = float(weighted_fit["live_centerline_usd"])
+    backbone_sensitivity_rows = []
+    backbone_paths = [
+        ("learned_exponent_hold", 1.00, "baseline structural extrapolation"),
+        ("moderate_exponent_compression", 0.90, "sensitivity: retain 90% of learned exponent"),
+        ("conservative_exponent_compression", 0.80, "sensitivity: retain 80% of learned exponent"),
+    ]
+    anchor_dates = sorted(
+        set(multi_cycle_stress_test["projected_peak_date"].tolist())
+        | set(multi_cycle_stress_test["projected_trough_date"].tolist())
+    )
+    peak_dates_set = set(multi_cycle_stress_test["projected_peak_date"].tolist())
+    for path_name, exponent_retention, path_role in backbone_paths:
+        effective_exponent = float(weighted_fit["slope"]) * exponent_retention
+        for anchor_date in anchor_dates:
+            anchor_date = pd.Timestamp(anchor_date)
+            anchor_days = float((anchor_date - GENESIS).days)
+            years_from_live = (anchor_date - latest_date).days / 365.2425
+            projected_backbone = live_centerline * (anchor_days / live_model_days) ** effective_exponent
+            backbone_sensitivity_rows.append({
+                "backbone_path": path_name,
+                "anchor_type": "peak" if anchor_date in peak_dates_set else "trough",
+                "anchor_date": anchor_date,
+                "exponent_retention": exponent_retention,
+                "effective_exponent": effective_exponent,
+                "projected_backbone_usd": projected_backbone,
+                "cagr_from_live_actual_pct": (
+                    (projected_backbone / latest_price) ** (1.0 / years_from_live) - 1.0
+                ),
+                "cagr_from_live_centerline_pct": (
+                    (projected_backbone / live_centerline) ** (1.0 / years_from_live) - 1.0
+                ),
+                "path_role": path_role,
+            })
+    backbone_sensitivity = pd.DataFrame(backbone_sensitivity_rows)
+
     return (
         expanding,
         deviations,
@@ -638,6 +679,7 @@ def build_model_diagnostics(
         timing_stability,
         floor_sensitivity,
         multi_cycle_stress_test,
+        backbone_sensitivity,
     )
 
 

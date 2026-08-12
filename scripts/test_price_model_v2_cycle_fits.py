@@ -26,7 +26,7 @@ def main():
     fits, curves = fit_cycle_combo_centerlines(prices)
     comparison, spread = build_common_date_comparison(fits, prices)
     weighted, weighted_curve = fit_progress_weighted_backbone(prices)
-    expanding, deviations, geometry, floor, maturity, candidates, price_scenarios, timing, floor_sensitivity, multi_cycle = build_model_diagnostics(prices, fits, weighted)
+    expanding, deviations, geometry, floor, maturity, candidates, price_scenarios, timing, floor_sensitivity, multi_cycle, backbone_sensitivity = build_model_diagnostics(prices, fits, weighted)
 
     assert len(fits) == 9, f"Expected 9 fits, got {len(fits)}"
     assert not curves.empty, "Expected non-empty curve output"
@@ -118,6 +118,19 @@ def main():
         & (multi_cycle['floor_path'] == 'half_gap_recovery_to_completed_median')
     ]
     assert recovery['floor_multiple'].is_monotonic_increasing
+    assert set(backbone_sensitivity['backbone_path']) == {
+        'learned_exponent_hold',
+        'moderate_exponent_compression',
+        'conservative_exponent_compression',
+    }
+    assert backbone_sensitivity['anchor_date'].nunique() == 10
+    assert len(backbone_sensitivity) == 30
+    assert backbone_sensitivity['projected_backbone_usd'].gt(0).all()
+    assert backbone_sensitivity['cagr_from_live_actual_pct'].gt(0).all()
+    terminal = backbone_sensitivity[
+        backbone_sensitivity['anchor_date'] == backbone_sensitivity['anchor_date'].max()
+    ].sort_values('exponent_retention')
+    assert terminal['projected_backbone_usd'].is_monotonic_increasing
 
     print('PASS: Price Model v2 expanded cycle fit outputs look valid.')
 
