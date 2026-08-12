@@ -26,7 +26,7 @@ def main():
     fits, curves = fit_cycle_combo_centerlines(prices)
     comparison, spread = build_common_date_comparison(fits, prices)
     weighted, weighted_curve = fit_progress_weighted_backbone(prices)
-    expanding, deviations, geometry, floor, maturity = build_model_diagnostics(prices, fits, weighted)
+    expanding, deviations, geometry, floor, maturity, candidates = build_model_diagnostics(prices, fits, weighted)
 
     assert len(fits) == 9, f"Expected 9 fits, got {len(fits)}"
     assert not curves.empty, "Expected non-empty curve output"
@@ -71,6 +71,14 @@ def main():
     assert len(maturity) == 1
     assert maturity.iloc[0]['completed_trough_min'] <= maturity.iloc[0]['completed_trough_max']
     assert maturity.iloc[0]['pattern_read'] == 'stable mature trough band; two-stage upside compression'
+    assert set(candidates['candidate']) == {
+        'regime_hold', 'bounded_centerline_convergence', 'naive_log_amplitude_trend'
+    }
+    assert candidates.loc[
+        candidates['candidate'] == 'bounded_centerline_convergence',
+        'next_peak_multiple',
+    ].iloc[0] >= 1.0
+    assert candidates['current_cycle_is_partial'].all()
 
     print('PASS: Price Model v2 expanded cycle fit outputs look valid.')
 

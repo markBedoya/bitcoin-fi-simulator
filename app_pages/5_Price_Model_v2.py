@@ -23,7 +23,14 @@ except Exception as exc:
 anchor_df = get_cycle_anchor_df(prices)
 fits_df, curves_df = fit_cycle_combo_centerlines(prices)
 weighted_fit, weighted_curve = fit_progress_weighted_backbone(prices)
-expanding_df, deviations_df, cycle_geometry_df, floor_assessment_df, maturity_transition_df = build_model_diagnostics(
+(
+    expanding_df,
+    deviations_df,
+    cycle_geometry_df,
+    floor_assessment_df,
+    maturity_transition_df,
+    forward_candidates_df,
+) = build_model_diagnostics(
     prices, fits_df, weighted_fit
 )
 
@@ -192,6 +199,24 @@ st.dataframe(
     hide_index=True,
 )
 
+st.subheader("Forward structure tests")
+st.caption(
+    "These are boundary-shape tests, not price forecasts. The model keeps the downside floor separate from "
+    "the shrinking upside and rejects any unbounded trend that makes the next peak fall below the centerline."
+)
+st.dataframe(
+    forward_candidates_df.style.format({
+        "next_peak_multiple": "{:.3f}×",
+        "next_trough_multiple": "{:.3f}×",
+        "next_log_amplitude": "{:.3f}",
+        "forming_floor_vs_completed_min_pct": "{:.1%}",
+        "forming_floor_vs_completed_max_pct": "{:.1%}",
+        "recent_peak_excess_retention": "{:.1%}",
+    }),
+    use_container_width=True,
+    hide_index=True,
+)
+
 st.subheader("Peak compression and the forming bottom")
 st.caption("Every anchor now uses the same progress-weighted 2011→live backbone. The 2025 peak is confirmed; today's price is a partial forming-trough observation.")
 deviation_display = deviations_df.copy()
@@ -254,5 +279,7 @@ copy_text = (
     + floor_assessment_df.to_csv(index=False, sep="\t")
     + "\nMATURITY-TRANSITION SUMMARY\n"
     + maturity_transition_df.to_csv(index=False, sep="\t")
+    + "\nFORWARD STRUCTURE CANDIDATES\n"
+    + forward_candidates_df.to_csv(index=False, sep="\t")
 )
 st.code(copy_text, language="text")

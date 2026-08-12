@@ -7,7 +7,6 @@ The ZIP preserves the repository paths:
 - `app_pages/5_Price_Model_v2.py`
 - `src/price_model_v2.py`
 - `scripts/test_price_model_v2_cycle_fits.py`
-- `scripts/test_navigation_routes.py`
 
 This update:
 
@@ -22,7 +21,19 @@ This update:
 - preserves the lowest observed post-peak price as the forming trough even if price rebounds;
 - measures the backbone's downward recalibration separately from peak compression;
 - adds a compact maturity-transition summary instead of prematurely fitting a four-point forward curve;
+- compares a one-cycle regime hold with bounded convergence toward the centerline;
+- rejects an unbounded amplitude trend when it predicts a future peak below the centerline;
 - adds a compact tab-separated copy/paste results block;
-- fixes the Price Model V2 navigation route test.
 
 Delete `app_pages/2a_Price_Model_v2.py` from the GitHub repository if it still exists. The active page is `app_pages/5_Price_Model_v2.py`.
+# Forward structure diagnostics
+
+The compact export now includes `FORWARD STRUCTURE CANDIDATES`. It compares a
+one-cycle maturity-regime hold, bounded convergence of peak excess toward the
+centerline, and an intentionally unbounded log-amplitude trend. The last row is
+a rejection test: it is marked structurally invalid whenever it predicts a
+cycle peak below the 1.0x centerline.
+
+The current cycle remains partial. These rows test the shape of the future
+envelope; they do not yet select a production projection or publish dollar
+price forecasts.

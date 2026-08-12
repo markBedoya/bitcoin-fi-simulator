@@ -226,7 +226,7 @@ def build_model_diagnostics(
     prices: pd.DataFrame,
     fits_df: pd.DataFrame,
     weighted_fit: dict,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Return the compact diagnostics used to learn the mature-cycle geometry.
 
     October 2025 is treated as the confirmed current-cycle peak.  The latest
@@ -342,7 +342,79 @@ def build_model_diagnostics(
         "backbone_recalibration_pct": weighted_backbone_live / completed_backbone_live - 1.0,
         "pattern_read": "stable mature trough band; two-stage upside compression",
     }])
-    return expanding, deviations, cycle_geometry, floor_assessment, maturity_transition
+
+    # Compare forward structures without prematurely promoting one to the price model.
+    # A valid mature-cycle upper boundary must remain above both the trough boundary
+    # and the 1.0x centerline.  This guard exposes when an unconstrained amplitude
+    # trend has crossed into structurally invalid territory.
+    completed_floor_min = float(mature_troughs.min())
+    completed_floor_max = float(mature_troughs.max())
+    forming_floor = float(current["actual_to_centerline"])
+    robust_floor = float(np.median([mature_floor, forming_floor]))
+    current_amplitude = float(cycle_geometry.iloc[-1]["log_peak_to_trough_amplitude"])
+
+    recent = cycle_geometry.iloc[1:].copy()
+    x = recent["cycle"].to_numpy(dtype=float)
+    y = recent["log_peak_to_trough_amplitude"].to_numpy(dtype=float)
+    amplitude_slope, amplitude_intercept = np.polyfit(x, y, 1)
+    next_cycle_id = int(cycle_geometry["cycle"].max()) + 1
+    naive_next_amplitude = float(amplitude_intercept + amplitude_slope * next_cycle_id)
+    naive_next_peak = float(robust_floor * np.exp(naive_next_amplitude))
+
+    current_peak_excess = max(0.0, current_peak - 1.0)
+    prior_peak_excess = max(0.0, prior_peak - 1.0)
+    recent_excess_retention = (
+        current_peak_excess / prior_peak_excess if prior_peak_excess > 0 else 0.0
+    )
+    bounded_next_peak = 1.0 + current_peak_excess * recent_excess_retention
+
+    candidate_rows = [
+        {
+            "candidate": "regime_hold",
+            "next_peak_multiple": current_peak,
+            "next_trough_multiple": robust_floor,
+            "next_log_amplitude": float(np.log(current_peak / robust_floor)),
+            "structurally_valid": bool(current_peak >= 1.0 and current_peak > robust_floor),
+            "role": "upper scenario",
+            "interpretation": "2025 maturity arena persists for one more cycle",
+        },
+        {
+            "candidate": "bounded_centerline_convergence",
+            "next_peak_multiple": bounded_next_peak,
+            "next_trough_multiple": robust_floor,
+            "next_log_amplitude": float(np.log(bounded_next_peak / robust_floor)),
+            "structurally_valid": bool(bounded_next_peak >= 1.0 and bounded_next_peak > robust_floor),
+            "role": "lower scenario",
+            "interpretation": "peak excess decays toward, but never through, the centerline",
+        },
+        {
+            "candidate": "naive_log_amplitude_trend",
+            "next_peak_multiple": naive_next_peak,
+            "next_trough_multiple": robust_floor,
+            "next_log_amplitude": naive_next_amplitude,
+            "structurally_valid": bool(naive_next_peak >= 1.0 and naive_next_peak > robust_floor),
+            "role": "rejection test",
+            "interpretation": "unbounded recent amplitude trend; reject if peak falls below centerline",
+        },
+    ]
+    forward_candidates = pd.DataFrame(candidate_rows)
+    forward_candidates["forming_floor_vs_completed_min_pct"] = (
+        forming_floor / completed_floor_min - 1.0
+    )
+    forward_candidates["forming_floor_vs_completed_max_pct"] = (
+        forming_floor / completed_floor_max - 1.0
+    )
+    forward_candidates["recent_peak_excess_retention"] = recent_excess_retention
+    forward_candidates["current_cycle_is_partial"] = True
+
+    return (
+        expanding,
+        deviations,
+        cycle_geometry,
+        floor_assessment,
+        maturity_transition,
+        forward_candidates,
+    )
 
 
 def fit_cycle_combo_centerlines(prices: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
