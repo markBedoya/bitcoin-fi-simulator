@@ -222,29 +222,77 @@ def fit_progress_weighted_backbone(prices: pd.DataFrame) -> tuple[dict, pd.DataF
     return row, curve
 
 
-def build_model_diagnostics(prices: pd.DataFrame, fits_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return only the comparisons useful for choosing the V2 structure."""
+def build_model_diagnostics(
+    prices: pd.DataFrame,
+    fits_df: pd.DataFrame,
+    weighted_fit: dict,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Return the compact diagnostics used to learn the mature-cycle geometry.
+
+    October 2025 is treated as the confirmed current-cycle peak.  The latest
+    observation is treated as a forming trough: it contributes in proportion
+    to elapsed cycle progress but is never silently promoted to a completed
+    historical trough.
+    """
     expanding_ids = ["cycles_0_0", "cycles_0_1", "cycles_0_2", "live_2011"]
     expanding = fits_df.set_index("fit_id").loc[expanding_ids].reset_index()
     expanding = expanding[["fit_id", "label", "fit_start", "fit_end", "slope", "rmse_log", "r2_log"]]
 
-    # Use the longest completed-history fit as one shared ruler. This isolates
-    # changing cycle deviation from changes caused by swapping centerlines.
-    backbone = fits_df.set_index("fit_id").loc["cycles_0_2"]
     anchors = get_cycle_anchor_df(prices)
     latest = pd.DataFrame([{
         "date": pd.Timestamp(prices["date"].max()),
-        "type": "live",
-        "label": "Live",
+        "type": "forming_trough",
+        "label": "Current forming trough",
         "price_usd": float(prices.iloc[-1]["price_usd"]),
     }])
     deviations = pd.concat([anchors, latest], ignore_index=True)
     days = (deviations["date"] - GENESIS).dt.days.to_numpy(dtype=float)
-    deviations["shared_centerline_usd"] = np.exp(
-        float(backbone["intercept"]) + float(backbone["slope"]) * np.log(days)
+    deviations["weighted_centerline_usd"] = np.exp(
+        float(weighted_fit["intercept"]) + float(weighted_fit["slope"]) * np.log(days)
     )
-    deviations["actual_to_centerline"] = deviations["price_usd"] / deviations["shared_centerline_usd"]
-    return expanding, deviations
+    deviations["actual_to_centerline"] = deviations["price_usd"] / deviations["weighted_centerline_usd"]
+    deviations["anchor_status"] = "completed"
+    deviations.loc[deviations["type"] == "forming_trough", "anchor_status"] = "partial"
+    deviations.loc[deviations["label"] == "2025 peak", "anchor_status"] = "confirmed"
+
+    peak_rows = deviations[deviations["type"] == "peak"].reset_index(drop=True)
+    trough_rows = deviations[deviations["type"].isin(["trough", "forming_trough"])].reset_index(drop=True)
+    cycle_rows = []
+    for i in range(min(len(peak_rows), len(trough_rows) - 1)):
+        peak = peak_rows.iloc[i]
+        following_trough = trough_rows.iloc[i + 1]
+        peak_multiple = float(peak["actual_to_centerline"])
+        trough_multiple = float(following_trough["actual_to_centerline"])
+        cycle_rows.append({
+            "cycle": i,
+            "peak_label": peak["label"],
+            "peak_multiple": peak_multiple,
+            "trough_label": following_trough["label"],
+            "trough_multiple": trough_multiple,
+            "trough_status": following_trough["anchor_status"],
+            "peak_to_trough_multiple_ratio": peak_multiple / trough_multiple,
+            "log_peak_to_trough_amplitude": float(np.log(peak_multiple / trough_multiple)),
+        })
+    cycle_geometry = pd.DataFrame(cycle_rows)
+
+    mature_troughs = deviations[
+        (deviations["type"] == "trough")
+        & (deviations["date"] >= pd.Timestamp("2015-01-14"))
+    ]["actual_to_centerline"]
+    mature_floor = float(mature_troughs.median())
+    current = deviations.iloc[-1]
+    floor_assessment = pd.DataFrame([{
+        "current_price_usd": float(current["price_usd"]),
+        "current_centerline_usd": float(current["weighted_centerline_usd"]),
+        "current_multiple": float(current["actual_to_centerline"]),
+        "mature_completed_trough_median": mature_floor,
+        "current_vs_mature_floor_pct": float(current["actual_to_centerline"] / mature_floor - 1.0),
+        "cycle_progress": float(weighted_fit["progress"]),
+        "remaining_expected_days": max(0, int(weighted_fit["expected_cycle_days"] - weighted_fit["elapsed_days"])),
+        "model_interpretation": "forming bottom near mature-cycle floor",
+        "market_context_assumption": "October 2025 confirmed peak; bear market; negative news no longer making new lows",
+    }])
+    return expanding, deviations, cycle_geometry, floor_assessment
 
 
 def fit_cycle_combo_centerlines(prices: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:

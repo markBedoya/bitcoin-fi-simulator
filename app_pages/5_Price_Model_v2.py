@@ -23,7 +23,9 @@ except Exception as exc:
 anchor_df = get_cycle_anchor_df(prices)
 fits_df, curves_df = fit_cycle_combo_centerlines(prices)
 weighted_fit, weighted_curve = fit_progress_weighted_backbone(prices)
-expanding_df, deviations_df = build_model_diagnostics(prices, fits_df)
+expanding_df, deviations_df, cycle_geometry_df, floor_assessment_df = build_model_diagnostics(
+    prices, fits_df, weighted_fit
+)
 
 palette = [
     "#F48FB1", "#81C784", "#FFB74D", "#64B5F6", "#BA68C8",
@@ -56,10 +58,12 @@ col2.metric("Estimated cycle end", f"{weighted_fit['estimated_cycle_end'].date()
 col3.metric("Weighted backbone slope", f"{weighted_fit['slope']:.3f}")
 col4.metric("Live ÷ centerline", f"{weighted_fit['live_actual_to_centerline']:.2f}×")
 
+floor = floor_assessment_df.iloc[0]
 st.info(
-    f"The 2022→live cycle is {weighted_fit['progress']:.1%} complete using the median length of the three completed cycles "
-    f"({weighted_fit['expected_cycle_days']:,} days). Its observations therefore receive {weighted_fit['evidence_weight']:.1%} "
-    "of a completed cycle's weight. It influences the backbone almost fully, but is not labeled complete."
+    f"October 6, 2025 is treated as the confirmed cycle peak. The current ${floor['current_price_usd']:,.0f} area is treated "
+    f"as a forming bottom with about {int(floor['remaining_expected_days'])} days left in the expected cycle. It is "
+    f"{floor['current_multiple']:.3f}× the weighted backbone versus a {floor['mature_completed_trough_median']:.3f}× median "
+    "for the completed 2015, 2018, and 2022 troughs. The current observation remains partial evidence until the cycle closes."
 )
 
 fig = go.Figure()
@@ -187,16 +191,29 @@ st.dataframe(
     hide_index=True,
 )
 
-st.subheader("Cycle deviation from one shared centerline")
-st.caption("Every peak and trough uses the same completed-history backbone. Falling peak multiples and changing trough multiples reveal maturity without moving the ruler.")
+st.subheader("Peak compression and the forming bottom")
+st.caption("Every anchor now uses the same progress-weighted 2011→live backbone. The 2025 peak is confirmed; today's price is a partial forming-trough observation.")
 deviation_display = deviations_df.copy()
 deviation_display["date"] = pd.to_datetime(deviation_display["date"]).dt.date
-st.dataframe(deviation_display.style.format({"price_usd": "${:,.0f}", "shared_centerline_usd": "${:,.0f}", "actual_to_centerline": "{:.2f}×"}), use_container_width=True, hide_index=True)
+st.dataframe(deviation_display.style.format({"price_usd": "${:,.0f}", "weighted_centerline_usd": "${:,.0f}", "actual_to_centerline": "{:.3f}×"}), use_container_width=True, hide_index=True)
+
+st.subheader("Cycle geometry")
+st.caption("Peak strength and the following trough are measured separately so upside compression cannot hide a stable downside floor.")
+st.dataframe(
+    cycle_geometry_df.style.format({
+        "peak_multiple": "{:.3f}×",
+        "trough_multiple": "{:.3f}×",
+        "peak_to_trough_multiple_ratio": "{:.2f}×",
+        "log_peak_to_trough_amplitude": "{:.3f}",
+    }),
+    use_container_width=True,
+    hide_index=True,
+)
 
 st.subheader("Copy/paste results for analysis")
 st.caption(
     "Copy everything in the block below and paste it back into ChatGPT. It contains only the "
-    "cycle-progress, stable-backbone, and shared-deviation diagnostics needed for the next decision."
+    "cycle-progress, common-backbone, peak/trough geometry, and forming-bottom diagnostics needed for the next decision."
 )
 
 copy_text = (
@@ -205,7 +222,11 @@ copy_text = (
     + pd.DataFrame([weighted_fit]).drop(columns=["intercept"]).to_csv(index=False, sep="\t")
     + "\nEXPANDING-HISTORY BACKBONE\n"
     + expanding_display.to_csv(index=False, sep="\t")
-    + "\nSHARED-CENTERLINE CYCLE DEVIATIONS\n"
+    + "\nWEIGHTED-BACKBONE CYCLE DEVIATIONS\n"
     + deviation_display.to_csv(index=False, sep="\t")
+    + "\nCYCLE GEOMETRY\n"
+    + cycle_geometry_df.to_csv(index=False, sep="\t")
+    + "\nFORMING-BOTTOM ASSESSMENT\n"
+    + floor_assessment_df.to_csv(index=False, sep="\t")
 )
 st.code(copy_text, language="text")

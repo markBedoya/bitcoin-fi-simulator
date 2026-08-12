@@ -26,7 +26,7 @@ def main():
     fits, curves = fit_cycle_combo_centerlines(prices)
     comparison, spread = build_common_date_comparison(fits, prices)
     weighted, weighted_curve = fit_progress_weighted_backbone(prices)
-    expanding, deviations = build_model_diagnostics(prices, fits)
+    expanding, deviations, geometry, floor = build_model_diagnostics(prices, fits, weighted)
 
     assert len(fits) == 9, f"Expected 9 fits, got {len(fits)}"
     assert not curves.empty, "Expected non-empty curve output"
@@ -56,6 +56,15 @@ def main():
     assert list(expanding['fit_id']) == ['cycles_0_0', 'cycles_0_1', 'cycles_0_2', 'live_2011']
     assert len(deviations) == 9
     assert (deviations['actual_to_centerline'] > 0).all()
+    assert 'weighted_centerline_usd' in deviations.columns
+    assert deviations.iloc[-1]['type'] == 'forming_trough'
+    assert deviations.iloc[-1]['anchor_status'] == 'partial'
+    assert deviations.loc[deviations['label'] == '2025 peak', 'anchor_status'].iloc[0] == 'confirmed'
+    assert len(geometry) == 4
+    assert geometry.iloc[-1]['trough_status'] == 'partial'
+    assert len(floor) == 1
+    assert floor.iloc[0]['remaining_expected_days'] >= 0
+    assert floor.iloc[0]['mature_completed_trough_median'] > 0
 
     print('PASS: Price Model v2 expanded cycle fit outputs look valid.')
 
