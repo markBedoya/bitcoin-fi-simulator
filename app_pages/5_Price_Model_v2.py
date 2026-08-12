@@ -36,6 +36,7 @@ weighted_fit, weighted_curve = fit_progress_weighted_backbone(prices)
     multi_cycle_stress_test_df,
     backbone_sensitivity_df,
     recursive_exponent_candidates_df,
+    continuous_projection_df,
 ) = build_model_diagnostics(
     prices, fits_df, weighted_fit
 )
@@ -261,6 +262,54 @@ st.dataframe(
     hide_index=True,
 )
 
+st.subheader("Continuous 20-year candidate envelope")
+st.caption(
+    "Daily candidate paths interpolate cycle multipliers in log space between the live price, projected peaks, "
+    "and projected troughs. The band is structural scenario uncertainty, not a calibrated probability interval."
+)
+projection_fig = go.Figure()
+projection_colors = {"conservative": "#81C784", "central": "#64B5F6", "upper": "#FFB74D"}
+for scenario in ["conservative", "central", "upper"]:
+    scenario_projection = continuous_projection_df[
+        continuous_projection_df["scenario"] == scenario
+    ]
+    projection_fig.add_trace(go.Scatter(
+        x=scenario_projection["date"],
+        y=scenario_projection["projected_price_usd"],
+        mode="lines",
+        name=scenario.title(),
+        line=dict(color=projection_colors[scenario], width=3 if scenario == "central" else 2),
+        hovertemplate="%{x|%Y-%m-%d}<br>$%{y:,.0f}<extra>" + scenario.title() + "</extra>",
+    ))
+projection_fig.update_layout(
+    template="plotly_dark",
+    height=620,
+    xaxis_title="Date",
+    yaxis_title="Projected Bitcoin price (USD)",
+    legend=dict(orientation="h"),
+)
+projection_fig.update_yaxes(type="log")
+st.plotly_chart(projection_fig, use_container_width=True)
+
+projection_anchor_summary_df = continuous_projection_df[
+    continuous_projection_df["date"].isin(
+        recursive_exponent_candidates_df["anchor_date"].unique()
+    )
+].copy()
+st.dataframe(
+    projection_anchor_summary_df[[
+        "date", "scenario", "active_exponent", "backbone_usd",
+        "cycle_multiplier", "projected_price_usd", "projection_status",
+    ]].style.format({
+        "active_exponent": "{:.3f}",
+        "backbone_usd": "${:,.0f}",
+        "cycle_multiplier": "{:.3f}×",
+        "projected_price_usd": "${:,.0f}",
+    }),
+    use_container_width=True,
+    hide_index=True,
+)
+
 st.subheader("Next-cycle price envelope")
 st.caption(
     "The two valid boundary structures are multiplied by the progress-weighted backbone at the historically timed "
@@ -400,5 +449,7 @@ copy_text = (
     + backbone_sensitivity_df.to_csv(index=False, sep="\t")
     + "\nRECURSIVE EXPONENT CANDIDATES\n"
     + recursive_exponent_candidates_df.to_csv(index=False, sep="\t")
+    + "\nCONTINUOUS PROJECTION ANCHOR SUMMARY\n"
+    + projection_anchor_summary_df.to_csv(index=False, sep="\t")
 )
 st.code(copy_text, language="text")

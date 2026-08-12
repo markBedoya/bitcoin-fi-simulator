@@ -26,7 +26,7 @@ def main():
     fits, curves = fit_cycle_combo_centerlines(prices)
     comparison, spread = build_common_date_comparison(fits, prices)
     weighted, weighted_curve = fit_progress_weighted_backbone(prices)
-    expanding, deviations, geometry, floor, maturity, candidates, price_scenarios, timing, floor_sensitivity, multi_cycle, backbone_sensitivity, recursive_exponents = build_model_diagnostics(prices, fits, weighted)
+    expanding, deviations, geometry, floor, maturity, candidates, price_scenarios, timing, floor_sensitivity, multi_cycle, backbone_sensitivity, recursive_exponents, continuous_projection = build_model_diagnostics(prices, fits, weighted)
 
     assert len(fits) == 9, f"Expected 9 fits, got {len(fits)}"
     assert not curves.empty, "Expected non-empty curve output"
@@ -146,6 +146,17 @@ def main():
     assert recursive_terminal['one_time_recalibration_then_hold'] <= recursive_terminal['learned_exponent_hold']
     assert recursive_exponents['continuity_rule'].eq(
         'piecewise log-time integration; no boundary reset'
+    ).all()
+    assert set(continuous_projection['scenario']) == {'conservative', 'central', 'upper'}
+    assert continuous_projection.groupby('scenario')['date'].nunique().nunique() == 1
+    assert continuous_projection['projected_price_usd'].gt(0).all()
+    assert continuous_projection['cycle_multiplier'].gt(0).all()
+    live_rows = continuous_projection[
+        continuous_projection['date'] == continuous_projection['date'].min()
+    ]
+    assert np.allclose(live_rows['projected_price_usd'], prices.iloc[-1]['price_usd'])
+    assert continuous_projection['projection_status'].eq(
+        'candidate envelope; not calibrated probability interval'
     ).all()
 
     print('PASS: Price Model v2 expanded cycle fit outputs look valid.')

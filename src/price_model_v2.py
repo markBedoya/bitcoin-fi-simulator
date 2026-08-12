@@ -226,7 +226,7 @@ def build_model_diagnostics(
     prices: pd.DataFrame,
     fits_df: pd.DataFrame,
     weighted_fit: dict,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Return the compact diagnostics used to learn the mature-cycle geometry.
 
     October 2025 is treated as the confirmed current-cycle peak.  The latest
@@ -741,6 +741,101 @@ def build_model_diagnostics(
             })
     recursive_exponent_candidates = pd.DataFrame(recursive_rows)
 
+    # First continuous 20-year candidate envelope. Scenario choices remain
+    # explicit and separable: backbone behavior, peak path, and floor path.
+    # Log-space interpolation between anchor multipliers preserves positivity
+    # and continuity without manufacturing intra-cycle observations.
+    scenario_specs = [
+        {
+            "scenario": "conservative",
+            "backbone_path": "repeat_observed_recalibration",
+            "peak_path": "bounded_convergence_lower",
+            "floor_path": "conservative_forming_floor_hold",
+        },
+        {
+            "scenario": "central",
+            "backbone_path": "repeat_observed_recalibration",
+            "peak_path": "geometric_planning_midpoint",
+            "floor_path": "robust_floor_hold",
+        },
+        {
+            "scenario": "upper",
+            "backbone_path": "learned_exponent_hold",
+            "peak_path": "one_cycle_regime_hold_upper",
+            "floor_path": "half_gap_recovery_to_completed_median",
+        },
+    ]
+
+    def log_interpolate(date: pd.Timestamp, left: dict, right: dict) -> float:
+        span_days = max(1, int((right["date"] - left["date"]).days))
+        progress_days = int((date - left["date"]).days)
+        weight = float(np.clip(progress_days / span_days, 0.0, 1.0))
+        return float(np.exp(
+            np.log(left["multiple"])
+            + weight * (np.log(right["multiple"]) - np.log(left["multiple"]))
+        ))
+
+    projection_rows = []
+    projection_end = min(
+        latest_date + pd.DateOffset(years=20),
+        pd.Timestamp(multi_cycle_stress_test["projected_trough_date"].max()),
+    )
+    projection_dates = pd.date_range(latest_date, projection_end, freq="D")
+    for spec in scenario_specs:
+        anchors_for_scenario = [{
+            "date": latest_date,
+            "multiple": latest_price / live_centerline,
+            "anchor_type": "live actual",
+        }]
+        for horizon_cycle in range(1, future_cycle_count + 1):
+            selected = multi_cycle_stress_test[
+                (multi_cycle_stress_test["horizon_cycle"] == horizon_cycle)
+                & (multi_cycle_stress_test["peak_path"] == spec["peak_path"])
+                & (multi_cycle_stress_test["floor_path"] == spec["floor_path"])
+            ].iloc[0]
+            anchors_for_scenario.extend([
+                {
+                    "date": pd.Timestamp(selected["projected_peak_date"]),
+                    "multiple": float(selected["peak_multiple"]),
+                    "anchor_type": "peak",
+                },
+                {
+                    "date": pd.Timestamp(selected["projected_trough_date"]),
+                    "multiple": float(selected["floor_multiple"]),
+                    "anchor_type": "trough",
+                },
+            ])
+        anchors_for_scenario = sorted(anchors_for_scenario, key=lambda row: row["date"])
+        anchor_index = 0
+        for date in projection_dates:
+            while (
+                anchor_index + 1 < len(anchors_for_scenario) - 1
+                and date > anchors_for_scenario[anchor_index + 1]["date"]
+            ):
+                anchor_index += 1
+            left = anchors_for_scenario[anchor_index]
+            right = anchors_for_scenario[min(anchor_index + 1, len(anchors_for_scenario) - 1)]
+            multiplier = log_interpolate(date, left, right)
+            backbone, active_exponent, future_cycle = recursive_backbone_at(
+                date, spec["backbone_path"]
+            )
+            projection_rows.append({
+                "date": date,
+                "scenario": spec["scenario"],
+                "backbone_path": spec["backbone_path"],
+                "peak_path": spec["peak_path"],
+                "floor_path": spec["floor_path"],
+                "future_cycle": future_cycle,
+                "active_exponent": active_exponent,
+                "backbone_usd": backbone,
+                "cycle_multiplier": multiplier,
+                "projected_price_usd": backbone * multiplier,
+                "left_anchor_type": left["anchor_type"],
+                "right_anchor_type": right["anchor_type"],
+                "projection_status": "candidate envelope; not calibrated probability interval",
+            })
+    continuous_projection = pd.DataFrame(projection_rows)
+
     return (
         expanding,
         deviations,
@@ -754,6 +849,7 @@ def build_model_diagnostics(
         multi_cycle_stress_test,
         backbone_sensitivity,
         recursive_exponent_candidates,
+        continuous_projection,
     )
 
 
