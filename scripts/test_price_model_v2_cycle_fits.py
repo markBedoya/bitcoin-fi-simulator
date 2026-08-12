@@ -5,6 +5,8 @@ from src.price_model_v2 import (
     get_cycle_anchor_df,
     fit_cycle_combo_centerlines,
     build_common_date_comparison,
+    fit_progress_weighted_backbone,
+    build_model_diagnostics,
 )
 
 
@@ -23,6 +25,8 @@ def main():
     anchors = get_cycle_anchor_df(prices)
     fits, curves = fit_cycle_combo_centerlines(prices)
     comparison, spread = build_common_date_comparison(fits, prices)
+    weighted, weighted_curve = fit_progress_weighted_backbone(prices)
+    expanding, deviations = build_model_diagnostics(prices, fits)
 
     assert len(fits) == 9, f"Expected 9 fits, got {len(fits)}"
     assert not curves.empty, "Expected non-empty curve output"
@@ -45,6 +49,13 @@ def main():
     assert (spread['centerline_min_usd'] > 0).all()
     assert (spread['centerline_max_usd'] >= spread['centerline_median_usd']).all()
     assert (spread['centerline_median_usd'] >= spread['centerline_min_usd']).all()
+    assert 0.0 < weighted['progress'] <= 1.0
+    assert weighted['evidence_weight'] == weighted['progress']
+    assert weighted['live_centerline_usd'] > 0
+    assert len(weighted_curve) == len(prices)
+    assert list(expanding['fit_id']) == ['cycles_0_0', 'cycles_0_1', 'cycles_0_2', 'live_2011']
+    assert len(deviations) == 9
+    assert (deviations['actual_to_centerline'] > 0).all()
 
     print('PASS: Price Model v2 expanded cycle fit outputs look valid.')
 

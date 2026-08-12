@@ -5,26 +5,14 @@ import streamlit as st
 from src.data_pipeline import load_coinmetrics
 from src.price_model_v2 import (
     COMPLETE_CYCLES,
-    LIVE_STARTS,
     get_cycle_anchor_df,
     fit_cycle_combo_centerlines,
-    build_common_date_comparison,
+    fit_progress_weighted_backbone,
+    build_model_diagnostics,
 )
 
 st.title("Price Model v2 — Cycle-by-Cycle Power Law View")
-st.caption(
-    "This page is an exploratory comparison view. It overlays Bitcoin price history, the "
-    "historical cycle anchor points we have established, and multiple power-law centerlines "
-    "fit to individual complete cycles, contiguous combinations of complete cycles, and "
-    "selected trough-to-live windows. The goal is to visually compare how each cycle-specific "
-    "centerline behaves before making the next modeling decision."
-)
-
-st.info(
-    "This page now includes the earlier 2011 → 2014 → 2015 cycle, the 2015 → 2017 → 2018 cycle, "
-    "the 2018 → 2021 → 2022 cycle, every contiguous combination of those complete cycles, plus "
-    "the additional 2011→live, 2015→live, and 2018→live exploratory fits you requested."
-)
+st.caption("Find the stable long-term backbone, then measure how Bitcoin's cycle highs and lows compress around it.")
 
 try:
     prices, meta = load_coinmetrics(refresh=False)
@@ -34,7 +22,8 @@ except Exception as exc:
 
 anchor_df = get_cycle_anchor_df(prices)
 fits_df, curves_df = fit_cycle_combo_centerlines(prices)
-comparison_df, spread_df = build_common_date_comparison(fits_df, prices)
+weighted_fit, weighted_curve = fit_progress_weighted_backbone(prices)
+expanding_df, deviations_df = build_model_diagnostics(prices, fits_df)
 
 palette = [
     "#F48FB1", "#81C784", "#FFB74D", "#64B5F6", "#BA68C8",
@@ -44,19 +33,12 @@ fit_ids = fits_df["fit_id"].tolist()
 fit_label_lookup = dict(zip(fits_df["fit_id"], fits_df["label"]))
 color_lookup = {fit_id: palette[i % len(palette)] for i, fit_id in enumerate(fit_ids)}
 
-complete_default = fits_df.loc[fits_df["fit_group"] == "Complete cycle fits", "fit_id"].tolist()
+complete_default = ["cycles_0_2", "live_2011"]
 
 with st.sidebar:
     st.header("View settings")
     log_scale = st.toggle("Logarithmic price scale", value=True)
-    show_extrapolated = st.toggle(
-        "Show each centerline across the full chart",
-        value=True,
-        help=(
-            "When enabled, each fitted centerline is shown across the full visible history. "
-            "The portion inside the actual fitted date window is emphasized with a thicker solid line."
-        ),
-    )
+    show_extrapolated = True
     selected_fits = st.multiselect(
         "Centerlines to show",
         options=fit_ids,
@@ -66,25 +48,19 @@ with st.sidebar:
     if not selected_fits:
         st.warning("Select at least one fitted centerline to display.")
 
-    st.markdown("### Complete cycles used")
-    for cycle in COMPLETE_CYCLES:
-        st.caption(
-            f"**{cycle['name']}**  \n"
-            f"Start: {cycle['start'].date()}  \n"
-            f"Peak: {cycle['peak'].date()}  \n"
-            f"End: {cycle['end'].date()}"
-        )
-
-    st.markdown("### Live-window fits used")
-    latest_date = pd.Timestamp(prices["date"].max()).date()
-    for item in LIVE_STARTS:
-        st.caption(f"**{item['cycle_span']}**  \nStart: {item['start'].date()}  \nEnd: {latest_date}")
+    st.caption("The default view keeps only the longest completed-history fit and the comparable 2011→live fit.")
 
 col1, col2, col3, col4 = st.columns(4)
-col1.metric("BTC observations", f"{len(prices):,}")
-col2.metric("Historical anchors shown", f"{anchor_df['price_usd'].notna().sum():,}")
-col3.metric("Total fits", f"{len(fits_df):,}")
-col4.metric("Latest BTC date", f"{pd.Timestamp(prices['date'].max()).date()}")
+col1.metric("Open-cycle progress", f"{weighted_fit['progress']:.1%}")
+col2.metric("Estimated cycle end", f"{weighted_fit['estimated_cycle_end'].date()}")
+col3.metric("Weighted backbone slope", f"{weighted_fit['slope']:.3f}")
+col4.metric("Live ÷ centerline", f"{weighted_fit['live_actual_to_centerline']:.2f}×")
+
+st.info(
+    f"The 2022→live cycle is {weighted_fit['progress']:.1%} complete using the median length of the three completed cycles "
+    f"({weighted_fit['expected_cycle_days']:,} days). Its observations therefore receive {weighted_fit['evidence_weight']:.1%} "
+    "of a completed cycle's weight. It influences the backbone almost fully, but is not labeled complete."
+)
 
 fig = go.Figure()
 fig.add_trace(
@@ -164,6 +140,16 @@ for fit_id in selected_fits:
         )
     )
 
+fig.add_trace(
+    go.Scatter(
+        x=weighted_curve["date"],
+        y=weighted_curve["centerline_price_usd"],
+        mode="lines",
+        name="Progress-weighted backbone",
+        line=dict(color="#FFFFFF", width=3, dash="dash"),
+    )
+)
+
 for cycle in COMPLETE_CYCLES:
     fig.add_vrect(
         x0=cycle["start"],
@@ -190,133 +176,36 @@ fig.update_yaxes(type="log" if log_scale else "linear")
 
 st.plotly_chart(fig, use_container_width=True)
 
-st.subheader("Fit summary")
-st.caption(
-    "Each row is a separate power-law centerline fit. The exponent is the slope in log(price) vs log(days since Bitcoin genesis). "
-    "The start/end centerline values are the fitted fair-value line at the window boundaries."
-)
-
-display = fits_df.copy()
-display["fit_start"] = pd.to_datetime(display["fit_start"]).dt.date
-display["fit_end"] = pd.to_datetime(display["fit_end"]).dt.date
+st.subheader("Expanding-history convergence")
+st.caption("Same 2011 start, with progressively more cycle history. This is the clean test of whether the backbone stabilizes.")
+expanding_display = expanding_df.copy()
+expanding_display["fit_start"] = pd.to_datetime(expanding_display["fit_start"]).dt.date
+expanding_display["fit_end"] = pd.to_datetime(expanding_display["fit_end"]).dt.date
 st.dataframe(
-    display[
-        [
-            "fit_group",
-            "label",
-            "fit_start",
-            "fit_end",
-            "days_used",
-            "slope",
-            "rmse_log",
-            "r2_log",
-            "centerline_start_usd",
-            "centerline_end_usd",
-        ]
-    ].style.format(
-        {
-            "slope": "{:.4f}",
-            "rmse_log": "{:.4f}",
-            "r2_log": "{:.4f}",
-            "centerline_start_usd": "${:,.0f}",
-            "centerline_end_usd": "${:,.0f}",
-        }
-    ),
+    expanding_display.style.format({"slope": "{:.4f}", "rmse_log": "{:.4f}", "r2_log": "{:.4f}"}),
     use_container_width=True,
     hide_index=True,
 )
 
-
-
-st.subheader("Common-date centerline comparison")
-st.caption(
-    "Every fitted power-law centerline is evaluated on the exact same dates. "
-    "This is the table to copy back into ChatGPT so we can judge whether the fitted fair-value "
-    "paths are converging toward a common structure. The first row is the actual Bitcoin price "
-    "at each checkpoint for reference."
-)
-
-comparison_display = comparison_df.copy()
-comparison_display["fit_start"] = pd.to_datetime(comparison_display["fit_start"], errors="coerce").dt.date
-comparison_display["fit_end"] = pd.to_datetime(comparison_display["fit_end"], errors="coerce").dt.date
-checkpoint_columns = [
-    c for c in comparison_display.columns
-    if " | " in c
-]
-comparison_format = {c: "${:,.0f}" for c in checkpoint_columns}
-comparison_format["slope"] = "{:.4f}"
-st.dataframe(
-    comparison_display.style.format(comparison_format, na_rep="—"),
-    use_container_width=True,
-    hide_index=True,
-)
-
-st.subheader("Checkpoint convergence summary")
-st.caption(
-    "This collapses the nine fitted centerlines at each common date into their minimum, median, "
-    "maximum, and spread. A narrowing spread over time would be evidence that different training "
-    "windows are converging toward a similar structural centerline."
-)
-spread_display = spread_df.copy()
-spread_display["date"] = pd.to_datetime(spread_display["date"]).dt.date
-st.dataframe(
-    spread_display.style.format(
-        {
-            "actual_btc_usd": "${:,.0f}",
-            "centerline_min_usd": "${:,.0f}",
-            "centerline_median_usd": "${:,.0f}",
-            "centerline_max_usd": "${:,.0f}",
-            "max_min_ratio": "{:.2f}x",
-            "range_pct_of_median": "{:.1%}",
-            "median_vs_actual_ratio": "{:.2f}x",
-        },
-        na_rep="—",
-    ),
-    use_container_width=True,
-    hide_index=True,
-)
+st.subheader("Cycle deviation from one shared centerline")
+st.caption("Every peak and trough uses the same completed-history backbone. Falling peak multiples and changing trough multiples reveal maturity without moving the ruler.")
+deviation_display = deviations_df.copy()
+deviation_display["date"] = pd.to_datetime(deviation_display["date"]).dt.date
+st.dataframe(deviation_display.style.format({"price_usd": "${:,.0f}", "shared_centerline_usd": "${:,.0f}", "actual_to_centerline": "{:.2f}×"}), use_container_width=True, hide_index=True)
 
 st.subheader("Copy/paste results for analysis")
 st.caption(
-    "Copy everything in the block below and paste it back into ChatGPT. It contains both the "
-    "common-date matrix and the convergence summary in tab-separated format."
+    "Copy everything in the block below and paste it back into ChatGPT. It contains only the "
+    "cycle-progress, stable-backbone, and shared-deviation diagnostics needed for the next decision."
 )
-
-copy_matrix = comparison_display.copy()
-for col in checkpoint_columns:
-    copy_matrix[col] = pd.to_numeric(copy_matrix[col], errors="coerce").round(2)
-copy_matrix["slope"] = pd.to_numeric(copy_matrix["slope"], errors="coerce").round(6)
-copy_matrix = copy_matrix.fillna("")
-
-copy_spread = spread_display.copy()
-for col in ["actual_btc_usd", "centerline_min_usd", "centerline_median_usd", "centerline_max_usd"]:
-    copy_spread[col] = pd.to_numeric(copy_spread[col], errors="coerce").round(2)
-for col in ["max_min_ratio", "range_pct_of_median", "median_vs_actual_ratio"]:
-    copy_spread[col] = pd.to_numeric(copy_spread[col], errors="coerce").round(6)
-copy_spread = copy_spread.fillna("")
 
 copy_text = (
-    "COMMON-DATE CENTERLINE COMPARISON\n"
-    + copy_matrix.to_csv(index=False, sep="\t")
-    + "\nCHECKPOINT CONVERGENCE SUMMARY\n"
-    + copy_spread.to_csv(index=False, sep="\t")
+    "PRICE MODEL V2 — COMPACT DIAGNOSTICS\n"
+    + "CURRENT CYCLE EVIDENCE\n"
+    + pd.DataFrame([weighted_fit]).drop(columns=["intercept"]).to_csv(index=False, sep="\t")
+    + "\nEXPANDING-HISTORY BACKBONE\n"
+    + expanding_display.to_csv(index=False, sep="\t")
+    + "\nSHARED-CENTERLINE CYCLE DEVIATIONS\n"
+    + deviation_display.to_csv(index=False, sep="\t")
 )
 st.code(copy_text, language="text")
-
-
-st.subheader("Anchor points used on this page")
-st.dataframe(
-    anchor_df.assign(date=anchor_df["date"].dt.date)
-    [["date", "type", "label", "price_usd"]]
-    .style.format({"price_usd": "${:,.2f}"}),
-    use_container_width=True,
-    hide_index=True,
-)
-
-st.markdown("### What to look for")
-st.markdown(
-    "- Compare the **individual complete-cycle fits** against the **combined complete-cycle fits**.  \n"
-    "- Compare the earlier complete-cycle structure against the **2011→live**, **2015→live**, and **2018→live** fits.  \n"
-    "- Look at where each line places Bitcoin's fair-value centerline **before**, **during**, and **after** its fitted window.  \n"
-    "- Use this page as a visual lab before deciding how to update the main Price Model or the calibration logic."
-)

@@ -8,6 +8,7 @@ APP = Path(__file__).resolve().parents[1] / "streamlit_app.py"
 EXPECTED_ROUTES = {
     "data-management",
     "price-model",
+    "price-model-v2",
     "calibrated-price-model",
     "btc-financial-independence",
 }

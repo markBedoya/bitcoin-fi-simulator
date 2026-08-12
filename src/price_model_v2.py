@@ -53,6 +53,28 @@ LIVE_STARTS = [
 ]
 
 
+def get_current_cycle_progress(prices: pd.DataFrame) -> dict:
+    """Estimate how much of the open cycle has elapsed from completed-cycle lengths."""
+    latest_date = pd.Timestamp(prices["date"].max())
+    current_start = COMPLETE_CYCLES[-1]["end"]
+    completed_days = np.array(
+        [(cycle["end"] - cycle["start"]).days for cycle in COMPLETE_CYCLES],
+        dtype=float,
+    )
+    expected_days = int(round(float(np.median(completed_days))))
+    elapsed_days = max(0, int((latest_date - current_start).days))
+    progress = float(np.clip(elapsed_days / expected_days, 0.0, 1.0))
+    return {
+        "cycle_start": current_start,
+        "latest_date": latest_date,
+        "expected_cycle_days": expected_days,
+        "estimated_cycle_end": current_start + pd.Timedelta(days=expected_days),
+        "elapsed_days": elapsed_days,
+        "progress": progress,
+        "evidence_weight": progress,
+    }
+
+
 def get_cycle_anchor_df(prices: pd.DataFrame) -> pd.DataFrame:
     price_lookup = prices.set_index("date")["price_usd"]
     rows = []
@@ -149,6 +171,80 @@ def _fit_power_law(
     fitted["fit_end"] = end
 
     return float(slope), float(intercept), fitted, rmse_log, r2_log
+
+
+def fit_progress_weighted_backbone(prices: pd.DataFrame) -> tuple[dict, pd.DataFrame]:
+    """Fit 2011→live while discounting the open cycle by its completion fraction.
+
+    Each completed cycle receives total weight 1 regardless of small differences
+    in duration. The open cycle receives total weight equal to its completion
+    fraction, so a 96%-complete cycle supplies 0.96 cycle-equivalents of evidence.
+    """
+    progress = get_current_cycle_progress(prices)
+    start = COMPLETE_CYCLES[0]["start"]
+    latest = progress["latest_date"]
+    segment = prices[(prices["date"] >= start) & (prices["date"] <= latest)].copy()
+    x_days = (segment["date"] - GENESIS).dt.days.to_numpy(dtype=float)
+    y_price = segment["price_usd"].to_numpy(dtype=float)
+    valid = (x_days > 0) & (y_price > 0)
+    segment = segment.loc[valid].reset_index(drop=True)
+    log_x = np.log(x_days[valid])
+    log_y = np.log(y_price[valid])
+    weights = np.zeros(len(segment), dtype=float)
+    for cycle in COMPLETE_CYCLES:
+        in_cycle = (segment["date"] >= cycle["start"]) & (segment["date"] < cycle["end"])
+        count = int(in_cycle.sum())
+        if count:
+            weights[in_cycle.to_numpy()] = 1.0 / count
+    in_open_cycle = segment["date"] >= progress["cycle_start"]
+    open_count = int(in_open_cycle.sum())
+    if open_count:
+        weights[in_open_cycle.to_numpy()] = progress["evidence_weight"] / open_count
+    slope, intercept = np.polyfit(log_x, log_y, 1, w=np.sqrt(weights))
+    fitted_log = intercept + slope * log_x
+    rmse_log = float(np.sqrt(np.average((log_y - fitted_log) ** 2, weights=weights)))
+
+    curve = prices[["date"]].copy()
+    curve_days = (curve["date"] - GENESIS).dt.days.to_numpy(dtype=float)
+    curve["centerline_price_usd"] = np.exp(intercept + slope * np.log(curve_days))
+    row = {
+        **progress,
+        "fit_id": "progress_weighted_backbone",
+        "label": "Progress-weighted 2011→live backbone",
+        "slope": float(slope),
+        "intercept": float(intercept),
+        "rmse_log": rmse_log,
+        "effective_current_cycle_weight": float(progress["evidence_weight"]),
+        "live_centerline_usd": float(curve.iloc[-1]["centerline_price_usd"]),
+        "live_actual_usd": float(prices.iloc[-1]["price_usd"]),
+    }
+    row["live_actual_to_centerline"] = row["live_actual_usd"] / row["live_centerline_usd"]
+    return row, curve
+
+
+def build_model_diagnostics(prices: pd.DataFrame, fits_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Return only the comparisons useful for choosing the V2 structure."""
+    expanding_ids = ["cycles_0_0", "cycles_0_1", "cycles_0_2", "live_2011"]
+    expanding = fits_df.set_index("fit_id").loc[expanding_ids].reset_index()
+    expanding = expanding[["fit_id", "label", "fit_start", "fit_end", "slope", "rmse_log", "r2_log"]]
+
+    # Use the longest completed-history fit as one shared ruler. This isolates
+    # changing cycle deviation from changes caused by swapping centerlines.
+    backbone = fits_df.set_index("fit_id").loc["cycles_0_2"]
+    anchors = get_cycle_anchor_df(prices)
+    latest = pd.DataFrame([{
+        "date": pd.Timestamp(prices["date"].max()),
+        "type": "live",
+        "label": "Live",
+        "price_usd": float(prices.iloc[-1]["price_usd"]),
+    }])
+    deviations = pd.concat([anchors, latest], ignore_index=True)
+    days = (deviations["date"] - GENESIS).dt.days.to_numpy(dtype=float)
+    deviations["shared_centerline_usd"] = np.exp(
+        float(backbone["intercept"]) + float(backbone["slope"]) * np.log(days)
+    )
+    deviations["actual_to_centerline"] = deviations["price_usd"] / deviations["shared_centerline_usd"]
+    return expanding, deviations
 
 
 def fit_cycle_combo_centerlines(prices: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
