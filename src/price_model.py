@@ -6,15 +6,14 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "bottom-anchored-fair-value-research-v0.1.0"
+MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.2.0"
 GENESIS = pd.Timestamp("2009-01-03")
 BOTTOM_WINDOW_DAYS = 120
 PEAK_WINDOW_DAYS = 90
 REGION_CLUSTER_DAYS = 7
 VALIDATION_TEMPERATURE = 0.35
+REFERENCE_DAYS_BEFORE_TURN = 56
 
-# Dates locate broad market-regime turning regions. The observed lowest/highest
-# daily close may occur before or after the date. The 2026 date remains forming.
 BOTTOM_TURNING_REGIONS = [
     {"anchor_date": pd.Timestamp("2011-11-18"), "label": "2011 bottom region"},
     {"anchor_date": pd.Timestamp("2015-01-14"), "label": "2015 bottom region"},
@@ -31,10 +30,17 @@ PEAK_TURNING_REGIONS = [
 ]
 
 CANDIDATE_LABELS = {
-    "learned_power_law": "Learned fixed bottom power law",
-    "published_bottom_formula": "Published 5.82 × 0.42 bottom formula",
+    "expanding_power_law": "Expanding-history bottom power law",
     "all_cycle_excess_decay": "All-cycle excess-growth decay",
     "recent_excess_decay": "Recent excess-growth decay",
+    "local_exponent": "Recency-weighted local exponent",
+}
+
+FAIR_METHOD_LABELS = {
+    "peak_bottom_midpoint": "Peak/bottom log midpoint",
+    "cycle_log_median": "Time-weighted cycle median",
+    "cycle_log_mean": "Time-weighted geometric mean",
+    "central_50_midpoint": "Central-50% log midpoint",
 }
 
 
@@ -47,6 +53,12 @@ class BottomAnchoredModelResult:
     candidate_forecasts: pd.DataFrame
     validation_summary: pd.DataFrame
     walk_forward: pd.DataFrame
+    bottom_sensitivity: pd.DataFrame
+    fair_value_cycles: pd.DataFrame
+    fair_value_validation: pd.DataFrame
+    fair_value_methods: pd.DataFrame
+    dynamic_settling: pd.DataFrame
+    dynamic_settling_summary: pd.DataFrame
     all_price_curve: pd.DataFrame
 
 
@@ -64,11 +76,22 @@ def _median_timestamp(values: pd.Series) -> pd.Timestamp:
     return pd.Timestamp(ordered.iloc[len(ordered) // 2])
 
 
+def _region_price(values: pd.Series, statistic: str) -> float:
+    array = values.to_numpy(dtype=float)
+    if statistic == "median":
+        return float(np.median(array))
+    if statistic == "geometric_mean":
+        return float(np.exp(np.mean(np.log(array))))
+    raise ValueError(f"Unknown region statistic: {statistic}")
+
+
 def _extract_regions(
     data: pd.DataFrame,
     specifications: list[dict],
     half_window_days: int,
     direction: str,
+    cluster_days: int = REGION_CLUSTER_DAYS,
+    statistic: str = "median",
 ) -> pd.DataFrame:
     latest = pd.Timestamp(data["date"].max())
     rows: list[dict] = []
@@ -77,22 +100,21 @@ def _extract_regions(
         start = anchor - pd.Timedelta(days=half_window_days)
         end = min(anchor + pd.Timedelta(days=half_window_days), latest)
         window = data[(data["date"] >= start) & (data["date"] <= end)].copy()
-        if len(window) < REGION_CLUSTER_DAYS:
+        if len(window) < cluster_days:
             continue
         if direction == "bottom":
-            cluster = window.nsmallest(REGION_CLUSTER_DAYS, "price_usd").copy()
+            cluster = window.nsmallest(cluster_days, "price_usd").copy()
             extreme_row = window.loc[window["price_usd"].idxmin()]
         else:
-            cluster = window.nlargest(REGION_CLUSTER_DAYS, "price_usd").copy()
+            cluster = window.nlargest(cluster_days, "price_usd").copy()
             extreme_row = window.loc[window["price_usd"].idxmax()]
-
         status = "completed" if latest >= anchor + pd.Timedelta(days=half_window_days) else "forming"
         rows.append({
             "cycle": cycle,
             "label": specification["label"],
             "anchor_date": anchor,
             "region_date": _median_timestamp(cluster["date"]),
-            "region_price_usd": float(cluster["price_usd"].median()),
+            "region_price_usd": _region_price(cluster["price_usd"], statistic),
             "cluster_low_usd": float(cluster["price_usd"].min()),
             "cluster_high_usd": float(cluster["price_usd"].max()),
             "extreme_date": pd.Timestamp(extreme_row["date"]),
@@ -100,26 +122,18 @@ def _extract_regions(
             "window_start": start,
             "window_end": end,
             "observations": int(len(window)),
+            "cluster_days": int(cluster_days),
+            "statistic": statistic,
             "status": status,
         })
     return pd.DataFrame(rows)
 
 
-def _log_interpolate(
-    target_dates: pd.DatetimeIndex | pd.Series,
-    anchor_dates: pd.Series | list,
-    anchor_values: pd.Series | list,
-) -> np.ndarray:
+def _log_interpolate(target_dates, anchor_dates, anchor_values) -> np.ndarray:
     target = pd.DatetimeIndex(target_dates).asi8.astype(float)
     dates = pd.DatetimeIndex(anchor_dates).asi8.astype(float)
     values = np.asarray(anchor_values, dtype=float)
     return np.exp(np.interp(target, dates, np.log(values)))
-
-
-def _published_lines(dates: pd.DatetimeIndex | pd.Series) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    model_days = (pd.DatetimeIndex(dates) - GENESIS).days.to_numpy(dtype=float)
-    raw = 1.0117e-17 * np.power(model_days, 5.82)
-    return raw, 0.71 * raw, 0.42 * raw
 
 
 def _candidate_prediction(
@@ -130,15 +144,20 @@ def _candidate_prediction(
 ) -> float:
     values = np.asarray(region_values, dtype=float)
     dates = pd.DatetimeIndex(region_dates)
-    if model_id == "published_bottom_formula":
-        return float(_published_lines(pd.DatetimeIndex([target_date]))[2][0])
-    if model_id == "learned_power_law":
-        if len(values) < 2:
-            return float("nan")
-        x = np.log((dates - GENESIS).days.to_numpy(dtype=float))
-        slope, intercept = np.polyfit(x, np.log(values), 1)
-        target_days = float((target_date - GENESIS).days)
+    if len(values) < 2:
+        return float("nan")
+    model_days = (dates - GENESIS).days.to_numpy(dtype=float)
+    target_days = float((target_date - GENESIS).days)
+
+    if model_id == "expanding_power_law":
+        slope, intercept = np.polyfit(np.log(model_days), np.log(values), 1)
         return float(np.exp(intercept + slope * np.log(target_days)))
+
+    if model_id == "local_exponent":
+        local_exponents = np.log(values[1:] / values[:-1]) / np.log(model_days[1:] / model_days[:-1])
+        recency_weights = np.arange(1, len(local_exponents) + 1, dtype=float)
+        effective_exponent = float(np.average(local_exponents, weights=recency_weights))
+        return float(values[-1] * (target_days / model_days[-1]) ** effective_exponent)
 
     if len(values) < 3:
         return float("nan")
@@ -157,11 +176,10 @@ def _candidate_prediction(
 
 def _walk_forward(bottoms: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     rows: list[dict] = []
-    model_ids = list(CANDIDATE_LABELS)
     for target_index in range(2, len(bottoms)):
         training = bottoms.iloc[:target_index]
         target = bottoms.iloc[target_index]
-        for model_id in model_ids:
+        for model_id, label in CANDIDATE_LABELS.items():
             predicted = _candidate_prediction(
                 model_id,
                 training["region_date"].tolist(),
@@ -174,7 +192,7 @@ def _walk_forward(bottoms: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             evidence_weight = 0.5 if target["status"] == "forming" else 1.0
             rows.append({
                 "model_id": model_id,
-                "model": CANDIDATE_LABELS[model_id],
+                "model": label,
                 "target_cycle": int(target["cycle"]),
                 "target_date": pd.Timestamp(target["anchor_date"]),
                 "target_status": target["status"],
@@ -186,6 +204,8 @@ def _walk_forward(bottoms: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
                 "evidence_weight": evidence_weight,
             })
     walk = pd.DataFrame(rows)
+    if walk.empty:
+        return walk, pd.DataFrame()
     summaries: list[dict] = []
     for model_id, label in CANDIDATE_LABELS.items():
         subset = walk[walk["model_id"] == model_id]
@@ -194,7 +214,6 @@ def _walk_forward(bottoms: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
         weights = subset["evidence_weight"].to_numpy(dtype=float)
         errors = subset["absolute_log_error"].to_numpy(dtype=float)
         mean_error = float(np.average(errors, weights=weights))
-        rms_error = float(np.sqrt(np.average(np.square(errors), weights=weights)))
         evidence = float(weights.sum())
         coverage = min(1.0, evidence / 2.0)
         raw_weight = float(coverage * np.exp(-mean_error / VALIDATION_TEMPERATURE))
@@ -204,7 +223,7 @@ def _walk_forward(bottoms: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             "holdouts": int(len(subset)),
             "effective_holdouts": evidence,
             "mean_absolute_log_error": mean_error,
-            "rms_log_error": rms_error,
+            "rms_log_error": float(np.sqrt(np.average(np.square(errors), weights=weights))),
             "approx_typical_pct_error": float(np.exp(mean_error) - 1.0),
             "raw_validation_weight": raw_weight,
         })
@@ -215,6 +234,378 @@ def _walk_forward(bottoms: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
             validation["raw_validation_weight"] / total if total > 0 else 1.0 / len(validation)
         )
     return walk, validation
+
+
+def _forecast_candidates(
+    bottoms: pd.DataFrame,
+    target_date: pd.Timestamp,
+    validation: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    rows: list[dict] = []
+    for model_id, label in CANDIDATE_LABELS.items():
+        prediction = _candidate_prediction(
+            model_id,
+            bottoms["region_date"].tolist(),
+            bottoms["region_price_usd"].to_numpy(dtype=float),
+            target_date,
+        )
+        if np.isfinite(prediction) and prediction > 0:
+            rows.append({
+                "model_id": model_id,
+                "model": label,
+                "target_date": target_date,
+                "predicted_bottom_usd": prediction,
+            })
+    forecasts = pd.DataFrame(rows)
+    if forecasts.empty:
+        return forecasts
+    if validation is None or validation.empty:
+        forecasts["ensemble_weight"] = 1.0 / len(forecasts)
+    else:
+        forecasts = forecasts.merge(
+            validation[["model_id", "ensemble_weight", "holdouts", "approx_typical_pct_error"]],
+            on="model_id",
+            how="left",
+        )
+        forecasts["ensemble_weight"] = forecasts["ensemble_weight"].fillna(0.0)
+        if forecasts["ensemble_weight"].sum() <= 0:
+            forecasts["ensemble_weight"] = 1.0 / len(forecasts)
+        else:
+            forecasts["ensemble_weight"] /= forecasts["ensemble_weight"].sum()
+    return forecasts
+
+
+def _ensemble_value(forecasts: pd.DataFrame) -> float:
+    valid = forecasts[
+        np.isfinite(forecasts["predicted_bottom_usd"])
+        & (forecasts["predicted_bottom_usd"] > 0)
+        & (forecasts["ensemble_weight"] > 0)
+    ]
+    if valid.empty:
+        return float("nan")
+    weights = valid["ensemble_weight"].to_numpy(dtype=float)
+    weights /= weights.sum()
+    return float(np.exp(np.sum(weights * np.log(valid["predicted_bottom_usd"].to_numpy(dtype=float)))))
+
+
+def _forming_evidence_weight(anchor_date: pd.Timestamp, reveal_date: pd.Timestamp, half_window: int) -> float:
+    start = anchor_date - pd.Timedelta(days=half_window)
+    return float(np.clip((reveal_date - start).days / (2.0 * half_window), 0.0, 1.0))
+
+
+def _dynamic_bottom_estimate(
+    prior_bottoms: pd.DataFrame,
+    target_row: pd.Series,
+    reveal_date: pd.Timestamp,
+    validation: pd.DataFrame | None = None,
+    half_window: int = BOTTOM_WINDOW_DAYS,
+) -> dict:
+    anchor = pd.Timestamp(target_row["anchor_date"])
+    forecasts = _forecast_candidates(prior_bottoms, anchor, validation)
+    forecast = _ensemble_value(forecasts)
+    observed = float(target_row["region_price_usd"])
+    evidence = _forming_evidence_weight(anchor, reveal_date, half_window)
+    dynamic = float(np.exp((1.0 - evidence) * np.log(forecast) + evidence * np.log(observed)))
+    return {
+        "forecast_bottom_usd": forecast,
+        "observed_forming_bottom_usd": observed,
+        "forming_evidence_weight": evidence,
+        "dynamic_bottom_usd": dynamic,
+        "forecast_low_usd": float(forecasts["predicted_bottom_usd"].min()),
+        "forecast_high_usd": float(forecasts["predicted_bottom_usd"].max()),
+    }
+
+
+def _add_bottom_growth(bottoms: pd.DataFrame) -> pd.DataFrame:
+    result = bottoms.copy().sort_values("region_date").reset_index(drop=True)
+    result["bottom_to_bottom_multiple"] = result["region_price_usd"].pct_change() + 1.0
+    result["bottom_to_bottom_cagr"] = np.nan
+    for index in range(1, len(result)):
+        years = (result.loc[index, "region_date"] - result.loc[index - 1, "region_date"]).days / 365.2425
+        result.loc[index, "bottom_to_bottom_cagr"] = (
+            (result.loc[index, "region_price_usd"] / result.loc[index - 1, "region_price_usd"]) ** (1.0 / years) - 1.0
+        )
+    return result
+
+
+def _foundation_at(date: pd.Timestamp, left_date, left_value, right_date, right_value) -> float:
+    span = max((pd.Timestamp(right_date) - pd.Timestamp(left_date)).total_seconds(), 1.0)
+    progress = float(np.clip((pd.Timestamp(date) - pd.Timestamp(left_date)).total_seconds() / span, 0.0, 1.0))
+    return float(np.exp(np.log(left_value) + progress * (np.log(right_value) - np.log(left_value))))
+
+
+def _build_fair_value_cycles(
+    data: pd.DataFrame,
+    bottoms: pd.DataFrame,
+    peaks: pd.DataFrame,
+) -> pd.DataFrame:
+    rows: list[dict] = []
+    cycle_count = min(len(peaks), len(bottoms) - 1)
+    for cycle in range(cycle_count):
+        left = bottoms.iloc[cycle]
+        right = bottoms.iloc[cycle + 1]
+        peak = peaks.iloc[cycle]
+        cycle_end = min(pd.Timestamp(right["anchor_date"]), pd.Timestamp(data["date"].max()))
+        segment = data[(data["date"] >= pd.Timestamp(left["region_date"])) & (data["date"] <= cycle_end)].copy()
+        if segment.empty:
+            continue
+        right_date = pd.Timestamp(right["anchor_date"] if right["status"] == "forming" else right["region_date"])
+        foundation = _log_interpolate(
+            segment["date"],
+            [pd.Timestamp(left["region_date"]), right_date],
+            [float(left["region_price_usd"]), float(right["region_price_usd"])],
+        )
+        ratio = segment["price_usd"].to_numpy(dtype=float) / foundation
+        peak_foundation = _foundation_at(
+            pd.Timestamp(peak["region_date"]),
+            pd.Timestamp(left["region_date"]),
+            float(left["region_price_usd"]),
+            right_date,
+            float(right["region_price_usd"]),
+        )
+        peak_multiple = float(peak["region_price_usd"] / peak_foundation)
+        method_values = {
+            "peak_bottom_midpoint": float(np.sqrt(peak_multiple)),
+            "cycle_log_median": float(np.exp(np.median(np.log(ratio)))),
+            "cycle_log_mean": float(np.exp(np.mean(np.log(ratio)))),
+            "central_50_midpoint": float(np.sqrt(np.quantile(ratio, 0.25) * np.quantile(ratio, 0.75))),
+        }
+        for method_id, multiple in method_values.items():
+            rows.append({
+                "cycle": cycle,
+                "method_id": method_id,
+                "method": FAIR_METHOD_LABELS[method_id],
+                "start_date": pd.Timestamp(left["region_date"]),
+                "end_date": cycle_end,
+                "target_status": right["status"],
+                "observations": int(len(segment)),
+                "fair_multiple": multiple,
+                "peak_foundation_multiple": peak_multiple,
+            })
+    return pd.DataFrame(rows)
+
+
+def _fair_value_walk_forward(
+    data: pd.DataFrame,
+    bottoms: pd.DataFrame,
+    fair_cycles: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows: list[dict] = []
+    cycles = sorted(fair_cycles["cycle"].unique())
+    for target_cycle in cycles[1:]:
+        target_status = str(fair_cycles.loc[fair_cycles["cycle"] == target_cycle, "target_status"].iloc[0])
+        evidence_weight = 1.0 if target_status == "completed" else 0.0
+        left = bottoms.iloc[target_cycle]
+        right = bottoms.iloc[target_cycle + 1]
+        right_date = pd.Timestamp(right["anchor_date"] if right["status"] == "forming" else right["region_date"])
+        cycle_end = min(right_date, pd.Timestamp(data["date"].max()))
+        segment = data[(data["date"] >= pd.Timestamp(left["region_date"])) & (data["date"] <= cycle_end)].copy()
+        foundation = _log_interpolate(
+            segment["date"],
+            [pd.Timestamp(left["region_date"]), right_date],
+            [float(left["region_price_usd"]), float(right["region_price_usd"])],
+        )
+        for method_id, label in FAIR_METHOD_LABELS.items():
+            history = fair_cycles[
+                (fair_cycles["cycle"] < target_cycle)
+                & (fair_cycles["method_id"] == method_id)
+            ].sort_values("cycle")
+            if history.empty:
+                continue
+            predicted_multiple = float(history["fair_multiple"].iloc[-1])
+            residual = np.log(segment["price_usd"].to_numpy(dtype=float) / (foundation * predicted_multiple))
+            median_abs = float(np.median(np.abs(residual)))
+            neutrality = float(abs(np.mean(residual >= 0.0) - 0.5))
+            rows.append({
+                "method_id": method_id,
+                "method": label,
+                "target_cycle": int(target_cycle),
+                "target_status": target_status,
+                "predicted_multiple": predicted_multiple,
+                "realized_multiple": float(fair_cycles.loc[
+                    (fair_cycles["cycle"] == target_cycle)
+                    & (fair_cycles["method_id"] == method_id),
+                    "fair_multiple",
+                ].iloc[0]),
+                "median_absolute_log_error": median_abs,
+                "absolute_log_bias": float(abs(np.median(residual))),
+                "time_above_fair_value": float(np.mean(residual >= 0.0)),
+                "neutrality_error": neutrality,
+                "combined_score": median_abs + neutrality,
+                "evidence_weight": evidence_weight,
+            })
+    walk = pd.DataFrame(rows)
+    summaries: list[dict] = []
+    for method_id, label in FAIR_METHOD_LABELS.items():
+        subset = walk[(walk["method_id"] == method_id) & (walk["evidence_weight"] > 0)]
+        if subset.empty:
+            continue
+        weights = subset["evidence_weight"].to_numpy(dtype=float)
+        score = float(np.average(subset["combined_score"], weights=weights))
+        summaries.append({
+            "method_id": method_id,
+            "method": label,
+            "completed_holdouts": int(len(subset)),
+            "mean_combined_score": score,
+            "mean_median_absolute_log_error": float(np.average(subset["median_absolute_log_error"], weights=weights)),
+            "mean_neutrality_error": float(np.average(subset["neutrality_error"], weights=weights)),
+            "raw_validation_weight": float(np.exp(-score / 0.6)),
+        })
+    summary = pd.DataFrame(summaries)
+    if not summary.empty:
+        summary["ensemble_weight"] = summary["raw_validation_weight"] / summary["raw_validation_weight"].sum()
+    return walk, summary
+
+
+def _dynamic_settling_backtest(
+    data: pd.DataFrame,
+    observed_bottoms: pd.DataFrame,
+    peaks: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    paths: list[dict] = []
+    summaries: list[dict] = []
+    latest = pd.Timestamp(data["date"].max())
+    for target_index in range(2, len(observed_bottoms)):
+        target = observed_bottoms.iloc[target_index]
+        prior = observed_bottoms.iloc[:target_index].copy()
+        anchor = pd.Timestamp(target["anchor_date"])
+        reference_date = anchor - pd.Timedelta(days=REFERENCE_DAYS_BEFORE_TURN)
+        reveal_end = min(anchor + pd.Timedelta(days=BOTTOM_WINDOW_DAYS), latest)
+        if reveal_end < reference_date:
+            continue
+        _, prior_validation = _walk_forward(prior)
+        reveal_dates = list(pd.date_range(reference_date, reveal_end, freq="30D"))
+        if reveal_dates[-1] != reveal_end:
+            reveal_dates.append(reveal_end)
+        left = prior.iloc[-1]
+        peak = peaks.iloc[target_index - 1]
+        settled_bottom = float(target["region_price_usd"])
+        settled_reference_foundation = _foundation_at(
+            reference_date, left["region_date"], left["region_price_usd"], anchor, settled_bottom
+        )
+        settled_peak_foundation = _foundation_at(
+            peak["region_date"], left["region_date"], left["region_price_usd"], anchor, settled_bottom
+        )
+        settled_multiplier = float(np.sqrt(float(peak["region_price_usd"]) / settled_peak_foundation))
+        settled_reference_fair = settled_reference_foundation * settled_multiplier
+
+        cycle_rows: list[dict] = []
+        for reveal_date in reveal_dates:
+            partial = data[data["date"] <= reveal_date]
+            partial_target = _extract_regions(
+                partial, [BOTTOM_TURNING_REGIONS[target_index]], BOTTOM_WINDOW_DAYS, "bottom"
+            )
+            forecasts = _forecast_candidates(prior, anchor, prior_validation)
+            forecast = _ensemble_value(forecasts)
+            if partial_target.empty:
+                observed = np.nan
+                evidence = 0.0
+                dynamic_bottom = forecast
+            else:
+                observed = float(partial_target["region_price_usd"].iloc[0])
+                evidence = _forming_evidence_weight(anchor, reveal_date, BOTTOM_WINDOW_DAYS)
+                dynamic_bottom = float(np.exp((1.0 - evidence) * np.log(forecast) + evidence * np.log(observed)))
+            reference_foundation = _foundation_at(
+                reference_date, left["region_date"], left["region_price_usd"], anchor, dynamic_bottom
+            )
+            peak_foundation = _foundation_at(
+                peak["region_date"], left["region_date"], left["region_price_usd"], anchor, dynamic_bottom
+            )
+            fair_multiplier = float(np.sqrt(float(peak["region_price_usd"]) / peak_foundation))
+            reference_fair = reference_foundation * fair_multiplier
+            row = {
+                "target_cycle": int(target["cycle"]),
+                "target_status": target["status"],
+                "target_anchor": anchor,
+                "reference_date": reference_date,
+                "reveal_date": reveal_date,
+                "forecast_bottom_usd": forecast,
+                "forming_bottom_usd": observed,
+                "forming_evidence_weight": evidence,
+                "dynamic_bottom_usd": dynamic_bottom,
+                "settled_bottom_usd": settled_bottom if target["status"] == "completed" else np.nan,
+                "dynamic_reference_fair_value_usd": reference_fair,
+                "settled_reference_fair_value_usd": settled_reference_fair if target["status"] == "completed" else np.nan,
+                "bottom_error_vs_settled_log": float(abs(np.log(dynamic_bottom / settled_bottom))) if target["status"] == "completed" else np.nan,
+                "fair_value_error_vs_settled_log": float(abs(np.log(reference_fair / settled_reference_fair))) if target["status"] == "completed" else np.nan,
+            }
+            cycle_rows.append(row)
+            paths.append(row)
+        cycle_path = pd.DataFrame(cycle_rows)
+        first = cycle_path.iloc[0]
+        last = cycle_path.iloc[-1]
+        summaries.append({
+            "target_cycle": int(target["cycle"]),
+            "target_status": target["status"],
+            "target_anchor": anchor,
+            "reference_date": reference_date,
+            "first_dynamic_bottom_usd": float(first["dynamic_bottom_usd"]),
+            "latest_dynamic_bottom_usd": float(last["dynamic_bottom_usd"]),
+            "settled_bottom_usd": settled_bottom if target["status"] == "completed" else np.nan,
+            "first_reference_fair_value_usd": float(first["dynamic_reference_fair_value_usd"]),
+            "latest_reference_fair_value_usd": float(last["dynamic_reference_fair_value_usd"]),
+            "settled_reference_fair_value_usd": settled_reference_fair if target["status"] == "completed" else np.nan,
+            "first_bottom_error_pct": float(abs(first["dynamic_bottom_usd"] / settled_bottom - 1.0)) if target["status"] == "completed" else np.nan,
+            "latest_bottom_error_pct": float(abs(last["dynamic_bottom_usd"] / settled_bottom - 1.0)) if target["status"] == "completed" else np.nan,
+            "first_fair_value_error_pct": float(abs(first["dynamic_reference_fair_value_usd"] / settled_reference_fair - 1.0)) if target["status"] == "completed" else np.nan,
+            "latest_fair_value_error_pct": float(abs(last["dynamic_reference_fair_value_usd"] / settled_reference_fair - 1.0)) if target["status"] == "completed" else np.nan,
+        })
+    return pd.DataFrame(paths), pd.DataFrame(summaries)
+
+
+def _bottom_sensitivity(
+    data: pd.DataFrame,
+    next_bottom_anchor: pd.Timestamp,
+    fair_multiplier: float,
+) -> pd.DataFrame:
+    rows: list[dict] = []
+    latest = pd.Timestamp(data["date"].max())
+    for half_window in (60, 90, 120, 180):
+        for cluster_days in (3, 7, 14, 30):
+            for statistic in ("median", "geometric_mean"):
+                regions = _extract_regions(
+                    data, BOTTOM_TURNING_REGIONS, half_window, "bottom",
+                    cluster_days=cluster_days, statistic=statistic,
+                )
+                current = regions[regions["cycle"] == len(BOTTOM_TURNING_REGIONS) - 1]
+                completed = regions[regions["cycle"] < len(BOTTOM_TURNING_REGIONS) - 1]
+                if current.empty or len(completed) < 3:
+                    rows.append({
+                        "half_window_days": half_window,
+                        "cluster_days": cluster_days,
+                        "statistic": statistic,
+                        "available": False,
+                    })
+                    continue
+                _, prior_validation = _walk_forward(completed)
+                target = current.iloc[0]
+                dynamic = _dynamic_bottom_estimate(
+                    completed, target, latest, prior_validation, half_window=half_window
+                )
+                adjusted = pd.concat([completed, current], ignore_index=True)
+                adjusted.loc[adjusted.index[-1], "region_price_usd"] = dynamic["dynamic_bottom_usd"]
+                adjusted.loc[adjusted.index[-1], "region_date"] = pd.Timestamp(target["anchor_date"])
+                _, validation = _walk_forward(adjusted)
+                forecasts = _forecast_candidates(adjusted, next_bottom_anchor, validation)
+                previous = completed.iloc[-1]
+                current_foundation = _foundation_at(
+                    latest, previous["region_date"], previous["region_price_usd"],
+                    target["anchor_date"], dynamic["dynamic_bottom_usd"],
+                )
+                rows.append({
+                    "half_window_days": half_window,
+                    "cluster_days": cluster_days,
+                    "statistic": statistic,
+                    "available": True,
+                    "forming_region_usd": float(target["region_price_usd"]),
+                    "forming_evidence_weight": dynamic["forming_evidence_weight"],
+                    "dynamic_current_bottom_usd": dynamic["dynamic_bottom_usd"],
+                    "current_foundation_usd": current_foundation,
+                    "fair_value_if_multiplier_held_usd": current_foundation * fair_multiplier,
+                    "next_bottom_ensemble_usd": _ensemble_value(forecasts),
+                    "internal_models_available": int(len(forecasts)),
+                })
+    return pd.DataFrame(rows)
 
 
 def _cycle_balanced_all_price_backbone(data: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
@@ -245,7 +636,6 @@ def _cycle_balanced_all_price_backbone(data: pd.DataFrame) -> tuple[pd.DataFrame
     curve["all_price_backbone_usd"] = np.exp(intercept + slope * np.log(curve_days))
     return curve, {
         "exponent": float(slope),
-        "intercept": float(intercept),
         "latest_backbone_usd": float(curve["all_price_backbone_usd"].iloc[-1]),
         "open_cycle_evidence_weight": progress,
     }
@@ -255,151 +645,124 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     data = _normalise(prices)
     if data.empty:
         raise ValueError("No valid Bitcoin prices are available.")
+    latest = pd.Timestamp(data["date"].max())
 
-    bottoms = _extract_regions(
+    observed_bottoms = _add_bottom_growth(_extract_regions(
         data, BOTTOM_TURNING_REGIONS, BOTTOM_WINDOW_DAYS, "bottom"
-    )
-    peaks = _extract_regions(
-        data, PEAK_TURNING_REGIONS, PEAK_WINDOW_DAYS, "peak"
-    )
-    if len(bottoms) < 4:
-        raise ValueError("At least four observable Bitcoin bottom regions are required.")
-
-    bottoms = bottoms.sort_values("region_date").reset_index(drop=True)
-    bottoms["bottom_to_bottom_multiple"] = bottoms["region_price_usd"].pct_change() + 1.0
-    bottoms["bottom_to_bottom_cagr"] = np.nan
-    for index in range(1, len(bottoms)):
-        years = (bottoms.loc[index, "region_date"] - bottoms.loc[index - 1, "region_date"]).days / 365.2425
-        bottoms.loc[index, "bottom_to_bottom_cagr"] = (
-            (bottoms.loc[index, "region_price_usd"] / bottoms.loc[index - 1, "region_price_usd"]) ** (1.0 / years) - 1.0
-        )
+    ))
+    peaks = _extract_regions(data, PEAK_TURNING_REGIONS, PEAK_WINDOW_DAYS, "peak")
+    if len(observed_bottoms) < 5 or len(peaks) < 4:
+        raise ValueError("The complete bottom/peak research catalog is not observable yet.")
 
     mature_anchor_dates = [pd.Timestamp(item["anchor_date"]) for item in BOTTOM_TURNING_REGIONS[1:]]
     mature_cycle_days = np.diff(pd.DatetimeIndex(mature_anchor_dates).asi8) / (24 * 60 * 60 * 1e9)
     expected_cycle_days = int(round(float(np.median(mature_cycle_days))))
-    current_turning_anchor = pd.Timestamp(BOTTOM_TURNING_REGIONS[-1]["anchor_date"])
-    next_bottom_anchor = current_turning_anchor + pd.Timedelta(days=expected_cycle_days)
+    current_anchor = pd.Timestamp(BOTTOM_TURNING_REGIONS[-1]["anchor_date"])
+    next_bottom_anchor = current_anchor + pd.Timedelta(days=expected_cycle_days)
     mature_bull_days = [
         (pd.Timestamp(PEAK_TURNING_REGIONS[index]["anchor_date"]) - pd.Timestamp(BOTTOM_TURNING_REGIONS[index]["anchor_date"])).days
         for index in range(1, len(PEAK_TURNING_REGIONS))
     ]
     expected_bull_days = int(round(float(np.median(mature_bull_days))))
-    next_peak_anchor = current_turning_anchor + pd.Timedelta(days=expected_bull_days)
+    next_peak_anchor = current_anchor + pd.Timedelta(days=expected_bull_days)
 
-    walk, validation = _walk_forward(bottoms)
-    forecasts: list[dict] = []
-    for model_id, label in CANDIDATE_LABELS.items():
-        prediction = _candidate_prediction(
-            model_id,
-            bottoms["region_date"].tolist(),
-            bottoms["region_price_usd"].to_numpy(dtype=float),
-            next_bottom_anchor,
-        )
-        validation_row = validation[validation["model_id"] == model_id]
-        forecasts.append({
-            "model_id": model_id,
-            "model": label,
-            "next_bottom_anchor": next_bottom_anchor,
-            "predicted_bottom_usd": prediction,
-            "ensemble_weight": (
-                float(validation_row["ensemble_weight"].iloc[0])
-                if not validation_row.empty else 0.0
-            ),
-            "validation_holdouts": (
-                int(validation_row["holdouts"].iloc[0])
-                if not validation_row.empty else 0
-            ),
-            "approx_typical_pct_error": (
-                float(validation_row["approx_typical_pct_error"].iloc[0])
-                if not validation_row.empty else np.nan
-            ),
-        })
-    forecast_df = pd.DataFrame(forecasts)
-    valid_forecasts = forecast_df[
-        np.isfinite(forecast_df["predicted_bottom_usd"])
-        & (forecast_df["predicted_bottom_usd"] > 0)
-        & (forecast_df["ensemble_weight"] > 0)
-    ].copy()
-    valid_forecasts["ensemble_weight"] /= valid_forecasts["ensemble_weight"].sum()
-    forecast_df = forecast_df.drop(columns="ensemble_weight").merge(
-        valid_forecasts[["model_id", "ensemble_weight"]], on="model_id", how="left"
+    completed_bottoms = observed_bottoms[observed_bottoms["status"] == "completed"].copy()
+    _, prior_validation = _walk_forward(completed_bottoms)
+    current_observed = observed_bottoms.iloc[-1]
+    current_dynamic = _dynamic_bottom_estimate(
+        completed_bottoms, current_observed, latest, prior_validation
     )
-    forecast_df["ensemble_weight"] = forecast_df["ensemble_weight"].fillna(0.0)
-    central_next_bottom = float(np.exp(np.sum(
-        valid_forecasts["ensemble_weight"].to_numpy(dtype=float)
-        * np.log(valid_forecasts["predicted_bottom_usd"].to_numpy(dtype=float))
+
+    settled_bottoms = observed_bottoms.copy()
+    settled_bottoms.loc[settled_bottoms.index[-1], "region_price_usd"] = current_dynamic["dynamic_bottom_usd"]
+    settled_bottoms.loc[settled_bottoms.index[-1], "region_date"] = current_anchor
+    settled_bottoms = _add_bottom_growth(settled_bottoms)
+
+    fair_cycles = _build_fair_value_cycles(data, settled_bottoms, peaks)
+    fair_walk, fair_methods = _fair_value_walk_forward(data, settled_bottoms, fair_cycles)
+    current_cycle_id = int(fair_cycles["cycle"].max())
+    current_methods = fair_cycles[fair_cycles["cycle"] == current_cycle_id].merge(
+        fair_methods[["method_id", "ensemble_weight", "completed_holdouts", "mean_combined_score"]],
+        on="method_id", how="left",
+    )
+    current_methods["ensemble_weight"] = current_methods["ensemble_weight"].fillna(1.0 / len(current_methods))
+    current_methods["ensemble_weight"] /= current_methods["ensemble_weight"].sum()
+    fair_multiplier = float(np.exp(np.sum(
+        current_methods["ensemble_weight"].to_numpy(dtype=float)
+        * np.log(current_methods["fair_multiple"].to_numpy(dtype=float))
     )))
-    low_next_bottom = float(valid_forecasts["predicted_bottom_usd"].min())
-    high_next_bottom = float(valid_forecasts["predicted_bottom_usd"].max())
+    fair_multiplier_low = float(current_methods["fair_multiple"].min())
+    fair_multiplier_high = float(current_methods["fair_multiple"].max())
 
-    observed_foundation_at_peaks = _log_interpolate(
-        peaks["region_date"], bottoms["region_date"], bottoms["region_price_usd"]
+    bottom_walk, bottom_validation = _walk_forward(settled_bottoms)
+    forecasts = _forecast_candidates(settled_bottoms, next_bottom_anchor, bottom_validation)
+    next_bottom_central = _ensemble_value(forecasts)
+    forecasts["next_bottom_anchor"] = next_bottom_anchor
+
+    previous = settled_bottoms.iloc[-2]
+    current_foundation = _foundation_at(
+        latest, previous["region_date"], previous["region_price_usd"],
+        current_anchor, current_dynamic["dynamic_bottom_usd"],
     )
-    peaks = peaks.copy()
-    peaks["bottom_foundation_usd"] = observed_foundation_at_peaks
-    peaks["peak_to_bottom_foundation"] = peaks["region_price_usd"] / peaks["bottom_foundation_usd"]
-    peaks["cycle_neutral_fair_multiple"] = np.sqrt(peaks["peak_to_bottom_foundation"])
+    current_fair = current_foundation * fair_multiplier
+    current_fair_low = current_foundation * fair_multiplier_low
+    current_fair_high = current_foundation * fair_multiplier_high
 
-    latest_date = pd.Timestamp(data["date"].max())
-    first_curve_date = pd.Timestamp(bottoms["region_date"].min())
-    curve_dates = pd.date_range(first_curve_date, next_bottom_anchor, freq="D")
-    last_bottom_date = pd.Timestamp(bottoms["region_date"].iloc[-1])
-    last_bottom_price = float(bottoms["region_price_usd"].iloc[-1])
+    sensitivity = _bottom_sensitivity(data, next_bottom_anchor, fair_multiplier)
+    available_sensitivity = sensitivity[sensitivity["available"]].copy()
+    dynamic_paths, dynamic_summary = _dynamic_settling_backtest(data, observed_bottoms, peaks)
 
-    central_anchor_dates = bottoms["region_date"].tolist() + [next_bottom_anchor]
-    central_anchor_values = bottoms["region_price_usd"].tolist() + [central_next_bottom]
-    low_anchor_values = bottoms["region_price_usd"].tolist() + [low_next_bottom]
-    high_anchor_values = bottoms["region_price_usd"].tolist() + [high_next_bottom]
-    foundation_central = _log_interpolate(curve_dates, central_anchor_dates, central_anchor_values)
-    foundation_low = _log_interpolate(curve_dates, central_anchor_dates, low_anchor_values)
-    foundation_high = _log_interpolate(curve_dates, central_anchor_dates, high_anchor_values)
+    curve_dates = pd.date_range(pd.Timestamp(settled_bottoms["region_date"].min()), next_bottom_anchor, freq="D")
+    bottom_anchor_dates = settled_bottoms["region_date"].tolist() + [next_bottom_anchor]
+    bottom_anchor_values = settled_bottoms["region_price_usd"].tolist() + [next_bottom_central]
+    bottom_foundation = _log_interpolate(curve_dates, bottom_anchor_dates, bottom_anchor_values)
 
-    neutral_multiplier = _log_interpolate(
-        curve_dates,
-        peaks["region_date"],
-        peaks["cycle_neutral_fair_multiple"],
+    cycle_multiplier_rows = fair_cycles.merge(
+        fair_methods[["method_id", "ensemble_weight"]], on="method_id", how="left"
     )
-    published_raw_curve, published_fair_curve, published_bottom_curve = _published_lines(curve_dates)
+    cycle_multipliers = []
+    for cycle, group in cycle_multiplier_rows.groupby("cycle"):
+        weights = group["ensemble_weight"].fillna(1.0 / len(group)).to_numpy(dtype=float)
+        weights /= weights.sum()
+        cycle_multipliers.append({
+            "date": pd.Timestamp(peaks.iloc[int(cycle)]["region_date"]),
+            "multiple": float(np.exp(np.sum(weights * np.log(group["fair_multiple"].to_numpy(dtype=float))))),
+        })
+    multiplier_dates = [row["date"] for row in cycle_multipliers] + [next_peak_anchor]
+    multiplier_values = [row["multiple"] for row in cycle_multipliers] + [fair_multiplier]
+    fair_multiplier_curve = _log_interpolate(curve_dates, multiplier_dates, multiplier_values)
     curve = pd.DataFrame({
         "date": curve_dates,
-        "row_type": np.where(curve_dates <= latest_date, "historical", "projected"),
-        "bottom_foundation_usd": foundation_central,
-        "bottom_foundation_low_usd": foundation_low,
-        "bottom_foundation_high_usd": foundation_high,
-        "cycle_neutral_multiple": neutral_multiplier,
-        "experimental_fair_value_usd": foundation_central * neutral_multiplier,
-        "experimental_fair_value_low_usd": foundation_low * neutral_multiplier,
-        "experimental_fair_value_high_usd": foundation_high * neutral_multiplier,
-        "published_raw_power_law_usd": published_raw_curve,
-        "published_fair_value_usd": published_fair_curve,
-        "published_bottom_usd": published_bottom_curve,
+        "row_type": np.where(curve_dates <= latest, "historical", "projected"),
+        "bottom_foundation_usd": bottom_foundation,
+        "fair_value_multiple": fair_multiplier_curve,
+        "dynamic_fair_value_usd": bottom_foundation * fair_multiplier_curve,
     })
 
-    current_curve_row = curve.iloc[(curve["date"] - latest_date).abs().argsort()[:1]].iloc[0]
-    raw_published, fair_published, bottom_published = _published_lines(pd.DatetimeIndex([latest_date]))
     all_price_curve, all_price_summary = _cycle_balanced_all_price_backbone(data)
-    current_fair = float(current_curve_row["experimental_fair_value_usd"])
     latest_price = float(data["price_usd"].iloc[-1])
-
+    selected_method = str(fair_methods.sort_values("ensemble_weight", ascending=False)["method"].iloc[0])
     summary = {
         "model_version": MODEL_VERSION,
         "status": "RESEARCH_ONLY",
         "confidence": "LOW — only a few independent Bitcoin cycles exist",
-        "latest_date": latest_date,
+        "latest_date": latest,
         "latest_price_usd": latest_price,
-        "current_bottom_region_date": pd.Timestamp(bottoms["region_date"].iloc[-1]),
-        "current_bottom_region_usd": last_bottom_price,
-        "current_bottom_extreme_usd": float(bottoms["extreme_price_usd"].iloc[-1]),
-        "current_bottom_status": bottoms["status"].iloc[-1],
-        "current_bottom_foundation_usd": float(current_curve_row["bottom_foundation_usd"]),
-        "latest_peak_region_usd": float(peaks["region_price_usd"].iloc[-1]),
-        "latest_peak_foundation_multiple": float(peaks["peak_to_bottom_foundation"].iloc[-1]),
-        "cycle_neutral_fair_multiple": float(peaks["cycle_neutral_fair_multiple"].iloc[-1]),
-        "experimental_fair_value_usd": current_fair,
-        "price_to_experimental_fair_value": latest_price / current_fair,
-        "published_raw_power_law_usd": float(raw_published[0]),
-        "published_fair_value_benchmark_usd": float(fair_published[0]),
-        "published_bottom_benchmark_usd": float(bottom_published[0]),
+        "forming_bottom_region_usd": float(current_observed["region_price_usd"]),
+        "forming_bottom_extreme_usd": float(current_observed["extreme_price_usd"]),
+        "forming_evidence_weight": current_dynamic["forming_evidence_weight"],
+        "pre_observation_bottom_forecast_usd": current_dynamic["forecast_bottom_usd"],
+        "dynamic_settled_bottom_estimate_usd": current_dynamic["dynamic_bottom_usd"],
+        "dynamic_bottom_forecast_low_usd": current_dynamic["forecast_low_usd"],
+        "dynamic_bottom_forecast_high_usd": current_dynamic["forecast_high_usd"],
+        "current_bottom_foundation_usd": current_foundation,
+        "dynamic_fair_value_usd": current_fair,
+        "dynamic_fair_value_low_usd": current_fair_low,
+        "dynamic_fair_value_high_usd": current_fair_high,
+        "price_to_dynamic_fair_value": latest_price / current_fair,
+        "fair_value_multiple": fair_multiplier,
+        "fair_value_method_leader": selected_method,
+        "fair_value_completed_holdouts": int(fair_methods["completed_holdouts"].max()),
         "all_price_backbone_usd": all_price_summary["latest_backbone_usd"],
         "all_price_backbone_exponent": all_price_summary["exponent"],
         "all_price_open_cycle_weight": all_price_summary["open_cycle_evidence_weight"],
@@ -407,20 +770,31 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "expected_bull_days": expected_bull_days,
         "next_peak_anchor": next_peak_anchor,
         "next_bottom_anchor": next_bottom_anchor,
-        "next_bottom_ensemble_usd": central_next_bottom,
-        "next_bottom_candidate_low_usd": low_next_bottom,
-        "next_bottom_candidate_high_usd": high_next_bottom,
-        "next_bottom_range_type": "full range of transparent candidate models; not a probability interval",
-        "fair_value_method": "log midpoint between the bottom foundation and the latest observed peak multiple",
-        "candidate_weight_method": "walk-forward error weighting with forming-cycle evidence at half weight",
+        "next_bottom_internal_ensemble_usd": next_bottom_central,
+        "next_bottom_candidate_low_usd": float(forecasts["predicted_bottom_usd"].min()),
+        "next_bottom_candidate_high_usd": float(forecasts["predicted_bottom_usd"].max()),
+        "bottom_sensitivity_variants": int(len(available_sensitivity)),
+        "bottom_sensitivity_dynamic_low_usd": float(available_sensitivity["dynamic_current_bottom_usd"].min()),
+        "bottom_sensitivity_dynamic_high_usd": float(available_sensitivity["dynamic_current_bottom_usd"].max()),
+        "bottom_sensitivity_fair_low_usd": float(available_sensitivity["fair_value_if_multiplier_held_usd"].min()),
+        "bottom_sensitivity_fair_high_usd": float(available_sensitivity["fair_value_if_multiplier_held_usd"].max()),
+        "candidate_weight_method": "internal walk-forward error weighting",
+        "dynamic_settling_method": "pre-observation internal forecast blended with forming bottom evidence by turning-window completion",
+        "fair_value_method": "validation-weighted ensemble of four internally derived cycle-neutral definitions",
     }
     return BottomAnchoredModelResult(
         summary=summary,
-        bottom_regions=bottoms,
+        bottom_regions=observed_bottoms,
         peak_regions=peaks,
         curve=curve,
-        candidate_forecasts=forecast_df.sort_values("predicted_bottom_usd").reset_index(drop=True),
-        validation_summary=validation.sort_values("ensemble_weight", ascending=False).reset_index(drop=True),
-        walk_forward=walk.sort_values(["target_date", "model"]).reset_index(drop=True),
+        candidate_forecasts=forecasts.sort_values("predicted_bottom_usd").reset_index(drop=True),
+        validation_summary=bottom_validation.sort_values("ensemble_weight", ascending=False).reset_index(drop=True),
+        walk_forward=bottom_walk.sort_values(["target_date", "model"]).reset_index(drop=True),
+        bottom_sensitivity=sensitivity,
+        fair_value_cycles=fair_cycles,
+        fair_value_validation=fair_walk,
+        fair_value_methods=current_methods.sort_values("ensemble_weight", ascending=False).reset_index(drop=True),
+        dynamic_settling=dynamic_paths,
+        dynamic_settling_summary=dynamic_summary,
         all_price_curve=all_price_curve,
     )
