@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from importlib import reload
 
 import numpy as np
 import pandas as pd
@@ -9,6 +10,12 @@ import streamlit as st
 
 from src.data_pipeline import load_coinmetrics
 import src.price_model as price_model
+
+
+# Streamlit reruns the page in a long-lived process. Reloading prevents a newly
+# deployed page from retaining an older price_model module in memory.
+price_model = reload(price_model)
+EXPECTED_SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v2"
 
 
 st.set_page_config(
@@ -65,6 +72,45 @@ except Exception as exc:
     st.stop()
 
 summary = model.summary
+required_summary_keys = {
+    "summary_schema",
+    "latest_date",
+    "latest_price_usd",
+    "price_to_dynamic_fair_value",
+    "dynamic_fair_value_usd",
+    "dynamic_settled_bottom_estimate_usd",
+}
+missing_summary_keys = sorted(required_summary_keys.difference(summary))
+missing_result_sections = sorted(
+    section for section in (
+        "bottom_sensitivity",
+        "fair_value_methods",
+        "dynamic_settling",
+        "dynamic_settling_summary",
+    )
+    if not hasattr(model, section)
+)
+if (
+    missing_summary_keys
+    or missing_result_sections
+    or summary.get("summary_schema") != EXPECTED_SUMMARY_SCHEMA
+):
+    loaded_version = getattr(price_model, "MODEL_VERSION", "unknown")
+    st.error(
+        "The page and model engine are from different project versions. Update both "
+        "`streamlit_app.py` and `src/price_model.py` from the same ZIP, then reboot the Streamlit app."
+    )
+    st.code(
+        json.dumps({
+            "loaded_model_version": loaded_version,
+            "expected_summary_schema": EXPECTED_SUMMARY_SCHEMA,
+            "loaded_summary_schema": summary.get("summary_schema"),
+            "missing_summary_keys": missing_summary_keys,
+            "missing_result_sections": missing_result_sections,
+        }, indent=2),
+        language="json",
+    )
+    st.stop()
 latest_date = pd.Timestamp(summary["latest_date"])
 
 st.title("₿ Bitcoin Fair Value")

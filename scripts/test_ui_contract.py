@@ -9,6 +9,13 @@ assert "Research Lab — calibration and evidence" in page
 assert "The current cycle is still settling" in page
 assert "Bottom-definition sensitivity" in page
 assert "Historical fake-today test" in page
+assert "price_model = reload(price_model)" in page
+assert "required_summary_keys" in page
+assert "The page and model engine are from different project versions" in page
+guard_position = page.index("The page and model engine are from different project versions")
+ratio_position = page.index('ratio = float(summary["price_to_dynamic_fair_value"])')
+assert guard_position < ratio_position
+assert "price_model.SUMMARY_SCHEMA" not in page
 assert "Your scenario — never used as model evidence" in page
 assert "Copy/paste research diagnostics" in page
 assert "bitcoin-dynamic-settling-copy-block-v2" in page

@@ -10,7 +10,7 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from src.price_model import fit_bottom_anchored_model  # noqa: E402
+from src.price_model import SUMMARY_SCHEMA, fit_bottom_anchored_model  # noqa: E402
 
 
 def synthetic_prices() -> pd.DataFrame:
@@ -31,6 +31,7 @@ def main() -> None:
     assert len(result.candidate_forecasts) == 4
     assert np.isclose(result.candidate_forecasts["ensemble_weight"].sum(), 1.0)
     assert result.summary["dynamic_fair_value_usd"] > 0
+    assert result.summary["summary_schema"] == SUMMARY_SCHEMA
     assert result.summary["dynamic_settled_bottom_estimate_usd"] > 0
     assert 0 <= result.summary["forming_evidence_weight"] <= 1
     assert result.summary["next_bottom_candidate_low_usd"] > 0

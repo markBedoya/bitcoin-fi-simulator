@@ -1,5 +1,7 @@
 # Bitcoin Fair Value
 
+Current model: `bottom-anchored-dynamic-settling-v0.2.1`
+
 A single-page Streamlit research application for estimating Bitcoin fair value from bear-market bottom regions that settle gradually as new evidence arrives.
 
 The public page shows:

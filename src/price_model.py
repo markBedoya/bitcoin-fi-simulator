@@ -6,7 +6,8 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.2.0"
+MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.2.1"
+SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v2"
 GENESIS = pd.Timestamp("2009-01-03")
 BOTTOM_WINDOW_DAYS = 120
 PEAK_WINDOW_DAYS = 90
@@ -743,6 +744,7 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     latest_price = float(data["price_usd"].iloc[-1])
     selected_method = str(fair_methods.sort_values("ensemble_weight", ascending=False)["method"].iloc[0])
     summary = {
+        "summary_schema": SUMMARY_SCHEMA,
         "model_version": MODEL_VERSION,
         "status": "RESEARCH_ONLY",
         "confidence": "LOW — only a few independent Bitcoin cycles exist",
