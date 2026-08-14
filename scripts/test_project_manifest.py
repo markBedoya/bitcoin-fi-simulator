@@ -25,6 +25,7 @@ python_files = sorted(
     for path in ROOT.rglob("*.py")
 )
 expected_python = [
+    "scripts/test_lifecycle.py",
     "scripts/test_price_model.py",
     "scripts/test_project_manifest.py",
     "scripts/test_ui_contract.py",

@@ -15,7 +15,7 @@ import src.price_model as price_model
 # Streamlit reruns the page in a long-lived process. Reloading prevents a newly
 # deployed page from retaining an older price_model module in memory.
 price_model = reload(price_model)
-EXPECTED_SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v7"
+EXPECTED_SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v8"
 
 
 st.set_page_config(
@@ -27,10 +27,14 @@ st.set_page_config(
 
 
 def money(value: float) -> str:
+    if value is None or not np.isfinite(float(value)):
+        return "Not observable yet"
     return f"${value:,.0f}"
 
 
 def copy_safe(value):
+    if value is pd.NaT or value is pd.NA:
+        return None
     if isinstance(value, np.generic):
         value = value.item()
     if isinstance(value, (pd.Timestamp, pd.Timedelta)):
@@ -63,7 +67,10 @@ with st.sidebar:
         "Research model. Turning dates locate broad market regions; exact daily highs and lows can occur "
         "before or after them."
     )
-    st.caption("Bitcoin prices remain cached until **Refresh Bitcoin data** is clicked or the app restarts.")
+    st.caption(
+        "Bitcoin prices refresh automatically when the runtime cache is 24 hours old. "
+        "Use **Refresh Bitcoin data** to update immediately."
+    )
 
 try:
     prices, meta = load_coinmetrics(refresh=refresh)
@@ -78,7 +85,11 @@ required_summary_keys = {
     "latest_date",
     "latest_price_usd",
     "price_to_dynamic_fair_value",
+    "forming_bottom_region_usd",
+    "pre_observation_bottom_forecast_usd",
     "dynamic_fair_value_usd",
+    "dynamic_fair_value_low_usd",
+    "dynamic_fair_value_high_usd",
     "dynamic_settled_bottom_estimate_usd",
     "linear_window_progress",
     "forming_evidence_weight",
@@ -89,7 +100,17 @@ required_summary_keys = {
     "dynamic_fair_value_cycle_low_usd",
     "dynamic_fair_value_cycle_high_usd",
     "current_bottom_anchor",
+    "current_cycle",
+    "current_cycle_lifecycle_state",
+    "current_cycle_observation_window_start",
     "current_cycle_observation_window_end",
+    "rolling_cycle_engine",
+    "rolling_cycle_status",
+    "completed_bottom_cycles",
+    "automatically_promoted_bottom_cycles",
+    "last_completed_bottom_region_date",
+    "active_peak_lifecycle_state",
+    "next_peak_anchor",
     "anchor_marginalization_method",
     "anchor_marginalization_variants",
     "forming_bottom_region_anchor_low_usd",
@@ -102,9 +123,28 @@ required_summary_keys = {
     "anchor_timing_empirical_fair_high_usd",
     "next_bottom_cycle_low_usd",
     "next_bottom_cycle_high_usd",
+    "next_bottom_anchor",
     "next_bottom_core_usd",
     "next_bottom_core_low_usd",
     "next_bottom_core_high_usd",
+    "next_bottom_core_stress_low_usd",
+    "next_bottom_core_stress_high_usd",
+    "next_bottom_core_multiple",
+    "mature_observed_growth_path",
+    "settling_calibration_cycles",
+    "bottom_sensitivity_variants",
+    "bottom_sensitivity_dynamic_low_usd",
+    "bottom_sensitivity_dynamic_high_usd",
+    "bottom_sensitivity_fair_low_usd",
+    "bottom_sensitivity_fair_high_usd",
+    "current_anchor_completed_intervals",
+    "anchor_timing_empirical_evidence_low",
+    "anchor_timing_empirical_evidence_high",
+    "anchor_timing_empirical_next_bottom_low_usd",
+    "anchor_timing_empirical_next_bottom_high_usd",
+    "original_rough_current_bottom_anchor",
+    "all_price_backbone_usd",
+    "all_price_backbone_exponent",
 }
 missing_summary_keys = sorted(required_summary_keys.difference(summary))
 missing_result_sections = sorted(
@@ -144,6 +184,14 @@ if (
     )
     st.stop()
 latest_date = pd.Timestamp(summary["latest_date"])
+active_state = str(summary["current_cycle_lifecycle_state"])
+active_bottom_year = pd.Timestamp(summary["current_bottom_anchor"]).year
+projected_bottom_year = pd.Timestamp(summary["next_bottom_anchor"]).year
+scenario_peak_year = (
+    pd.Timestamp(summary["next_peak_anchor"]).year
+    if pd.notna(summary["next_peak_anchor"])
+    else active_bottom_year - 1
+)
 
 st.title("₿ Bitcoin Fair Value")
 st.caption(
@@ -169,20 +217,32 @@ m1, m2, m3, m4, m5 = st.columns(5)
 m1.metric("Bitcoin price", money(summary["latest_price_usd"]))
 m2.metric("Dynamic fair value", money(summary["dynamic_fair_value_usd"]))
 m3.metric("Price / fair value", f"{ratio:.3f}×")
-m4.metric("Settling bottom estimate", money(summary["dynamic_settled_bottom_estimate_usd"]))
+m4.metric(
+    "Settling bottom estimate" if active_state == "forming" else f"{active_bottom_year} bottom prior",
+    money(summary["dynamic_settled_bottom_estimate_usd"]),
+)
 m5.metric("Valuation", valuation_label)
 
-st.info(
-    f"The anchor-marginalized forming bottom region is **{money(summary['forming_bottom_region_usd'])}**, "
-    f"combining the empirical dates around the **{pd.Timestamp(summary['current_bottom_anchor']).date()}** timing center. "
-    f"The window is **{summary['linear_window_progress']:.1%}** complete, while the calibrated historical "
-    f"evidence weight is **{summary['forming_evidence_weight']:.1%}**. The observed region is blended "
-    f"with the pre-observation estimate of **{money(summary['pre_observation_bottom_forecast_usd'])}**. "
-    f"That produces a settling bottom estimate of **{money(summary['dynamic_settled_bottom_estimate_usd'])}** "
-    f"and fair value of **{money(summary['dynamic_fair_value_usd'])}**. When any one completed cycle is "
-    f"removed, the bottom remains within **{money(summary['dynamic_settled_bottom_cycle_low_usd'])}–"
-    f"{money(summary['dynamic_settled_bottom_cycle_high_usd'])}**."
-)
+if active_state == "forming":
+    st.info(
+        f"The anchor-marginalized forming bottom region is **{money(summary['forming_bottom_region_usd'])}**, "
+        f"combining the empirical dates around the **{pd.Timestamp(summary['current_bottom_anchor']).date()}** timing center. "
+        f"The window is **{summary['linear_window_progress']:.1%}** complete, while the calibrated historical "
+        f"evidence weight is **{summary['forming_evidence_weight']:.1%}**. The observed region is blended "
+        f"with the pre-observation estimate of **{money(summary['pre_observation_bottom_forecast_usd'])}**. "
+        f"That produces a settling bottom estimate of **{money(summary['dynamic_settled_bottom_estimate_usd'])}** "
+        f"and fair value of **{money(summary['dynamic_fair_value_usd'])}**. When any one completed cycle is "
+        f"removed, the bottom remains within **{money(summary['dynamic_settled_bottom_cycle_low_usd'])}–"
+        f"{money(summary['dynamic_settled_bottom_cycle_high_usd'])}**."
+    )
+else:
+    st.info(
+        f"The **{active_bottom_year}** bottom target is still before its observation window, which begins "
+        f"**{pd.Timestamp(summary['current_cycle_observation_window_start']).date()}**. Its current "
+        f"**{money(summary['dynamic_settled_bottom_estimate_usd'])}** estimate is therefore prior-only, "
+        "with 0% observed-region evidence. Fair value continues to update from market price history and "
+        f"the completed bottom foundation; it is currently **{money(summary['dynamic_fair_value_usd'])}**."
+    )
 
 curve = model.curve
 historical_curve = curve[curve["row_type"] == "historical"]
@@ -206,13 +266,15 @@ figure.add_trace(go.Scatter(
     x=historical_curve["date"], y=historical_curve["dynamic_fair_value_usd"], mode="lines",
     name="Dynamic fair value", line={"color": "#F7931A", "width": 3},
 ))
+observed_bottom_markers = model.bottom_regions[model.bottom_regions["region_price_usd"].notna()]
+observed_peak_markers = model.peak_regions[model.peak_regions["region_price_usd"].notna()]
 figure.add_trace(go.Scatter(
-    x=model.bottom_regions["region_date"], y=model.bottom_regions["region_price_usd"],
+    x=observed_bottom_markers["region_date"], y=observed_bottom_markers["region_price_usd"],
     mode="markers", name="Observed bottom regions",
     marker={"size": 11, "color": "#72D572", "symbol": "circle-open", "line": {"width": 2}},
 ))
 figure.add_trace(go.Scatter(
-    x=model.peak_regions["region_date"], y=model.peak_regions["region_price_usd"],
+    x=observed_peak_markers["region_date"], y=observed_peak_markers["region_price_usd"],
     mode="markers", name="Observed peak regions",
     marker={"size": 10, "color": "#FFD166", "symbol": "diamond-open", "line": {"width": 2}},
 ))
@@ -234,52 +296,69 @@ figure.update_layout(
 )
 st.plotly_chart(figure, use_container_width=True, config={"displaylogo": False})
 p1, p2, p3 = st.columns(3)
-p1.metric("2030 mature-cycle bottom", money(summary["next_bottom_core_usd"]))
+p1.metric(f"{projected_bottom_year} mature-cycle bottom", money(summary["next_bottom_core_usd"]))
 p2.metric(
     "Definition range",
     f"{money(summary['next_bottom_core_low_usd'])}–{money(summary['next_bottom_core_high_usd'])}",
 )
 p3.metric("Projected bottom growth", f"{summary['next_bottom_core_multiple']:.3f}×")
 st.caption(
-    "The dashed green line extends only to the next mature-cycle bottom—not yet ten years. Recursive bottom "
-    "projection has not been validated, and fair value stops at today because future peak compression has not "
-    "been modeled. The definition range is not a confidence interval."
+    f"The dashed green line extends one bottom beyond the active {active_bottom_year} target, to "
+    f"{projected_bottom_year}—not yet a fixed ten-year horizon. Recursive bottom projection has not been "
+    "validated, and fair value stops at today because future peak compression has not been modeled. "
+    "The definition range is not a confidence interval."
 )
 
 with st.expander("How the model works", expanded=False):
     st.markdown(
         """
 1. **Bottom regions:** each turning area is represented by a cluster of low daily closes, so one wick does not define the model.
-2. **Anchor timing:** the forming 2026 timing range is derived from completed mature intervals; early, central, and late anchor models are combined so one window boundary cannot control the public result.
-3. **Dynamic settling:** an internal forecast is blended with the observed forming region using an empirical settling-speed curve learned from completed bottoms.
+2. **Rolling anchor timing:** every active timing range is derived from completed mature intervals; early, central, and late anchor models are combined so one window boundary cannot control the public result.
+3. **Dynamic settling:** an internal forecast is blended with the observed forming region using an empirical settling-speed curve. Before the window begins, observed evidence is zero.
 4. **Bottom foundation:** settled regions are joined in log-price space, creating the structural curve beneath market cycles.
 5. **Fair value:** four cycle-neutral definitions are tested on earlier completed cycles and combined using walk-forward validation weights.
-6. **Mature-cycle projection:** decaying bottom growth across the 2015→2018, 2018→2022, and forming 2022→2026 transitions produces the core next-bottom estimate.
-7. **Pre-observation prior:** several internal rules create a forecast before a forming bottom is observed. They help the 2026 estimate settle but are not presented as 2030 paths.
+6. **Automatic rollover:** after a complete observation window closes, the settled region is promoted into history and the next bottom and peak targets are generated automatically.
+7. **Mature-cycle projection:** decaying growth across mature bottom transitions produces the core estimate one bottom beyond the active target.
 8. **Scenario separation:** user-entered future prices remain scenarios and never become training evidence.
         """
     )
 
 with st.expander("Research Lab — calibration and evidence", expanded=True):
-    st.subheader("The current cycle is still settling")
+    st.subheader(
+        "The current cycle is still settling"
+        if active_state == "forming"
+        else "The active bottom is still prior-only"
+    )
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Pre-observation estimate", money(summary["pre_observation_bottom_forecast_usd"]))
     c2.metric("Marginalized forming region", money(summary["forming_bottom_region_usd"]))
     c3.metric("Linear window progress", f"{summary['linear_window_progress']:.1%}")
     c4.metric("Empirical evidence", f"{summary['forming_evidence_weight']:.1%}")
     c5.metric("Dynamic settled estimate", money(summary["dynamic_settled_bottom_estimate_usd"]))
-    st.caption(
-        "The estimate is allowed to move while the current turning window is incomplete. It is not treated "
-        "as a finished $60K bottom merely because that is the lowest region observed so far. Evidence weight "
-        "describes blending influence, not the probability that the market bottom has occurred."
-    )
+    if active_state == "forming":
+        st.caption(
+            "The estimate is allowed to move while the current turning window is incomplete. It is not treated "
+            "as a finished bottom merely because that is the lowest region observed so far. Evidence weight "
+            "describes blending influence, not the probability that the market bottom has occurred."
+        )
+    else:
+        st.caption(
+            "No prices from the active target window are available yet, so the bottom estimate equals its "
+            "walk-forward prior. The observed-region evidence weight remains zero until the window begins."
+        )
 
     st.subheader("Current bottom-anchor timing")
     t1, t2, t3, t4 = st.columns(4)
-    t1.metric(
-        "Original rough anchor",
-        str(pd.Timestamp(summary["original_rough_current_bottom_anchor"]).date()),
-    )
+    if int(summary["current_cycle"]) == 4:
+        t1.metric(
+            "Original rough anchor",
+            str(pd.Timestamp(summary["original_rough_current_bottom_anchor"]).date()),
+        )
+    else:
+        t1.metric(
+            "Last settled region",
+            str(pd.Timestamp(summary["last_completed_bottom_region_date"]).date()),
+        )
     t2.metric("Learned timing center", str(pd.Timestamp(summary["current_bottom_anchor"]).date()))
     t3.metric(
         "Completed-cycle range",
@@ -304,7 +383,7 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
         f"{money(summary['anchor_timing_empirical_fair_high_usd'])}",
     )
     a4.metric(
-        "Empirical 2030-bottom range",
+        f"Empirical {projected_bottom_year}-bottom range",
         f"{money(summary['anchor_timing_empirical_next_bottom_low_usd'])}–"
         f"{money(summary['anchor_timing_empirical_next_bottom_high_usd'])}",
     )
@@ -322,18 +401,29 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
         }),
         use_container_width=True, hide_index=True,
     )
-    st.caption(
-        "The completed mature intervals were 1,431 and 1,437 days, pointing to October 25. October 7 is "
-        "retained as an early stress case, with an equally distant November 12 late stress case. The narrow "
-        "October 22–28 range is empirical but rests on only two completed mature intervals. The public model "
-        "uses an equal-weight geometric mean of the October 22, 25, and 28 price outputs; the table preserves "
-        "the exact-date models."
+    if int(summary["current_cycle"]) == 4:
+        st.caption(
+            "The completed mature intervals were 1,431 and 1,437 days, pointing to October 25. October 7 is "
+            "retained as an early stress case, with an equally distant November 12 late stress case. The narrow "
+            "October 22–28 range is empirical but rests on only two completed mature intervals. The public model "
+            "uses an equal-weight geometric mean of the October 22, 25, and 28 price outputs; the table preserves "
+            "the exact-date models."
+        )
+    else:
+        st.caption(
+            "The active timing center is generated from the latest settled empirical region and the median of "
+            "completed mature-cycle intervals. Early, central, and late timing variants are recomputed on every run."
+        )
+    st.success(
+        f"**Rolling lifecycle enabled:** {summary['rolling_cycle_status']}. The active peak state is "
+        f"**{summary['active_peak_lifecycle_state']}**. Completed windows are deterministic and cannot absorb "
+        "prices that arrive after their recorded window end."
     )
-    st.info(
-        f"**Lifecycle boundary:** this forming-cycle engine updates as new prices arrive through the full "
-        f"observation window ending **{pd.Timestamp(summary['current_cycle_observation_window_end']).date()}**. "
-        "Automatic promotion of the settled 2026 bottom and rollover to the next forming target are not yet implemented."
-    )
+    l1, l2, l3, l4 = st.columns(4)
+    l1.metric("Active bottom cycle", str(summary["current_cycle"]))
+    l2.metric("Bottom state", active_state.replace("_", " ").title())
+    l3.metric("Completed bottoms", str(summary["completed_bottom_cycles"]))
+    l4.metric("Automatic promotions", str(summary["automatically_promoted_bottom_cycles"]))
 
     st.subheader("Empirical settling-speed calibration")
     calibration_chart = go.Figure()
@@ -406,7 +496,7 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
         f"{money(summary['dynamic_fair_value_cycle_high_usd'])}",
     )
     u4.metric(
-        "2030 bottom range",
+        f"{projected_bottom_year} bottom range",
         f"{money(summary['next_bottom_cycle_low_usd'])}–{money(summary['next_bottom_cycle_high_usd'])}",
     )
     dependence_table = model.settling_cycle_dependence.copy()
@@ -463,7 +553,7 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
     )
     st.caption(
         "For completed cycles, the final column is calculated only after the full bottom window is known. "
-        "The forming cycle has no final answer yet."
+        "An active forming or pre-window cycle has no final answer yet."
     )
 
     st.subheader("Bottom-definition sensitivity")
@@ -505,7 +595,7 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
         "cycle", "label", "anchor_date", "region_date", "region_price_usd",
         "anchor_marginalized_region_usd",
         "extreme_date", "extreme_price_usd", "bottom_to_bottom_multiple",
-        "bottom_to_bottom_cagr", "status",
+        "bottom_to_bottom_cagr", "status", "lifecycle_state",
     ]].copy()
     bottom_view["public_model_region_usd"] = bottom_view[
         "anchor_marginalized_region_usd"
@@ -513,7 +603,7 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
     bottom_view = bottom_view.rename(columns={"region_price_usd": "exact_anchor_region_usd"})[[
         "cycle", "label", "anchor_date", "region_date", "public_model_region_usd",
         "exact_anchor_region_usd", "extreme_date", "extreme_price_usd",
-        "bottom_to_bottom_multiple", "bottom_to_bottom_cagr", "status",
+        "bottom_to_bottom_multiple", "bottom_to_bottom_cagr", "status", "lifecycle_state",
     ]]
     st.dataframe(
         bottom_view.style.format({
@@ -524,8 +614,9 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
         hide_index=True, use_container_width=True,
     )
     st.caption(
-        "Completed cycles use the same value in both columns. For the forming 2026 cycle, the public model "
-        "region is marginalized across October 22, 25, and 28; the exact-anchor column shows October 25 only."
+        "Completed cycles use the same value in both columns. For the active cycle, the public model region "
+        "is marginalized across its empirical early, central, and late timing models; the exact-anchor column "
+        "shows only the central model. A pre-window target has no observed region yet."
     )
 
     st.subheader("Fair-value definitions and validation weights")
@@ -577,7 +668,7 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
     st.subheader("Ten-year projection readiness")
     r1, r2 = st.columns(2)
     r1.warning(
-        "**Bottom foundation: not yet.** The model currently supports one future bottom through 2030. "
+        "**Bottom foundation: not yet.** The model currently supports one bottom beyond the active rolling target. "
         "A ten-year line requires recursive mature-cycle decay and historical recursive backtesting."
     )
     r2.warning(
@@ -591,10 +682,10 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
 
     st.subheader("Your scenario — never used as model evidence")
     u1, u2, u3, u4 = st.columns(4)
-    scenario_bottom_low = u1.number_input("2030 bottom low", 1_000.0, 10_000_000.0, 100_000.0, 5_000.0)
-    scenario_bottom_high = u2.number_input("2030 bottom high", 1_000.0, 10_000_000.0, 120_000.0, 5_000.0)
-    scenario_peak_low = u3.number_input("2029 peak low", 1_000.0, 10_000_000.0, 150_000.0, 5_000.0)
-    scenario_peak_high = u4.number_input("2029 peak high", 1_000.0, 10_000_000.0, 180_000.0, 5_000.0)
+    scenario_bottom_low = u1.number_input(f"{projected_bottom_year} bottom low", 1_000.0, 10_000_000.0, 100_000.0, 5_000.0)
+    scenario_bottom_high = u2.number_input(f"{projected_bottom_year} bottom high", 1_000.0, 10_000_000.0, 120_000.0, 5_000.0)
+    scenario_peak_low = u3.number_input(f"{scenario_peak_year} peak low", 1_000.0, 10_000_000.0, 150_000.0, 5_000.0)
+    scenario_peak_high = u4.number_input(f"{scenario_peak_year} peak high", 1_000.0, 10_000_000.0, 180_000.0, 5_000.0)
     scenario_valid = scenario_bottom_low <= scenario_bottom_high < scenario_peak_low <= scenario_peak_high
     if scenario_valid:
         shallow_drawdown = 1.0 - scenario_bottom_high / scenario_peak_low
@@ -638,15 +729,15 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
         hovertemplate="%{x}<br>$%{y:,.0f}<extra></extra>",
     ))
     forecast_chart.update_layout(
-        title="2030 bottom: mature-cycle definition range vs your scenario",
+        title=f"{projected_bottom_year} bottom: mature-cycle definition range vs your scenario",
         xaxis_title="", yaxis_title="Projected bottom-region price (USD)", height=430,
     )
     st.plotly_chart(forecast_chart, use_container_width=True, config={"displaylogo": False})
 
     st.subheader("Bottom-model walk-forward validation")
     st.caption(
-        "Each target bottom is hidden in turn; a model can use only earlier regions. The forming cycle "
-        "receives partial evidence weight."
+        "Each target bottom is hidden in turn; a model can use only earlier regions. An active forming cycle "
+        "receives partial evidence weight, while a pre-window target receives zero."
     )
     walk_view = model.walk_forward[[
         "model", "target_date", "target_status", "training_bottoms", "predicted_price_usd",
@@ -679,22 +770,36 @@ st.caption(
 )
 
 diagnostics = {
-    "diagnostics_schema": "bitcoin-dynamic-settling-copy-block-v7",
+    "diagnostics_schema": "bitcoin-dynamic-settling-copy-block-v8",
     "deployment": {
         "model_version": price_model.MODEL_VERSION,
         "loaded_engine_source": getattr(price_model, "__file__", "UNKNOWN"),
     },
     "data": meta,
+    "lifecycle": {
+        key: copy_safe(summary[key]) for key in (
+            "current_cycle", "current_cycle_lifecycle_state",
+            "current_cycle_observation_window_start", "current_cycle_observation_window_end",
+            "current_cycle_observed_region_available", "completed_bottom_cycles",
+            "automatically_promoted_bottom_cycles", "last_completed_bottom_cycle",
+            "last_completed_bottom_region_date", "last_completed_bottom_region_usd",
+            "active_peak_cycle", "active_peak_lifecycle_state", "active_peak_anchor",
+            "active_peak_observation_window_start", "active_peak_observation_window_end",
+            "rolling_cycle_engine", "rolling_cycle_status",
+        )
+    },
     "summary": copy_safe(summary),
     "bottom_regions": compact_records(model.bottom_regions, [
         "cycle", "label", "anchor_date", "region_date", "region_price_usd",
         "cluster_low_usd", "cluster_high_usd", "extreme_date", "extreme_price_usd",
         "anchor_marginalized_region_usd", "anchor_empirical_region_low_usd",
         "anchor_empirical_region_high_usd",
-        "bottom_to_bottom_multiple", "bottom_to_bottom_cagr", "status",
+        "bottom_to_bottom_multiple", "bottom_to_bottom_cagr", "status", "lifecycle_state",
+        "window_start", "window_end", "timing_anchor_date",
     ]),
     "peak_regions": compact_records(model.peak_regions, [
         "cycle", "label", "anchor_date", "region_date", "region_price_usd", "status",
+        "lifecycle_state", "window_start", "window_end",
     ]),
     "fair_value_methods": compact_records(model.fair_value_methods, [
         "method_id", "method", "fair_multiple", "ensemble_weight", "completed_holdouts",
@@ -736,7 +841,8 @@ diagnostics = {
     ]),
     "mature_cycle_forecast": compact_records(model.mature_cycle_forecast, [
         "model_id", "model", "target_date", "mature_start_cycle", "mature_transitions",
-        "includes_forming_current_bottom", "observed_growth_path", "next_growth_multiple", "predicted_bottom_usd",
+        "includes_forming_current_bottom", "active_endpoint_state", "observed_growth_path",
+        "next_growth_multiple", "predicted_bottom_usd",
         "definition_range_low_usd", "definition_range_high_usd", "definition_stress_low_usd",
         "definition_stress_high_usd", "definition_variants", "range_definition", "validation_status",
     ]),

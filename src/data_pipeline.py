@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-import requests
 
 
 CACHE = Path("/tmp/bitcoin-bottom-fair-value/coinmetrics_btc_daily.csv")
+CACHE_MAX_AGE = pd.Timedelta(hours=24)
 URL = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
 
 
@@ -25,6 +26,8 @@ def normalize_prices(frame: pd.DataFrame) -> pd.DataFrame:
 
 
 def fetch_coinmetrics() -> pd.DataFrame:
+    import requests
+
     params = {
         "assets": "btc",
         "metrics": "PriceUSD",
@@ -55,10 +58,21 @@ def fetch_coinmetrics() -> pd.DataFrame:
     return data
 
 
+def cache_is_stale(cache_path: Path = CACHE, now: datetime | None = None) -> bool:
+    if not cache_path.exists():
+        return True
+    checked_at = now or datetime.now(timezone.utc)
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=timezone.utc)
+    modified_at = datetime.fromtimestamp(cache_path.stat().st_mtime, tz=timezone.utc)
+    return checked_at - modified_at >= CACHE_MAX_AGE.to_pytimedelta()
+
+
 def load_coinmetrics(refresh: bool = False) -> tuple[pd.DataFrame, dict]:
-    if refresh or not CACHE.exists():
+    stale = cache_is_stale(CACHE)
+    if refresh or stale:
         data = fetch_coinmetrics()
-        source = "Coin Metrics Community (fresh)"
+        source = "Coin Metrics Community (fresh — manual or daily refresh)"
     else:
         data = normalize_prices(pd.read_csv(CACHE))
         source = "Coin Metrics Community (cached)"
@@ -68,4 +82,6 @@ def load_coinmetrics(refresh: bool = False) -> tuple[pd.DataFrame, dict]:
         "first_date": data["date"].min().date().isoformat(),
         "latest_date": data["date"].max().date().isoformat(),
         "cache_path": str(CACHE),
+        "cache_max_age_hours": int(CACHE_MAX_AGE / pd.Timedelta(hours=1)),
+        "automatic_refresh_enabled": True,
     }

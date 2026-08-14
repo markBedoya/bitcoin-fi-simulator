@@ -13,8 +13,8 @@ sys.path.insert(0, str(ROOT))
 from src.price_model import SUMMARY_SCHEMA, fit_bottom_anchored_model  # noqa: E402
 
 
-def synthetic_prices() -> pd.DataFrame:
-    dates = pd.date_range("2010-01-01", "2026-08-12", freq="D")
+def synthetic_prices(end_date: str = "2026-08-12") -> pd.DataFrame:
+    dates = pd.date_range("2010-01-01", end_date, freq="D")
     genesis = pd.Timestamp("2009-01-03")
     days = (dates - genesis).days.to_numpy(dtype=float)
     floor = 2.0e-17 * np.power(days, 5.75)
@@ -27,7 +27,8 @@ def synthetic_prices() -> pd.DataFrame:
 def main() -> None:
     result = fit_bottom_anchored_model(synthetic_prices())
     assert len(result.bottom_regions) == 5
-    assert len(result.peak_regions) == 4
+    assert len(result.peak_regions) == 5
+    assert result.peak_regions.iloc[-1]["lifecycle_state"] == "pre_window"
     assert len(result.forming_prior_forecasts) == 4
     assert np.isclose(result.forming_prior_forecasts["ensemble_weight"].sum(), 1.0)
     assert result.summary["dynamic_fair_value_usd"] > 0
@@ -41,6 +42,12 @@ def main() -> None:
     assert pd.Timestamp(result.summary["current_bottom_anchor"]) == pd.Timestamp("2026-10-25")
     assert result.summary["current_anchor_shift_from_rough_days"] == 18
     assert result.summary["expected_cycle_days"] == 1434
+    assert result.summary["current_cycle"] == 4
+    assert result.summary["current_cycle_lifecycle_state"] == "forming"
+    assert result.summary["completed_bottom_cycles"] == 4
+    assert result.summary["automatically_promoted_bottom_cycles"] == 0
+    assert result.summary["current_cycle_observed_region_available"] is True
+    assert result.summary["rolling_cycle_engine"].startswith("enabled")
     assert result.summary["mature_observed_growth_path"].count("→") == 2
     assert result.summary["next_bottom_core_low_usd"] <= result.summary["next_bottom_core_usd"]
     assert result.summary["next_bottom_core_high_usd"] >= result.summary["next_bottom_core_usd"]
@@ -100,8 +107,12 @@ def main() -> None:
     )
     assert result.summary["anchor_marginalization_variants"] == 3
     assert pd.Timestamp(result.summary["current_cycle_observation_window_end"]) == pd.Timestamp("2027-02-22")
-    assert "rollover" in result.summary["rolling_cycle_status"]
+    assert "promoted automatically" in result.summary["rolling_cycle_status"]
     assert np.isclose(marginalized_region, result.summary["forming_bottom_region_usd"])
+    assert np.isclose(result.summary["forming_bottom_region_usd"], 233650.05575375573)
+    assert np.isclose(result.summary["dynamic_settled_bottom_estimate_usd"], 224829.51421970947)
+    assert np.isclose(result.summary["dynamic_fair_value_usd"], 248219.60196226233)
+    assert np.isclose(result.summary["next_bottom_core_usd"], 495801.47379315965)
     assert np.isclose(
         empirical_timing["forming_evidence_weight"].mean(),
         result.summary["forming_evidence_weight"],

@@ -21,8 +21,10 @@ assert 'column.endswith("_date")' in page
 assert 'column.endswith("_anchor")' in page
 assert "public_model_region_usd" in page
 assert "exact_anchor_region_usd" in page
-assert "Lifecycle boundary" in page
-assert "Automatic promotion" in page
+assert "Rolling lifecycle enabled" in page
+assert "Automatic promotions" in page
+assert "current_cycle_lifecycle_state" in page
+assert "24 hours old" in page
 assert "Ten-year projection readiness" in page
 assert "Recursive bottom" in page
 assert "Leave-one-cycle-out range" in page
@@ -38,7 +40,7 @@ assert guard_position < ratio_position
 assert "price_model.SUMMARY_SCHEMA" not in page
 assert "Your scenario — never used as model evidence" in page
 assert "Copy/paste research diagnostics" in page
-assert "bitcoin-dynamic-settling-copy-block-v7" in page
+assert "bitcoin-dynamic-settling-copy-block-v8" in page
 assert "loaded_engine_source" in page
 assert "forming_bottom_prior_forecasts" in page
 assert "candidate_forecasts" not in page

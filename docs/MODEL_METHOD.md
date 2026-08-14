@@ -76,7 +76,7 @@ Each later observable bottom is hidden in turn. Models fit only earlier regions 
 
 ## Bottom foundation
 
-Completed bottom regions and the dynamically settling current region are joined in log-price space. Beyond the current anchor, the foundation extends to the mature-cycle next-bottom estimate. Projection segments are marked separately from observed history.
+Completed bottom regions and the active bottom estimate are joined in log-price space. While its observation window is forming, that endpoint blends prior and observed-region evidence; before the window begins, it is entirely prior-based. Beyond the active anchor, the foundation extends to the mature-cycle next-bottom estimate. Projection segments are marked separately from observed history.
 
 ## Fair value
 
@@ -93,15 +93,23 @@ Fair value is not projected beyond the latest observed date. A future fair-value
 
 ## Projection horizon
 
-The current public bottom foundation extends through one future bottom region in 2030. Extending it ten years would require recursively applying mature-cycle decay into at least the following bottom and validating that recursive procedure on historical fake-today forecasts. That work has not yet been completed.
+The public bottom foundation extends one region beyond the active rolling target. In August 2026 that endpoint is the expected 2030 region; after the 2026 window settles and rolls forward, the active target becomes the next cycle and the single additional projection advances with it. Extending the graph to a fixed ten-year horizon would require recursively applying mature-cycle decay and validating that recursive procedure on historical fake-today forecasts. That work has not yet been completed.
 
 A ten-year fair-value curve requires the recursive bottom foundation plus a separate forward model for the compression or stabilization of cycle-neutral fair-value multiples. Holding today's multiple constant would be a scenario assumption, not an empirically validated result, so it is not drawn as model output.
 
 ## Operational lifecycle
 
-Within the current observation window, every newly loaded Bitcoin price can change the anchor-specific regions, marginalized forming endpoint, empirical evidence weight, bottom foundation, current fair value, and sensitivities. The application currently reads its runtime cache until the user requests a refresh or the app restarts.
+Every active target has one of three states:
 
-The current forming window ends 120 days after the October 25 timing center, on February 22, 2027. The model does not yet contain a rolling state transition that freezes the settled 2026 region, adds it to the completed calibration catalog, generates the next expected bottom window, and later discovers the next peak region. Until that transition is implemented and time-travel tested, the project should not be described as permanently maintenance-free.
+1. `pre_window`: the model uses only the walk-forward prior and assigns zero observed-region evidence;
+2. `forming`: daily prices inside the target window update the region, empirical evidence weight, bottom foundation, fair value, and sensitivities;
+3. `settled`: the complete fixed window is promoted into the historical catalog.
+
+Promotion is deterministic rather than stored as mutable application state. Once a window has closed, its extraction always stops at the recorded window end, so prices arriving later cannot change that settled region. The empirical region date becomes the timing origin for the next bottom target. Completed mature intervals are recalculated, and their median generates the new central anchor with early and late timing variants. The same eligibility rule creates, observes, and settles later peak regions for fair-value calibration.
+
+The first automatic boundary is the 2026 window ending February 22, 2027. With that day's data available, cycle 4 is promoted and cycle 5 becomes the active target. Offline time-travel tests cover the forming-to-settled boundary, a prior-only next target, rolling peak formation and settlement, immutability of a closed bottom, and a second bottom rollover.
+
+The runtime price cache expires after 24 hours. A manual refresh remains available. Therefore a continuously hosted app can incorporate new daily observations and move between lifecycle states without a code edit, subject to the data provider and host remaining operational.
 
 ## All-price diagnostic
 
@@ -110,16 +118,16 @@ A cycle-balanced regression over all daily prices remains optional inside the Re
 ## Research boundaries
 
 - Bitcoin supplies very few independent market cycles.
-- The current bottom region remains incomplete.
+- The active bottom region can be incomplete or pre-window; its lifecycle state is always reported.
 - The current anchor is based on only two completed mature timing intervals.
 - Equal weighting across the three empirical anchor dates is a transparent smoothing choice, not a learned probability distribution.
 - Turning dates, windows, and cluster statistics are transparent research choices rather than facts of nature.
 - Walk-forward validation has only a few held-out cycles.
-- The mature-cycle projection has only three transitions and includes a forming current endpoint.
+- The mature-cycle projection has very few transitions and includes an active endpoint that may be forming or prior-only.
 - The empirical settling curve has only four completed regions and is deliberately regularized toward linear time.
 - The leave-one-cycle-out spread measures single-cycle dependence, not total model uncertainty.
 - Definition ranges are not probability intervals.
 - User peak and bottom inputs are scenarios only and never become model evidence.
 - The model is `RESEARCH_ONLY` and does not provide investment advice or a guaranteed floor.
 
-The next projection priority is to validate recursive mature-cycle bottom forecasts before extending the public foundation beyond 2030. Future fair value remains a separate later step.
+The next projection priority is to validate recursive mature-cycle bottom forecasts before extending the public foundation to a fixed ten-year horizon. Future fair value remains a separate later step.

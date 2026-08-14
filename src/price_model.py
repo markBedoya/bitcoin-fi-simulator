@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.7.1"
-SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v7"
+MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.8.0"
+SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v8"
 GENESIS = pd.Timestamp("2009-01-03")
 BOTTOM_WINDOW_DAYS = 120
 PEAK_WINDOW_DAYS = 90
@@ -18,12 +18,18 @@ SETTLING_GRID = tuple(np.round(np.arange(0.05, 1.001, 0.05), 2))
 SETTLING_LINEAR_PRIOR_CYCLES = 2.0
 ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR = pd.Timestamp("2026-10-07")
 
-BOTTOM_TURNING_REGIONS = [
+BOTTOM_SEED_REGIONS = [
     {"anchor_date": pd.Timestamp("2011-11-18"), "label": "2011 bottom region"},
     {"anchor_date": pd.Timestamp("2015-01-14"), "label": "2015 bottom region"},
     {"anchor_date": pd.Timestamp("2018-12-15"), "label": "2018 bottom region"},
     {"anchor_date": pd.Timestamp("2022-11-21"), "label": "2022 bottom region"},
-    {"anchor_date": pd.Timestamp("2026-10-25"), "label": "2026 forming bottom region"},
+]
+
+# Compatibility catalog for historical replay tests. The live engine derives this
+# first rolling target from completed mature-cycle timing instead of treating it
+# as a permanently fixed final entry.
+BOTTOM_TURNING_REGIONS = BOTTOM_SEED_REGIONS + [
+    {"anchor_date": pd.Timestamp("2026-10-25"), "label": "2026 bottom region"},
 ]
 
 PEAK_TURNING_REGIONS = [
@@ -137,6 +143,189 @@ def _extract_regions(
             "status": status,
         })
     return pd.DataFrame(rows)
+
+
+def _lifecycle_state(
+    anchor_date: pd.Timestamp,
+    latest_date: pd.Timestamp,
+    half_window_days: int,
+) -> str:
+    window_start = pd.Timestamp(anchor_date) - pd.Timedelta(days=half_window_days)
+    window_end = pd.Timestamp(anchor_date) + pd.Timedelta(days=half_window_days)
+    if latest_date < window_start:
+        return "pre_window"
+    if latest_date < window_end:
+        return "forming"
+    return "settled"
+
+
+def _unobserved_region(
+    cycle: int,
+    anchor_date: pd.Timestamp,
+    label: str,
+    half_window_days: int,
+    direction: str,
+) -> dict:
+    return {
+        "cycle": int(cycle),
+        "label": label,
+        "anchor_date": pd.Timestamp(anchor_date),
+        "region_date": pd.NaT,
+        "region_price_usd": np.nan,
+        "cluster_low_usd": np.nan,
+        "cluster_high_usd": np.nan,
+        "extreme_date": pd.NaT,
+        "extreme_price_usd": np.nan,
+        "window_start": pd.Timestamp(anchor_date) - pd.Timedelta(days=half_window_days),
+        "window_end": pd.Timestamp(anchor_date) + pd.Timedelta(days=half_window_days),
+        "observations": 0,
+        "cluster_days": REGION_CLUSTER_DAYS,
+        "statistic": "median",
+        "status": "forming",
+        "lifecycle_state": "pre_window",
+        "region_direction": direction,
+    }
+
+
+def _rolling_bottom_catalog(data: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Build completed bottoms plus exactly one active rolling target.
+
+    The operation is deterministic and stateless. Once a target window closes,
+    its extracted region cannot change because the window end is fixed. Its
+    empirical region date then becomes the timing origin for the next target.
+    """
+    latest = pd.Timestamp(data["date"].max())
+    seed = _extract_regions(data, BOTTOM_SEED_REGIONS, BOTTOM_WINDOW_DAYS, "bottom")
+    if len(seed) != len(BOTTOM_SEED_REGIONS) or not seed["status"].eq("completed").all():
+        raise ValueError("The completed bottom seed catalog is not observable yet.")
+    seed["lifecycle_state"] = "settled"
+    seed["timing_anchor_date"] = seed["anchor_date"]
+    rows = seed.to_dict(orient="records")
+
+    mature_timing_anchors = [
+        pd.Timestamp(item["anchor_date"]) for item in BOTTOM_SEED_REGIONS[1:]
+    ]
+    promoted_cycles = 0
+    active_metadata: dict | None = None
+    for _ in range(32):
+        interval_days = np.diff(pd.DatetimeIndex(mature_timing_anchors).asi8) / (24 * 60 * 60 * 1e9)
+        expected_days = int(round(float(np.median(interval_days))))
+        previous_anchor = mature_timing_anchors[-1]
+        target_anchor = previous_anchor + pd.Timedelta(days=expected_days)
+        early_anchor = previous_anchor + pd.Timedelta(days=int(np.min(interval_days)))
+        late_anchor = previous_anchor + pd.Timedelta(days=int(np.max(interval_days)))
+        cycle = len(rows)
+        label = f"{target_anchor.year} rolling bottom region"
+        state = _lifecycle_state(target_anchor, latest, BOTTOM_WINDOW_DAYS)
+        extracted = _extract_regions(
+            data,
+            [{"anchor_date": target_anchor, "label": label}],
+            BOTTOM_WINDOW_DAYS,
+            "bottom",
+        )
+        if extracted.empty:
+            row = _unobserved_region(
+                cycle, target_anchor, label, BOTTOM_WINDOW_DAYS, "bottom"
+            )
+        else:
+            row = extracted.iloc[0].to_dict()
+            row["cycle"] = cycle
+            row["lifecycle_state"] = state
+            row["region_direction"] = "bottom"
+        row["timing_anchor_date"] = (
+            pd.Timestamp(row["region_date"]) if state == "settled" else target_anchor
+        )
+        rows.append(row)
+
+        if state != "settled":
+            active_metadata = {
+                "active_cycle": cycle,
+                "state": state,
+                "anchor_date": target_anchor,
+                "anchor_early": early_anchor,
+                "anchor_late": late_anchor,
+                "previous_timing_anchor": previous_anchor,
+                "expected_cycle_days": expected_days,
+                "mature_cycle_days": interval_days.astype(int).tolist(),
+                "window_start": target_anchor - pd.Timedelta(days=BOTTOM_WINDOW_DAYS),
+                "window_end": target_anchor + pd.Timedelta(days=BOTTOM_WINDOW_DAYS),
+                "promoted_cycles": promoted_cycles,
+            }
+            break
+
+        promoted_cycles += 1
+        mature_timing_anchors.append(pd.Timestamp(row["timing_anchor_date"]))
+    if active_metadata is None:
+        raise ValueError("The rolling bottom lifecycle exceeded its safety horizon.")
+
+    catalog = pd.DataFrame(rows).sort_values("cycle").reset_index(drop=True)
+    catalog = _add_bottom_growth(catalog)
+    return catalog, active_metadata
+
+
+def _rolling_peak_catalog(
+    data: pd.DataFrame,
+    bottom_catalog: pd.DataFrame,
+    expected_bull_days: int,
+) -> tuple[pd.DataFrame, dict]:
+    """Discover future peak regions as eligible bottom cycles become observable."""
+    latest = pd.Timestamp(data["date"].max())
+    seed = _extract_regions(data, PEAK_TURNING_REGIONS, PEAK_WINDOW_DAYS, "peak")
+    if len(seed) != len(PEAK_TURNING_REGIONS):
+        raise ValueError("The completed peak seed catalog is not observable yet.")
+    seed["lifecycle_state"] = np.where(seed["status"].eq("completed"), "settled", "forming")
+    seed["region_direction"] = "peak"
+    rows = seed.to_dict(orient="records")
+
+    dynamic_bottoms = bottom_catalog[bottom_catalog["cycle"] >= len(PEAK_TURNING_REGIONS)]
+    for _, bottom in dynamic_bottoms.sort_values("cycle").iterrows():
+        bottom_state = str(bottom["lifecycle_state"])
+        if bottom_state == "pre_window":
+            continue
+        source_date = (
+            pd.Timestamp(bottom["timing_anchor_date"])
+            if bottom_state == "settled"
+            else pd.Timestamp(bottom["anchor_date"])
+        )
+        anchor = source_date + pd.Timedelta(days=expected_bull_days)
+        cycle = int(bottom["cycle"])
+        label = f"{anchor.year} rolling peak region"
+        state = _lifecycle_state(anchor, latest, PEAK_WINDOW_DAYS)
+        extracted = _extract_regions(
+            data,
+            [{"anchor_date": anchor, "label": label}],
+            PEAK_WINDOW_DAYS,
+            "peak",
+        )
+        if extracted.empty:
+            row = _unobserved_region(cycle, anchor, label, PEAK_WINDOW_DAYS, "peak")
+        else:
+            row = extracted.iloc[0].to_dict()
+            row["cycle"] = cycle
+            row["lifecycle_state"] = state
+            row["region_direction"] = "peak"
+        rows.append(row)
+
+    catalog = pd.DataFrame(rows).sort_values("cycle").reset_index(drop=True)
+    unsettled = catalog[catalog["lifecycle_state"] != "settled"]
+    if unsettled.empty:
+        active = {
+            "cycle": None,
+            "state": "awaiting_bottom",
+            "anchor_date": pd.NaT,
+            "window_start": pd.NaT,
+            "window_end": pd.NaT,
+        }
+    else:
+        row = unsettled.iloc[0]
+        active = {
+            "cycle": int(row["cycle"]),
+            "state": str(row["lifecycle_state"]),
+            "anchor_date": pd.Timestamp(row["anchor_date"]),
+            "window_start": pd.Timestamp(row["window_start"]),
+            "window_end": pd.Timestamp(row["window_end"]),
+        }
+    return catalog, active
 
 
 def _log_interpolate(target_dates, anchor_dates, anchor_values) -> np.ndarray:
@@ -302,8 +491,8 @@ def _mature_cycle_decay(bottoms: pd.DataFrame, mature_start_cycle: int = 1) -> d
     """Project the next bottom from decaying mature-cycle growth above 1x.
 
     Cycle zero is Bitcoin's early micro-cap regime. Starting with the 2015
-    bottom leaves the three later transitions that describe the maturing
-    market structure: 2015→2018, 2018→2022, and 2022→forming 2026.
+    bottom leaves the later transitions that describe the maturing market;
+    the rolling active endpoint is included with its disclosed lifecycle state.
     """
     mature = bottoms[bottoms["cycle"] >= mature_start_cycle].sort_values("cycle")
     values = mature["region_price_usd"].to_numpy(dtype=float)
@@ -413,7 +602,10 @@ def _empirical_settling_calibration(
             reveal_date = start + pd.Timedelta(days=round(fraction * 2 * half_window))
             partial = _extract_regions(
                 data[data["date"] <= reveal_date],
-                [BOTTOM_TURNING_REGIONS[cycle]],
+                [{
+                    "anchor_date": anchor,
+                    "label": str(target["label"]),
+                }],
                 half_window,
                 "bottom",
             )
@@ -518,21 +710,35 @@ def _empirical_anchor_marginalization(
     for anchor in anchors:
         current = _extract_regions(
             data,
-            [{"anchor_date": pd.Timestamp(anchor), "label": "2026 forming bottom region"}],
+            [{"anchor_date": pd.Timestamp(anchor), "label": f"{pd.Timestamp(anchor).year} rolling bottom region"}],
             BOTTOM_WINDOW_DAYS,
             "bottom",
         )
         if current.empty:
-            continue
-        target = current.iloc[0]
-        dynamic = _dynamic_bottom_estimate(
-            completed_bottoms, target, latest, prior_validation,
-            settling_calibration=settling_calibration,
-        )
+            forecasts = _forecast_candidates(completed_bottoms, pd.Timestamp(anchor), prior_validation)
+            forecast = _ensemble_value(forecasts)
+            dynamic = {
+                "forecast_bottom_usd": forecast,
+                "dynamic_bottom_usd": forecast,
+                "forecast_low_usd": float(forecasts["predicted_bottom_usd"].min()),
+                "forecast_high_usd": float(forecasts["predicted_bottom_usd"].max()),
+                "linear_window_progress": 0.0,
+                "forming_evidence_weight": 0.0,
+            }
+            region_price = np.nan
+            extreme_price = np.nan
+        else:
+            target = current.iloc[0]
+            dynamic = _dynamic_bottom_estimate(
+                completed_bottoms, target, latest, prior_validation,
+                settling_calibration=settling_calibration,
+            )
+            region_price = float(target["region_price_usd"])
+            extreme_price = float(target["extreme_price_usd"])
         rows.append({
             "anchor_date": pd.Timestamp(anchor),
-            "forming_region_usd": float(target["region_price_usd"]),
-            "forming_extreme_usd": float(target["extreme_price_usd"]),
+            "forming_region_usd": region_price,
+            "forming_extreme_usd": extreme_price,
             "linear_window_progress": dynamic["linear_window_progress"],
             "forming_evidence_weight": dynamic["forming_evidence_weight"],
             "pre_observation_bottom_forecast_usd": dynamic["forecast_bottom_usd"],
@@ -545,22 +751,30 @@ def _empirical_anchor_marginalization(
         raise ValueError("Not every empirical anchor variant is observable yet.")
     variants["marginalization_weight"] = 1.0 / len(variants)
 
-    def geometric_mean(column: str) -> float:
-        values = variants[column].to_numpy(dtype=float)
+    def geometric_mean(column: str, allow_empty: bool = False) -> float:
+        values = variants[column].dropna().to_numpy(dtype=float)
+        if len(values) == 0:
+            if allow_empty:
+                return float("nan")
+            raise ValueError(f"No finite values are available for {column}.")
         return float(np.exp(np.mean(np.log(values))))
+
+    observed_regions = variants["forming_region_usd"].dropna()
+    observed_extremes = variants["forming_extreme_usd"].dropna()
 
     aggregate = {
         "forecast_bottom_usd": geometric_mean("pre_observation_bottom_forecast_usd"),
-        "observed_forming_bottom_usd": geometric_mean("forming_region_usd"),
-        "forming_extreme_usd": float(variants["forming_extreme_usd"].min()),
-        "forming_region_low_usd": float(variants["forming_region_usd"].min()),
-        "forming_region_high_usd": float(variants["forming_region_usd"].max()),
+        "observed_forming_bottom_usd": geometric_mean("forming_region_usd", allow_empty=True),
+        "forming_extreme_usd": float(observed_extremes.min()) if not observed_extremes.empty else np.nan,
+        "forming_region_low_usd": float(observed_regions.min()) if not observed_regions.empty else np.nan,
+        "forming_region_high_usd": float(observed_regions.max()) if not observed_regions.empty else np.nan,
         "forming_evidence_weight": float(variants["forming_evidence_weight"].mean()),
         "linear_window_progress": float(variants["linear_window_progress"].mean()),
         "dynamic_bottom_usd": geometric_mean("dynamic_current_bottom_usd"),
         "forecast_low_usd": float(variants["forecast_low_usd"].min()),
         "forecast_high_usd": float(variants["forecast_high_usd"].max()),
         "anchor_marginalization_variants": int(len(variants)),
+        "observed_region_available": bool(not observed_regions.empty),
     }
     return variants, aggregate
 
@@ -590,10 +804,15 @@ def _settling_cycle_dependence(
                 calibration["window_fraction"].to_numpy(dtype=float),
                 calibration["empirical_evidence_weight"].to_numpy(dtype=float),
             ))
-            dynamic = float(np.exp(
-                (1.0 - evidence) * np.log(float(variant["pre_observation_bottom_forecast_usd"]))
-                + evidence * np.log(float(variant["forming_region_usd"]))
-            ))
+            observed = float(variant["forming_region_usd"])
+            forecast = float(variant["pre_observation_bottom_forecast_usd"])
+            if np.isfinite(observed) and evidence > 0:
+                dynamic = float(np.exp(
+                    (1.0 - evidence) * np.log(forecast)
+                    + evidence * np.log(observed)
+                ))
+            else:
+                dynamic = forecast
             variant_evidence.append(evidence)
             variant_bottoms.append(dynamic)
         evidence = float(np.mean(variant_evidence))
@@ -630,7 +849,7 @@ def _settling_cycle_dependence(
 
 def _add_bottom_growth(bottoms: pd.DataFrame) -> pd.DataFrame:
     result = bottoms.copy().sort_values("region_date").reset_index(drop=True)
-    result["bottom_to_bottom_multiple"] = result["region_price_usd"].pct_change() + 1.0
+    result["bottom_to_bottom_multiple"] = result["region_price_usd"].pct_change(fill_method=None) + 1.0
     result["bottom_to_bottom_cagr"] = np.nan
     for index in range(1, len(result)):
         years = (result.loc[index, "region_date"] - result.loc[index - 1, "region_date"]).days / 365.2425
@@ -791,7 +1010,13 @@ def _dynamic_settling_backtest(
         if reveal_dates[-1] != reveal_end:
             reveal_dates.append(reveal_end)
         left = prior.iloc[-1]
-        peak = peaks.iloc[target_index - 1]
+        peak_match = peaks[
+            (peaks["cycle"] == int(target["cycle"]) - 1)
+            & peaks["region_price_usd"].notna()
+        ]
+        if peak_match.empty:
+            continue
+        peak = peak_match.iloc[0]
         settled_bottom = float(target["region_price_usd"])
         settled_reference_foundation = _foundation_at(
             reference_date, left["region_date"], left["region_price_usd"], anchor, settled_bottom
@@ -806,7 +1031,10 @@ def _dynamic_settling_backtest(
         for reveal_date in reveal_dates:
             partial = data[data["date"] <= reveal_date]
             partial_target = _extract_regions(
-                partial, [BOTTOM_TURNING_REGIONS[target_index]], BOTTOM_WINDOW_DAYS, "bottom"
+                partial,
+                [{"anchor_date": anchor, "label": str(target["label"])}],
+                BOTTOM_WINDOW_DAYS,
+                "bottom",
             )
             forecasts = _forecast_candidates(prior, anchor, prior_validation)
             forecast = _ensemble_value(forecasts)
@@ -879,19 +1107,26 @@ def _bottom_sensitivity(
     data: pd.DataFrame,
     fair_multiplier: float,
     settling_calibration: pd.DataFrame,
+    bottom_catalog: pd.DataFrame,
+    active_cycle: int,
+    active_state: str,
 ) -> pd.DataFrame:
     rows: list[dict] = []
     latest = pd.Timestamp(data["date"].max())
+    specifications = [
+        {"anchor_date": pd.Timestamp(row["anchor_date"]), "label": str(row["label"])}
+        for _, row in bottom_catalog.sort_values("cycle").iterrows()
+    ]
     for half_window in (60, 90, 120, 180):
         for cluster_days in (3, 7, 14, 30):
             for statistic in ("median", "geometric_mean"):
                 regions = _extract_regions(
-                    data, BOTTOM_TURNING_REGIONS, half_window, "bottom",
+                    data, specifications, half_window, "bottom",
                     cluster_days=cluster_days, statistic=statistic,
                 )
-                current = regions[regions["cycle"] == len(BOTTOM_TURNING_REGIONS) - 1]
-                completed = regions[regions["cycle"] < len(BOTTOM_TURNING_REGIONS) - 1]
-                if current.empty or len(completed) < 3:
+                current = regions[regions["cycle"] == active_cycle]
+                completed = regions[regions["cycle"] < active_cycle]
+                if len(completed) < 3 or (current.empty and active_state != "pre_window"):
                     rows.append({
                         "half_window_days": half_window,
                         "cluster_days": cluster_days,
@@ -900,11 +1135,30 @@ def _bottom_sensitivity(
                     })
                     continue
                 _, prior_validation = _walk_forward(completed)
-                target = current.iloc[0]
-                dynamic = _dynamic_bottom_estimate(
-                    completed, target, latest, prior_validation, half_window=half_window,
-                    settling_calibration=settling_calibration,
-                )
+                if current.empty:
+                    anchor = pd.Timestamp(bottom_catalog.loc[
+                        bottom_catalog["cycle"] == active_cycle, "anchor_date"
+                    ].iloc[0])
+                    forecasts = _forecast_candidates(completed, anchor, prior_validation)
+                    forecast = _ensemble_value(forecasts)
+                    dynamic = {
+                        "forming_evidence_weight": 0.0,
+                        "linear_window_progress": 0.0,
+                        "dynamic_bottom_usd": forecast,
+                    }
+                    current = pd.DataFrame([_unobserved_region(
+                        active_cycle, anchor, f"{anchor.year} rolling bottom region",
+                        half_window, "bottom",
+                    )])
+                    target = current.iloc[0]
+                    forming_region = np.nan
+                else:
+                    target = current.iloc[0]
+                    dynamic = _dynamic_bottom_estimate(
+                        completed, target, latest, prior_validation, half_window=half_window,
+                        settling_calibration=settling_calibration,
+                    )
+                    forming_region = float(target["region_price_usd"])
                 adjusted = pd.concat([completed, current], ignore_index=True)
                 adjusted.loc[adjusted.index[-1], "region_price_usd"] = dynamic["dynamic_bottom_usd"]
                 adjusted.loc[adjusted.index[-1], "region_date"] = pd.Timestamp(target["anchor_date"])
@@ -919,7 +1173,7 @@ def _bottom_sensitivity(
                     "cluster_days": cluster_days,
                     "statistic": statistic,
                     "available": True,
-                    "forming_region_usd": float(target["region_price_usd"]),
+                    "forming_region_usd": forming_region,
                     "forming_evidence_weight": dynamic["forming_evidence_weight"],
                     "linear_window_progress": dynamic["linear_window_progress"],
                     "dynamic_current_bottom_usd": dynamic["dynamic_bottom_usd"],
@@ -941,13 +1195,26 @@ def _anchor_timing_sensitivity(
     empirical_early: pd.Timestamp,
     empirical_late: pd.Timestamp,
     expected_cycle_days: int,
+    previous_timing_anchor: pd.Timestamp,
+    current_cycle: int,
 ) -> pd.DataFrame:
-    """Recompute the forming cycle across empirical and conservative anchor dates."""
+    """Recompute the active cycle across empirical and conservative anchor dates."""
     latest = pd.Timestamp(data["date"].max())
-    stress_days = abs((empirical_anchor - ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR).days)
+    if current_cycle == len(BOTTOM_SEED_REGIONS):
+        early_stress = ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR
+        stress_days = abs((empirical_anchor - early_stress).days)
+        early_stress_role = "original rough date / early stress"
+    else:
+        empirical_spread = max(
+            abs((empirical_anchor - empirical_early).days),
+            abs((empirical_late - empirical_anchor).days),
+        )
+        stress_days = max(7, empirical_spread * 3)
+        early_stress = empirical_anchor - pd.Timedelta(days=stress_days)
+        early_stress_role = "conservative early stress"
     late_stress = empirical_anchor + pd.Timedelta(days=stress_days)
     variants = [
-        (ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR, "original rough date / early stress"),
+        (early_stress, early_stress_role),
         (empirical_early, "completed-cycle early"),
         (empirical_anchor, "completed-cycle central"),
         (empirical_late, "completed-cycle late"),
@@ -955,23 +1222,35 @@ def _anchor_timing_sensitivity(
     ]
     rows: list[dict] = []
     previous = completed_bottoms.sort_values("cycle").iloc[-1]
-    current_cycle = int(completed_bottoms["cycle"].max()) + 1
     for anchor, role in variants:
         current = _extract_regions(
             data,
-            [{"anchor_date": pd.Timestamp(anchor), "label": "2026 forming bottom region"}],
+            [{"anchor_date": pd.Timestamp(anchor), "label": f"{pd.Timestamp(anchor).year} rolling bottom region"}],
             BOTTOM_WINDOW_DAYS,
             "bottom",
         )
         if current.empty:
-            rows.append({"anchor_date": pd.Timestamp(anchor), "timing_role": role, "available": False})
-            continue
-        current.loc[current.index[0], "cycle"] = current_cycle
-        target = current.iloc[0]
-        dynamic = _dynamic_bottom_estimate(
-            completed_bottoms, target, latest, prior_validation,
-            settling_calibration=settling_calibration,
-        )
+            forecasts = _forecast_candidates(completed_bottoms, pd.Timestamp(anchor), prior_validation)
+            forecast = _ensemble_value(forecasts)
+            current = pd.DataFrame([_unobserved_region(
+                current_cycle, pd.Timestamp(anchor), f"{pd.Timestamp(anchor).year} rolling bottom region",
+                BOTTOM_WINDOW_DAYS, "bottom",
+            )])
+            dynamic = {
+                "forecast_bottom_usd": forecast,
+                "dynamic_bottom_usd": forecast,
+                "linear_window_progress": 0.0,
+                "forming_evidence_weight": 0.0,
+            }
+            forming_region = np.nan
+        else:
+            current.loc[current.index[0], "cycle"] = current_cycle
+            target = current.iloc[0]
+            dynamic = _dynamic_bottom_estimate(
+                completed_bottoms, target, latest, prior_validation,
+                settling_calibration=settling_calibration,
+            )
+            forming_region = float(target["region_price_usd"])
         adjusted = pd.concat([completed_bottoms, current], ignore_index=True)
         adjusted.loc[adjusted.index[-1], "cycle"] = current_cycle
         adjusted.loc[adjusted.index[-1], "region_price_usd"] = dynamic["dynamic_bottom_usd"]
@@ -987,8 +1266,8 @@ def _anchor_timing_sensitivity(
             "timing_role": role,
             "available": True,
             "offset_from_empirical_days": int((pd.Timestamp(anchor) - empirical_anchor).days),
-            "implied_cycle_days": int((pd.Timestamp(anchor) - pd.Timestamp(previous["anchor_date"])).days),
-            "forming_region_usd": float(target["region_price_usd"]),
+            "implied_cycle_days": int((pd.Timestamp(anchor) - pd.Timestamp(previous_timing_anchor)).days),
+            "forming_region_usd": forming_region,
             "linear_window_progress": dynamic["linear_window_progress"],
             "forming_evidence_weight": dynamic["forming_evidence_weight"],
             "pre_observation_bottom_forecast_usd": dynamic["forecast_bottom_usd"],
@@ -1041,36 +1320,25 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         raise ValueError("No valid Bitcoin prices are available.")
     latest = pd.Timestamp(data["date"].max())
 
-    observed_bottoms = _add_bottom_growth(_extract_regions(
-        data, BOTTOM_TURNING_REGIONS, BOTTOM_WINDOW_DAYS, "bottom"
-    ))
-    peaks = _extract_regions(data, PEAK_TURNING_REGIONS, PEAK_WINDOW_DAYS, "peak")
-    if len(observed_bottoms) < 5 or len(peaks) < 4:
-        raise ValueError("The complete bottom/peak research catalog is not observable yet.")
-
-    completed_mature_anchor_dates = [
-        pd.Timestamp(item["anchor_date"]) for item in BOTTOM_TURNING_REGIONS[1:-1]
-    ]
-    mature_cycle_days = (
-        np.diff(pd.DatetimeIndex(completed_mature_anchor_dates).asi8) / (24 * 60 * 60 * 1e9)
-    )
-    expected_cycle_days = int(round(float(np.median(mature_cycle_days))))
-    current_anchor = completed_mature_anchor_dates[-1] + pd.Timedelta(days=expected_cycle_days)
-    empirical_anchor_early = completed_mature_anchor_dates[-1] + pd.Timedelta(
-        days=int(np.min(mature_cycle_days))
-    )
-    empirical_anchor_late = completed_mature_anchor_dates[-1] + pd.Timedelta(
-        days=int(np.max(mature_cycle_days))
-    )
-    if current_anchor != pd.Timestamp(BOTTOM_TURNING_REGIONS[-1]["anchor_date"]):
-        raise ValueError("The current bottom anchor specification does not match mature-cycle timing.")
+    observed_bottoms, lifecycle = _rolling_bottom_catalog(data)
+    current_cycle = int(lifecycle["active_cycle"])
+    current_anchor = pd.Timestamp(lifecycle["anchor_date"])
+    empirical_anchor_early = pd.Timestamp(lifecycle["anchor_early"])
+    empirical_anchor_late = pd.Timestamp(lifecycle["anchor_late"])
+    expected_cycle_days = int(lifecycle["expected_cycle_days"])
+    mature_cycle_days = np.asarray(lifecycle["mature_cycle_days"], dtype=int)
     next_bottom_anchor = current_anchor + pd.Timedelta(days=expected_cycle_days)
+
     mature_bull_days = [
-        (pd.Timestamp(PEAK_TURNING_REGIONS[index]["anchor_date"]) - pd.Timestamp(BOTTOM_TURNING_REGIONS[index]["anchor_date"])).days
+        (pd.Timestamp(PEAK_TURNING_REGIONS[index]["anchor_date"]) - pd.Timestamp(BOTTOM_SEED_REGIONS[index]["anchor_date"])).days
         for index in range(1, len(PEAK_TURNING_REGIONS))
     ]
     expected_bull_days = int(round(float(np.median(mature_bull_days))))
-    next_peak_anchor = current_anchor + pd.Timedelta(days=expected_bull_days)
+    peaks, peak_lifecycle = _rolling_peak_catalog(data, observed_bottoms, expected_bull_days)
+    observed_peaks = peaks[peaks["region_price_usd"].notna()].copy()
+    if len(observed_bottoms) < 5 or len(observed_peaks) < 4:
+        raise ValueError("The complete bottom/peak research catalog is not observable yet.")
+    next_peak_anchor = peak_lifecycle["anchor_date"]
 
     completed_bottoms = observed_bottoms[observed_bottoms["status"] == "completed"].copy()
     settling_calibration_detail, settling_calibration = _empirical_settling_calibration(
@@ -1079,7 +1347,9 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     settling_leave_one_out = _settling_leave_one_out(settling_calibration_detail)
     _, prior_validation = _walk_forward(completed_bottoms)
     forming_prior_forecasts = _forecast_candidates(completed_bottoms, current_anchor, prior_validation)
-    forming_prior_forecasts["forecast_role"] = "pre-observation prior for the forming 2026 bottom"
+    forming_prior_forecasts["forecast_role"] = (
+        f"pre-observation prior for active cycle {current_cycle} ({current_anchor.year})"
+    )
     anchor_marginalization_variants, current_dynamic = _empirical_anchor_marginalization(
         data, completed_bottoms, prior_validation, settling_calibration,
         [empirical_anchor_early, current_anchor, empirical_anchor_late],
@@ -1096,14 +1366,14 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     observed_bottoms.loc[observed_bottoms.index[-1], "anchor_empirical_region_high_usd"] = (
         current_dynamic["forming_region_high_usd"]
     )
-    current_observed = observed_bottoms.iloc[-1]
+    current_observed = observed_bottoms[observed_bottoms["cycle"] == current_cycle].iloc[0]
 
     settled_bottoms = observed_bottoms.copy()
     settled_bottoms.loc[settled_bottoms.index[-1], "region_price_usd"] = current_dynamic["dynamic_bottom_usd"]
     settled_bottoms.loc[settled_bottoms.index[-1], "region_date"] = current_anchor
     settled_bottoms = _add_bottom_growth(settled_bottoms)
 
-    fair_cycles = _build_fair_value_cycles(data, settled_bottoms, peaks)
+    fair_cycles = _build_fair_value_cycles(data, settled_bottoms, observed_peaks)
     fair_walk, fair_methods = _fair_value_walk_forward(data, settled_bottoms, fair_cycles)
     current_cycle_id = int(fair_cycles["cycle"].max())
     current_methods = fair_cycles[fair_cycles["cycle"] == current_cycle_id].merge(
@@ -1146,6 +1416,7 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     anchor_timing_sensitivity = _anchor_timing_sensitivity(
         data, completed_bottoms, prior_validation, settling_calibration, fair_multiplier,
         current_anchor, empirical_anchor_early, empirical_anchor_late, expected_cycle_days,
+        pd.Timestamp(lifecycle["previous_timing_anchor"]), current_cycle,
     )
     available_anchor_timing = anchor_timing_sensitivity[anchor_timing_sensitivity["available"]].copy()
     empirical_anchor_timing = available_anchor_timing[
@@ -1154,7 +1425,10 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     if len(empirical_anchor_timing) != 3:
         raise ValueError("The empirical anchor-timing sensitivity range is not observable yet.")
 
-    sensitivity = _bottom_sensitivity(data, fair_multiplier, settling_calibration)
+    sensitivity = _bottom_sensitivity(
+        data, fair_multiplier, settling_calibration, observed_bottoms, current_cycle,
+        str(lifecycle["state"]),
+    )
     available_sensitivity = sensitivity[sensitivity["available"]].copy()
     mature_sensitivity = available_sensitivity["mature_cycle_next_bottom_usd"].dropna()
     if mature_sensitivity.empty:
@@ -1169,7 +1443,8 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "target_date": next_bottom_anchor,
         "mature_start_cycle": mature_core["mature_start_cycle"],
         "mature_transitions": mature_core["mature_transitions"],
-        "includes_forming_current_bottom": True,
+        "includes_forming_current_bottom": str(lifecycle["state"]) == "forming",
+        "active_endpoint_state": str(lifecycle["state"]),
         "observed_growth_path": observed_growth_path,
         "next_growth_multiple": mature_core["next_growth_multiple"],
         "predicted_bottom_usd": next_bottom_core,
@@ -1179,9 +1454,12 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "definition_stress_high_usd": float(mature_sensitivity.max()),
         "definition_variants": int(len(mature_sensitivity)),
         "range_definition": "10th–90th percentile across available bottom-region definitions",
-        "validation_status": "LOW_EVIDENCE — three mature transitions; current endpoint is forming",
+        "validation_status": (
+            f"LOW_EVIDENCE — {mature_core['mature_transitions']} mature transitions; "
+            f"active endpoint is {str(lifecycle['state']).replace('_', ' ')}"
+        ),
     }])
-    dynamic_paths, dynamic_summary = _dynamic_settling_backtest(data, observed_bottoms, peaks)
+    dynamic_paths, dynamic_summary = _dynamic_settling_backtest(data, observed_bottoms, observed_peaks)
 
     curve_dates = pd.date_range(pd.Timestamp(settled_bottoms["region_date"].min()), next_bottom_anchor, freq="D")
     bottom_anchor_dates = settled_bottoms["region_date"].tolist() + [next_bottom_anchor]
@@ -1196,11 +1474,14 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         weights = group["ensemble_weight"].fillna(1.0 / len(group)).to_numpy(dtype=float)
         weights /= weights.sum()
         cycle_multipliers.append({
-            "date": pd.Timestamp(peaks.iloc[int(cycle)]["region_date"]),
+            "date": pd.Timestamp(observed_peaks.iloc[int(cycle)]["region_date"]),
             "multiple": float(np.exp(np.sum(weights * np.log(group["fair_multiple"].to_numpy(dtype=float))))),
         })
-    multiplier_dates = [row["date"] for row in cycle_multipliers] + [next_peak_anchor]
-    multiplier_values = [row["multiple"] for row in cycle_multipliers] + [fair_multiplier]
+    multiplier_dates = [row["date"] for row in cycle_multipliers]
+    multiplier_values = [row["multiple"] for row in cycle_multipliers]
+    if pd.notna(next_peak_anchor) and pd.Timestamp(next_peak_anchor) > multiplier_dates[-1]:
+        multiplier_dates.append(pd.Timestamp(next_peak_anchor))
+        multiplier_values.append(fair_multiplier)
     fair_multiplier_curve = _log_interpolate(curve_dates, multiplier_dates, multiplier_values)
     dynamic_fair_value = bottom_foundation * fair_multiplier_curve
     dynamic_fair_value[curve_dates > latest] = np.nan
@@ -1215,6 +1496,22 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     all_price_curve, all_price_summary = _cycle_balanced_all_price_backbone(data)
     latest_price = float(data["price_usd"].iloc[-1])
     selected_method = str(fair_methods.sort_values("ensemble_weight", ascending=False)["method"].iloc[0])
+    anchor_date_labels = ", ".join(
+        str(pd.Timestamp(value).date())
+        for value in (empirical_anchor_early, current_anchor, empirical_anchor_late)
+    )
+    lifecycle_state = str(lifecycle["state"])
+    if lifecycle_state == "forming":
+        rolling_status = (
+            f"cycle {current_cycle} bottom is forming; it will be promoted automatically after "
+            f"{pd.Timestamp(lifecycle['window_end']).date()}, then the next target will be generated"
+        )
+    else:
+        rolling_status = (
+            f"cycle {current_cycle} bottom is pre-window and prior-only; observed settling begins on "
+            f"{pd.Timestamp(lifecycle['window_start']).date()}"
+        )
+    last_completed_bottom = completed_bottoms.sort_values("cycle").iloc[-1]
     summary = {
         "summary_schema": SUMMARY_SCHEMA,
         "model_version": MODEL_VERSION,
@@ -1255,16 +1552,34 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "fair_value_method_leader": selected_method,
         "fair_value_completed_holdouts": int(fair_methods["completed_holdouts"].max()),
         "current_bottom_anchor": current_anchor,
-        "current_bottom_anchor_method": "previous completed bottom plus the median of completed mature-cycle lengths; output marginalized across empirical early, central, and late anchors",
-        "anchor_marginalization_method": "equal-weight geometric mean of price outputs across October 22, 25, and 28; arithmetic mean of progress and evidence weights",
+        "current_bottom_anchor_method": "previous completed timing anchor plus the median of completed mature-cycle intervals; settled rolling regions use their empirical region date for the next transition",
+        "anchor_marginalization_method": f"equal-weight geometric mean of price outputs across {anchor_date_labels}; arithmetic mean of progress and evidence weights",
         "anchor_marginalization_variants": current_dynamic["anchor_marginalization_variants"],
         "original_rough_current_bottom_anchor": ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR,
-        "current_anchor_shift_from_rough_days": int((current_anchor - ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR).days),
+        "current_anchor_shift_from_rough_days": (
+            int((current_anchor - ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR).days)
+            if current_cycle == len(BOTTOM_SEED_REGIONS) else None
+        ),
         "current_anchor_empirical_early": empirical_anchor_early,
         "current_anchor_empirical_late": empirical_anchor_late,
         "current_anchor_completed_intervals": int(len(mature_cycle_days)),
-        "current_cycle_observation_window_end": current_anchor + pd.Timedelta(days=BOTTOM_WINDOW_DAYS),
-        "rolling_cycle_status": "current 2026 forming cycle updates dynamically; automatic settlement and rollover to the next target are not yet implemented",
+        "current_cycle": current_cycle,
+        "current_cycle_lifecycle_state": lifecycle_state,
+        "current_cycle_observation_window_start": pd.Timestamp(lifecycle["window_start"]),
+        "current_cycle_observation_window_end": pd.Timestamp(lifecycle["window_end"]),
+        "current_cycle_observed_region_available": current_dynamic["observed_region_available"],
+        "completed_bottom_cycles": int(len(completed_bottoms)),
+        "automatically_promoted_bottom_cycles": int(lifecycle["promoted_cycles"]),
+        "last_completed_bottom_cycle": int(last_completed_bottom["cycle"]),
+        "last_completed_bottom_region_date": pd.Timestamp(last_completed_bottom["region_date"]),
+        "last_completed_bottom_region_usd": float(last_completed_bottom["region_price_usd"]),
+        "rolling_cycle_engine": "enabled — deterministic promotion after the complete observation window and automatic next-target generation",
+        "rolling_cycle_status": rolling_status,
+        "active_peak_cycle": peak_lifecycle["cycle"],
+        "active_peak_lifecycle_state": peak_lifecycle["state"],
+        "active_peak_anchor": peak_lifecycle["anchor_date"],
+        "active_peak_observation_window_start": peak_lifecycle["window_start"],
+        "active_peak_observation_window_end": peak_lifecycle["window_end"],
         "mature_cycle_days_low": int(np.min(mature_cycle_days)),
         "mature_cycle_days_central": expected_cycle_days,
         "mature_cycle_days_high": int(np.max(mature_cycle_days)),
@@ -1307,7 +1622,7 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "core_forecast_method": "mature-cycle excess-growth decay beginning with the 2015 bottom; 10th–90th percentile definition range",
         "dynamic_settling_method": "pre-observation internal forecast blended with forming bottom evidence using an empirical historical settling curve",
         "fair_value_method": "validation-weighted ensemble of four internally derived cycle-neutral definitions",
-        "bottom_projection_horizon_status": "one future bottom region through 2030; recursive 10-year projection not yet validated",
+        "bottom_projection_horizon_status": "one bottom beyond the active rolling target; recursive 10-year projection not yet validated",
         "future_fair_value_status": "stops at today; a 10-year fair-value path requires a validated peak-compression model",
     }
     return BottomAnchoredModelResult(

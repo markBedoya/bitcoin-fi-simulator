@@ -1,6 +1,6 @@
 # Bitcoin Fair Value
 
-Current model: `bottom-anchored-dynamic-settling-v0.7.1`
+Current model: `bottom-anchored-dynamic-settling-v0.8.0`
 
 A single-page Streamlit research application for estimating Bitcoin fair value from bear-market bottom regions that settle gradually as new evidence arrives.
 
@@ -40,11 +40,15 @@ The project intentionally contains no FI simulator, multipage router, legacy V2 
 
 The model is explicitly `RESEARCH_ONLY`. Bitcoin has only a few independent completed cycles. The mature-cycle range measures sensitivity to transparent bottom definitions, the leave-one-cycle-out range measures dependence on any single historical cycle, and the anchor-timing range measures dependence on the estimated 2026 turning date. The public forming endpoint is marginalized across the empirical early, central, and late anchor models so one hard window boundary does not control it. None of these ranges is a probability interval or guaranteed floor. The forming bottom remains provisional, and user-entered scenarios never become model evidence.
 
-The public projection currently ends at the next bottom region in 2030. A ten-year bottom line requires validated recursive projection, while a ten-year fair-value line additionally requires a validated model of future fair-value-multiple or peak compression.
+The public projection ends one bottom beyond the active rolling target. A fixed ten-year bottom line still requires validated recursive projection, while a ten-year fair-value line additionally requires a validated model of future fair-value-multiple or peak compression.
 
-## Current automation boundary
+## Rolling lifecycle
 
-New data changes the forming-region, evidence, bottom, fair-value, and sensitivity calculations automatically after the app receives it. The runtime cache is refreshed by the sidebar button or an app restart; it does not yet expire on a daily schedule. The current-cycle engine covers the full 2026 observation window through February 22, 2027. Automatic promotion of that completed bottom, creation of the next target, and rolling peak-region discovery are not yet implemented.
+New data changes the active region, evidence, bottom, fair-value, and sensitivity calculations automatically after the app receives it. The runtime price cache expires after 24 hours, and the sidebar button remains available for an immediate refresh.
+
+The lifecycle engine has three explicit states: `pre_window`, `forming`, and `settled`. Once a complete bottom window closes, the region is promoted deterministically into the completed catalog; later prices cannot enter that closed window. Its empirical region date becomes the timing origin for a newly generated bottom target. The same mechanism creates and settles the next eligible peak region. Because the process is recalculated entirely from price history on every run, it needs no hidden database or manual cycle switch.
+
+Automatic rollover does not make the forecasts certain. Timing is learned from very few cycles, and the public graph still shows only one bottom beyond the active target rather than an unvalidated fixed ten-year recursion.
 
 ## Data
 
@@ -54,6 +58,7 @@ Daily `PriceUSD` observations come from the Coin Metrics Community API and are c
 
 ```bash
 python scripts/test_price_model.py
+python scripts/test_lifecycle.py
 python scripts/test_ui_contract.py
 python scripts/test_project_manifest.py
 ```
