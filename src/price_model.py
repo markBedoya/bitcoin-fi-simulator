@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.6.0"
-SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v6"
+MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.7.0"
+SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v7"
 GENESIS = pd.Timestamp("2009-01-03")
 BOTTOM_WINDOW_DAYS = 120
 PEAK_WINDOW_DAYS = 90
@@ -505,10 +505,70 @@ def _dynamic_bottom_estimate(
     }
 
 
+def _empirical_anchor_marginalization(
+    data: pd.DataFrame,
+    completed_bottoms: pd.DataFrame,
+    prior_validation: pd.DataFrame,
+    settling_calibration: pd.DataFrame,
+    anchors: list[pd.Timestamp],
+) -> tuple[pd.DataFrame, dict]:
+    """Average exact empirical-anchor models so no single window boundary controls the endpoint."""
+    latest = pd.Timestamp(data["date"].max())
+    rows: list[dict] = []
+    for anchor in anchors:
+        current = _extract_regions(
+            data,
+            [{"anchor_date": pd.Timestamp(anchor), "label": "2026 forming bottom region"}],
+            BOTTOM_WINDOW_DAYS,
+            "bottom",
+        )
+        if current.empty:
+            continue
+        target = current.iloc[0]
+        dynamic = _dynamic_bottom_estimate(
+            completed_bottoms, target, latest, prior_validation,
+            settling_calibration=settling_calibration,
+        )
+        rows.append({
+            "anchor_date": pd.Timestamp(anchor),
+            "forming_region_usd": float(target["region_price_usd"]),
+            "forming_extreme_usd": float(target["extreme_price_usd"]),
+            "linear_window_progress": dynamic["linear_window_progress"],
+            "forming_evidence_weight": dynamic["forming_evidence_weight"],
+            "pre_observation_bottom_forecast_usd": dynamic["forecast_bottom_usd"],
+            "dynamic_current_bottom_usd": dynamic["dynamic_bottom_usd"],
+            "forecast_low_usd": dynamic["forecast_low_usd"],
+            "forecast_high_usd": dynamic["forecast_high_usd"],
+        })
+    variants = pd.DataFrame(rows).sort_values("anchor_date").reset_index(drop=True)
+    if len(variants) != len(anchors):
+        raise ValueError("Not every empirical anchor variant is observable yet.")
+    variants["marginalization_weight"] = 1.0 / len(variants)
+
+    def geometric_mean(column: str) -> float:
+        values = variants[column].to_numpy(dtype=float)
+        return float(np.exp(np.mean(np.log(values))))
+
+    aggregate = {
+        "forecast_bottom_usd": geometric_mean("pre_observation_bottom_forecast_usd"),
+        "observed_forming_bottom_usd": geometric_mean("forming_region_usd"),
+        "forming_extreme_usd": float(variants["forming_extreme_usd"].min()),
+        "forming_region_low_usd": float(variants["forming_region_usd"].min()),
+        "forming_region_high_usd": float(variants["forming_region_usd"].max()),
+        "forming_evidence_weight": float(variants["forming_evidence_weight"].mean()),
+        "linear_window_progress": float(variants["linear_window_progress"].mean()),
+        "dynamic_bottom_usd": geometric_mean("dynamic_current_bottom_usd"),
+        "forecast_low_usd": float(variants["forecast_low_usd"].min()),
+        "forecast_high_usd": float(variants["forecast_high_usd"].max()),
+        "anchor_marginalization_variants": int(len(variants)),
+    }
+    return variants, aggregate
+
+
 def _settling_cycle_dependence(
     leave_one_out: pd.DataFrame,
     observed_bottoms: pd.DataFrame,
-    target_row: pd.Series,
+    anchor_variants: pd.DataFrame,
     current_dynamic: dict,
     latest: pd.Timestamp,
     current_anchor: pd.Timestamp,
@@ -518,20 +578,26 @@ def _settling_cycle_dependence(
     if leave_one_out.empty:
         return pd.DataFrame()
     previous = observed_bottoms.iloc[-2]
-    forecast = float(current_dynamic["forecast_bottom_usd"])
-    observed = float(target_row["region_price_usd"])
     progress = float(current_dynamic["linear_window_progress"])
     rows: list[dict] = []
     for omitted_cycle, calibration in leave_one_out.groupby("omitted_cycle"):
         calibration = calibration.sort_values("window_fraction")
-        evidence = float(np.interp(
-            progress,
-            calibration["window_fraction"].to_numpy(dtype=float),
-            calibration["empirical_evidence_weight"].to_numpy(dtype=float),
-        ))
-        dynamic_bottom = float(np.exp(
-            (1.0 - evidence) * np.log(forecast) + evidence * np.log(observed)
-        ))
+        variant_evidence: list[float] = []
+        variant_bottoms: list[float] = []
+        for _, variant in anchor_variants.iterrows():
+            evidence = float(np.interp(
+                float(variant["linear_window_progress"]),
+                calibration["window_fraction"].to_numpy(dtype=float),
+                calibration["empirical_evidence_weight"].to_numpy(dtype=float),
+            ))
+            dynamic = float(np.exp(
+                (1.0 - evidence) * np.log(float(variant["pre_observation_bottom_forecast_usd"]))
+                + evidence * np.log(float(variant["forming_region_usd"]))
+            ))
+            variant_evidence.append(evidence)
+            variant_bottoms.append(dynamic)
+        evidence = float(np.mean(variant_evidence))
+        dynamic_bottom = float(np.exp(np.mean(np.log(np.asarray(variant_bottoms, dtype=float)))))
         current_foundation = _foundation_at(
             latest, previous["region_date"], previous["region_price_usd"],
             current_anchor, dynamic_bottom,
@@ -1012,13 +1078,25 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     )
     settling_leave_one_out = _settling_leave_one_out(settling_calibration_detail)
     _, prior_validation = _walk_forward(completed_bottoms)
-    current_observed = observed_bottoms.iloc[-1]
     forming_prior_forecasts = _forecast_candidates(completed_bottoms, current_anchor, prior_validation)
     forming_prior_forecasts["forecast_role"] = "pre-observation prior for the forming 2026 bottom"
-    current_dynamic = _dynamic_bottom_estimate(
-        completed_bottoms, current_observed, latest, prior_validation,
-        settling_calibration=settling_calibration,
+    anchor_marginalization_variants, current_dynamic = _empirical_anchor_marginalization(
+        data, completed_bottoms, prior_validation, settling_calibration,
+        [empirical_anchor_early, current_anchor, empirical_anchor_late],
     )
+    observed_bottoms["anchor_marginalized_region_usd"] = np.nan
+    observed_bottoms["anchor_empirical_region_low_usd"] = np.nan
+    observed_bottoms["anchor_empirical_region_high_usd"] = np.nan
+    observed_bottoms.loc[observed_bottoms.index[-1], "anchor_marginalized_region_usd"] = (
+        current_dynamic["observed_forming_bottom_usd"]
+    )
+    observed_bottoms.loc[observed_bottoms.index[-1], "anchor_empirical_region_low_usd"] = (
+        current_dynamic["forming_region_low_usd"]
+    )
+    observed_bottoms.loc[observed_bottoms.index[-1], "anchor_empirical_region_high_usd"] = (
+        current_dynamic["forming_region_high_usd"]
+    )
+    current_observed = observed_bottoms.iloc[-1]
 
     settled_bottoms = observed_bottoms.copy()
     settled_bottoms.loc[settled_bottoms.index[-1], "region_price_usd"] = current_dynamic["dynamic_bottom_usd"]
@@ -1056,7 +1134,7 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     current_fair_high = current_foundation * fair_multiplier_high
 
     settling_cycle_dependence = _settling_cycle_dependence(
-        settling_leave_one_out, observed_bottoms, current_observed, current_dynamic,
+        settling_leave_one_out, observed_bottoms, anchor_marginalization_variants, current_dynamic,
         latest, current_anchor, fair_multiplier,
     )
     if settling_cycle_dependence.empty:
@@ -1144,8 +1222,11 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "confidence": "LOW — only a few independent Bitcoin cycles exist",
         "latest_date": latest,
         "latest_price_usd": latest_price,
-        "forming_bottom_region_usd": float(current_observed["region_price_usd"]),
-        "forming_bottom_extreme_usd": float(current_observed["extreme_price_usd"]),
+        "forming_bottom_region_usd": current_dynamic["observed_forming_bottom_usd"],
+        "forming_bottom_region_exact_central_usd": float(current_observed["region_price_usd"]),
+        "forming_bottom_region_anchor_low_usd": current_dynamic["forming_region_low_usd"],
+        "forming_bottom_region_anchor_high_usd": current_dynamic["forming_region_high_usd"],
+        "forming_bottom_extreme_usd": current_dynamic["forming_extreme_usd"],
         "linear_window_progress": current_dynamic["linear_window_progress"],
         "forming_evidence_weight": current_dynamic["forming_evidence_weight"],
         "settling_calibration_cycles": (
@@ -1174,7 +1255,9 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "fair_value_method_leader": selected_method,
         "fair_value_completed_holdouts": int(fair_methods["completed_holdouts"].max()),
         "current_bottom_anchor": current_anchor,
-        "current_bottom_anchor_method": "previous completed bottom plus the median of completed mature-cycle lengths",
+        "current_bottom_anchor_method": "previous completed bottom plus the median of completed mature-cycle lengths; output marginalized across empirical early, central, and late anchors",
+        "anchor_marginalization_method": "equal-weight geometric mean of price outputs across October 22, 25, and 28; arithmetic mean of progress and evidence weights",
+        "anchor_marginalization_variants": current_dynamic["anchor_marginalization_variants"],
         "original_rough_current_bottom_anchor": ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR,
         "current_anchor_shift_from_rough_days": int((current_anchor - ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR).days),
         "current_anchor_empirical_early": empirical_anchor_early,

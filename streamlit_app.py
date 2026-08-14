@@ -15,7 +15,7 @@ import src.price_model as price_model
 # Streamlit reruns the page in a long-lived process. Reloading prevents a newly
 # deployed page from retaining an older price_model module in memory.
 price_model = reload(price_model)
-EXPECTED_SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v6"
+EXPECTED_SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v7"
 
 
 st.set_page_config(
@@ -88,6 +88,10 @@ required_summary_keys = {
     "dynamic_fair_value_cycle_low_usd",
     "dynamic_fair_value_cycle_high_usd",
     "current_bottom_anchor",
+    "anchor_marginalization_method",
+    "anchor_marginalization_variants",
+    "forming_bottom_region_anchor_low_usd",
+    "forming_bottom_region_anchor_high_usd",
     "current_anchor_empirical_early",
     "current_anchor_empirical_late",
     "anchor_timing_empirical_bottom_low_usd",
@@ -167,8 +171,8 @@ m4.metric("Settling bottom estimate", money(summary["dynamic_settled_bottom_esti
 m5.metric("Valuation", valuation_label)
 
 st.info(
-    f"The forming bottom region is **{money(summary['forming_bottom_region_usd'])}** around the empirically "
-    f"timed **{pd.Timestamp(summary['current_bottom_anchor']).date()}** anchor. "
+    f"The anchor-marginalized forming bottom region is **{money(summary['forming_bottom_region_usd'])}**, "
+    f"combining the empirical dates around the **{pd.Timestamp(summary['current_bottom_anchor']).date()}** timing center. "
     f"The window is **{summary['linear_window_progress']:.1%}** complete, while the calibrated historical "
     f"evidence weight is **{summary['forming_evidence_weight']:.1%}**. The observed region is blended "
     f"with the pre-observation estimate of **{money(summary['pre_observation_bottom_forecast_usd'])}**. "
@@ -244,7 +248,7 @@ with st.expander("How the model works", expanded=False):
     st.markdown(
         """
 1. **Bottom regions:** each turning area is represented by a cluster of low daily closes, so one wick does not define the model.
-2. **Anchor timing:** the forming 2026 anchor is derived from completed mature bottom-to-bottom intervals and tested across early and late dates.
+2. **Anchor timing:** the forming 2026 timing range is derived from completed mature intervals; early, central, and late anchor models are combined so one window boundary cannot control the public result.
 3. **Dynamic settling:** an internal forecast is blended with the observed forming region using an empirical settling-speed curve learned from completed bottoms.
 4. **Bottom foundation:** settled regions are joined in log-price space, creating the structural curve beneath market cycles.
 5. **Fair value:** four cycle-neutral definitions are tested on earlier completed cycles and combined using walk-forward validation weights.
@@ -258,7 +262,7 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
     st.subheader("The current cycle is still settling")
     c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Pre-observation estimate", money(summary["pre_observation_bottom_forecast_usd"]))
-    c2.metric("Forming observed region", money(summary["forming_bottom_region_usd"]))
+    c2.metric("Marginalized forming region", money(summary["forming_bottom_region_usd"]))
     c3.metric("Linear window progress", f"{summary['linear_window_progress']:.1%}")
     c4.metric("Empirical evidence", f"{summary['forming_evidence_weight']:.1%}")
     c5.metric("Dynamic settled estimate", money(summary["dynamic_settled_bottom_estimate_usd"]))
@@ -274,7 +278,7 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
         "Original rough anchor",
         str(pd.Timestamp(summary["original_rough_current_bottom_anchor"]).date()),
     )
-    t2.metric("Learned central anchor", str(pd.Timestamp(summary["current_bottom_anchor"]).date()))
+    t2.metric("Learned timing center", str(pd.Timestamp(summary["current_bottom_anchor"]).date()))
     t3.metric(
         "Completed-cycle range",
         f"{pd.Timestamp(summary['current_anchor_empirical_early']).date()}–"
@@ -319,7 +323,9 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
     st.caption(
         "The completed mature intervals were 1,431 and 1,437 days, pointing to October 25. October 7 is "
         "retained as an early stress case, with an equally distant November 12 late stress case. The narrow "
-        "October 22–28 range is empirical but rests on only two completed mature intervals."
+        "October 22–28 range is empirical but rests on only two completed mature intervals. The public model "
+        "uses an equal-weight geometric mean of the October 22, 25, and 28 price outputs; the table preserves "
+        "the exact-date models."
     )
 
     st.subheader("Empirical settling-speed calibration")
@@ -652,7 +658,7 @@ st.caption(
 )
 
 diagnostics = {
-    "diagnostics_schema": "bitcoin-dynamic-settling-copy-block-v6",
+    "diagnostics_schema": "bitcoin-dynamic-settling-copy-block-v7",
     "deployment": {
         "model_version": price_model.MODEL_VERSION,
         "loaded_engine_source": getattr(price_model, "__file__", "UNKNOWN"),
@@ -662,6 +668,8 @@ diagnostics = {
     "bottom_regions": compact_records(model.bottom_regions, [
         "cycle", "label", "anchor_date", "region_date", "region_price_usd",
         "cluster_low_usd", "cluster_high_usd", "extreme_date", "extreme_price_usd",
+        "anchor_marginalized_region_usd", "anchor_empirical_region_low_usd",
+        "anchor_empirical_region_high_usd",
         "bottom_to_bottom_multiple", "bottom_to_bottom_cagr", "status",
     ]),
     "peak_regions": compact_records(model.peak_regions, [

@@ -1,6 +1,6 @@
 # Bitcoin Fair Value
 
-Current model: `bottom-anchored-dynamic-settling-v0.6.0`
+Current model: `bottom-anchored-dynamic-settling-v0.7.0`
 
 A single-page Streamlit research application for estimating Bitcoin fair value from bear-market bottom regions that settle gradually as new evidence arrives.
 
@@ -38,7 +38,7 @@ The project intentionally contains no FI simulator, multipage router, legacy V2 
 
 ## Research status
 
-The model is explicitly `RESEARCH_ONLY`. Bitcoin has only a few independent completed cycles. The mature-cycle range measures sensitivity to transparent bottom definitions, the leave-one-cycle-out range measures dependence on any single historical cycle, and the anchor-timing range measures dependence on the estimated 2026 turning date. None is a probability interval or guaranteed floor. The forming bottom remains provisional, and user-entered scenarios never become model evidence.
+The model is explicitly `RESEARCH_ONLY`. Bitcoin has only a few independent completed cycles. The mature-cycle range measures sensitivity to transparent bottom definitions, the leave-one-cycle-out range measures dependence on any single historical cycle, and the anchor-timing range measures dependence on the estimated 2026 turning date. The public forming endpoint is marginalized across the empirical early, central, and late anchor models so one hard window boundary does not control it. None of these ranges is a probability interval or guaranteed floor. The forming bottom remains provisional, and user-entered scenarios never become model evidence.
 
 The public projection currently ends at the next bottom region in 2030. A ten-year bottom line requires validated recursive projection, while a ten-year fair-value line additionally requires a validated model of future fair-value-multiple or peak compression.
 

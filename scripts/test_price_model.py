@@ -85,13 +85,28 @@ def main() -> None:
     assert len(result.anchor_timing_sensitivity) == 5
     assert result.anchor_timing_sensitivity["available"].all()
     assert result.anchor_timing_sensitivity["timing_role"].str.startswith("completed-cycle").sum() == 3
-    central_timing = result.anchor_timing_sensitivity[
-        result.anchor_timing_sensitivity["timing_role"] == "completed-cycle central"
-    ].iloc[0]
+    empirical_timing = result.anchor_timing_sensitivity[
+        result.anchor_timing_sensitivity["timing_role"].str.startswith("completed-cycle")
+    ]
+    marginalized_bottom = float(np.exp(np.mean(np.log(
+        empirical_timing["dynamic_current_bottom_usd"].to_numpy(dtype=float)
+    ))))
+    marginalized_region = float(np.exp(np.mean(np.log(
+        empirical_timing["forming_region_usd"].to_numpy(dtype=float)
+    ))))
     assert np.isclose(
-        central_timing["dynamic_current_bottom_usd"],
+        marginalized_bottom,
         result.summary["dynamic_settled_bottom_estimate_usd"],
     )
+    assert result.summary["anchor_marginalization_variants"] == 3
+    assert np.isclose(marginalized_region, result.summary["forming_bottom_region_usd"])
+    assert np.isclose(
+        empirical_timing["forming_evidence_weight"].mean(),
+        result.summary["forming_evidence_weight"],
+    )
+    assert result.summary["forming_bottom_region_anchor_low_usd"] <= result.summary[
+        "forming_bottom_region_usd"
+    ] <= result.summary["forming_bottom_region_anchor_high_usd"]
     assert result.summary["anchor_timing_empirical_bottom_low_usd"] <= result.summary[
         "anchor_timing_empirical_bottom_high_usd"
     ]

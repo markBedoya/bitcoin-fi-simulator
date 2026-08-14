@@ -16,6 +16,8 @@ The original October 7, 2026 date was a rough estimate based on an earlier cycle
 
 Only two independent mature timing intervals exist, so the narrow six-day range must not be mistaken for strong statistical certainty. The application also retains October 7 as an early stress date and adds an equally distant November 12 late stress date. Every timing variant re-extracts the forming region and recomputes its window progress, evidence weight, dynamic bottom, current fair value, and next-bottom projection.
 
+The primary forming endpoint does not select one exact date from the October 22–28 empirical range. It runs the October 22, 25, and 28 anchor models separately, gives each one equal influence, and combines price-valued outputs with a geometric mean. Window progress and evidence weights use their arithmetic mean. This marginalization occurs before the bottom foundation, fair-value calibration, and mature-cycle projection are rebuilt, preventing one anchor window boundary from deciding the public result.
+
 ## Dynamic settling
 
 The current turning region is not assumed to be complete. Before observing it, four internal models estimate its eventual level from earlier completed bottoms. The pre-observation ensemble is blended with the forming observed region in log space:
@@ -104,6 +106,7 @@ A cycle-balanced regression over all daily prices remains optional inside the Re
 - Bitcoin supplies very few independent market cycles.
 - The current bottom region remains incomplete.
 - The current anchor is based on only two completed mature timing intervals.
+- Equal weighting across the three empirical anchor dates is a transparent smoothing choice, not a learned probability distribution.
 - Turning dates, windows, and cluster statistics are transparent research choices rather than facts of nature.
 - Walk-forward validation has only a few held-out cycles.
 - The mature-cycle projection has only three transitions and includes a forming current endpoint.

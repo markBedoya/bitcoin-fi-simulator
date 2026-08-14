@@ -14,7 +14,9 @@ assert "Conservative calibrated curve" in page
 assert "Dependence on individual completed cycles" in page
 assert "Current bottom-anchor timing" in page
 assert "Original rough anchor" in page
-assert "Learned central anchor" in page
+assert "Learned timing center" in page
+assert "Marginalized forming region" in page
+assert "equal-weight geometric mean" in page
 assert "Ten-year projection readiness" in page
 assert "Recursive bottom" in page
 assert "Leave-one-cycle-out range" in page
@@ -30,7 +32,7 @@ assert guard_position < ratio_position
 assert "price_model.SUMMARY_SCHEMA" not in page
 assert "Your scenario — never used as model evidence" in page
 assert "Copy/paste research diagnostics" in page
-assert "bitcoin-dynamic-settling-copy-block-v6" in page
+assert "bitcoin-dynamic-settling-copy-block-v7" in page
 assert "loaded_engine_source" in page
 assert "forming_bottom_prior_forecasts" in page
 assert "candidate_forecasts" not in page
