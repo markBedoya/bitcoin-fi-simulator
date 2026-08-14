@@ -15,7 +15,7 @@ import src.price_model as price_model
 # Streamlit reruns the page in a long-lived process. Reloading prevents a newly
 # deployed page from retaining an older price_model module in memory.
 price_model = reload(price_model)
-EXPECTED_SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v2"
+EXPECTED_SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v3"
 
 
 st.set_page_config(
@@ -79,11 +79,15 @@ required_summary_keys = {
     "price_to_dynamic_fair_value",
     "dynamic_fair_value_usd",
     "dynamic_settled_bottom_estimate_usd",
+    "next_bottom_core_usd",
+    "next_bottom_core_low_usd",
+    "next_bottom_core_high_usd",
 }
 missing_summary_keys = sorted(required_summary_keys.difference(summary))
 missing_result_sections = sorted(
     section for section in (
         "bottom_sensitivity",
+        "mature_cycle_forecast",
         "fair_value_methods",
         "dynamic_settling",
         "dynamic_settling_summary",
@@ -171,11 +175,6 @@ figure.add_trace(go.Scatter(
     name="Dynamic fair value", line={"color": "#F7931A", "width": 3},
 ))
 figure.add_trace(go.Scatter(
-    x=future_curve["date"], y=future_curve["dynamic_fair_value_usd"], mode="lines",
-    name="Dynamic fair value (research projection)",
-    line={"color": "#F7931A", "width": 2, "dash": "dash"},
-))
-figure.add_trace(go.Scatter(
     x=model.bottom_regions["region_date"], y=model.bottom_regions["region_price_usd"],
     mode="markers", name="Observed bottom regions",
     marker={"size": 11, "color": "#72D572", "symbol": "circle-open", "line": {"width": 2}},
@@ -202,9 +201,16 @@ figure.update_layout(
     height=690, legend={"orientation": "h", "y": -0.16}, margin={"b": 120},
 )
 st.plotly_chart(figure, use_container_width=True, config={"displaylogo": False})
+p1, p2, p3 = st.columns(3)
+p1.metric("2030 mature-cycle bottom", money(summary["next_bottom_core_usd"]))
+p2.metric(
+    "Definition range",
+    f"{money(summary['next_bottom_core_low_usd'])}–{money(summary['next_bottom_core_high_usd'])}",
+)
+p3.metric("Projected bottom growth", f"{summary['next_bottom_core_multiple']:.3f}×")
 st.caption(
-    "Solid lines describe evidence available today. Dashed lines extend the internal next-bottom ensemble "
-    "and are research projections, not confidence intervals."
+    "The dashed green line extends the mature-cycle bottom estimate. Fair value stops at today because "
+    "future peak compression has not been modeled. The definition range is not a confidence interval."
 )
 
 with st.expander("How the model works", expanded=False):
@@ -214,8 +220,9 @@ with st.expander("How the model works", expanded=False):
 2. **Dynamic settling:** an internal forecast made before the turning window is blended with the observed forming region as evidence accumulates.
 3. **Bottom foundation:** settled regions are joined in log-price space, creating the structural curve beneath market cycles.
 4. **Fair value:** four cycle-neutral definitions are tested on earlier completed cycles and combined using walk-forward validation weights.
-5. **Unknown future:** four internal bottom-growth models estimate the next region. The visible range is disagreement between models, not a probability band.
-6. **Scenario separation:** user-entered future prices remain scenarios and never become training evidence.
+5. **Mature-cycle projection:** decaying bottom growth across the 2015→2018, 2018→2022, and forming 2022→2026 transitions produces the core next-bottom estimate.
+6. **Pre-observation prior:** several internal rules create a forecast before a forming bottom is observed. They help the 2026 estimate settle but are not presented as 2030 paths.
+7. **Scenario separation:** user-entered future prices remain scenarios and never become training evidence.
         """
     )
 
@@ -332,24 +339,34 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
         "does not decide the calibration weights."
     )
 
-    st.subheader(f"Internal estimates for the {pd.Timestamp(summary['next_bottom_anchor']).date()} bottom region")
-    forecast_view = model.candidate_forecasts[[
-        "model", "predicted_bottom_usd", "ensemble_weight", "holdouts", "approx_typical_pct_error",
+    st.subheader(f"Mature-cycle estimate for the {pd.Timestamp(summary['next_bottom_anchor']).date()} bottom region")
+    core_view = model.mature_cycle_forecast[[
+        "model", "mature_transitions", "observed_growth_path", "next_growth_multiple", "predicted_bottom_usd",
+        "definition_range_low_usd", "definition_range_high_usd", "validation_status",
     ]].copy()
     st.dataframe(
-        forecast_view.style.format({
-            "predicted_bottom_usd": "${:,.0f}", "ensemble_weight": "{:.1%}",
-            "approx_typical_pct_error": "{:.1%}",
+        core_view.style.format({
+            "next_growth_multiple": "{:.3f}×", "predicted_bottom_usd": "${:,.0f}",
+            "definition_range_low_usd": "${:,.0f}", "definition_range_high_usd": "${:,.0f}",
         }),
         hide_index=True, use_container_width=True,
     )
-    f1, f2, f3 = st.columns(3)
-    f1.metric("Internal ensemble", money(summary["next_bottom_internal_ensemble_usd"]))
-    f2.metric("Lowest candidate", money(summary["next_bottom_candidate_low_usd"]))
-    f3.metric("Highest candidate", money(summary["next_bottom_candidate_high_usd"]))
-    st.warning(
-        "This range is intentionally wide. History is too short to establish one reliable long-run decay law, "
-        "and the current bottom has not settled."
+    f1, f2, f3, f4 = st.columns(4)
+    f1.metric("Core estimate", money(summary["next_bottom_core_usd"]))
+    f2.metric(
+        "Central definition range",
+        f"{money(summary['next_bottom_core_low_usd'])}–{money(summary['next_bottom_core_high_usd'])}",
+    )
+    f3.metric(
+        "Definition stress range",
+        f"{money(summary['next_bottom_core_stress_low_usd'])}–{money(summary['next_bottom_core_stress_high_usd'])}",
+    )
+    f4.metric("Next growth multiple", f"{summary['next_bottom_core_multiple']:.3f}×")
+    st.caption(
+        f"Observed mature bottom growth: **{summary['mature_observed_growth_path']}**; "
+        f"projected next growth: **{summary['next_bottom_core_multiple']:.3f}×**. "
+        "The central range is the 10th–90th percentile across available bottom-window, cluster-size, "
+        "and region-statistic definitions. It is a definition-sensitivity range, not a probability interval."
     )
 
     st.subheader("Your scenario — never used as model evidence")
@@ -371,20 +388,38 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
         deep_drawdown = float("nan")
         st.error("Scenario ordering must be: bottom low ≤ bottom high < peak low ≤ peak high.")
 
-    forecast_chart = go.Figure(go.Bar(
-        x=model.candidate_forecasts["model"], y=model.candidate_forecasts["predicted_bottom_usd"],
-        marker_color="#F7931A",
-        text=model.candidate_forecasts["predicted_bottom_usd"].map(lambda value: f"${value:,.0f}"),
-        textposition="outside",
+    chart_labels = ["Mature-cycle model"]
+    chart_values = [summary["next_bottom_core_usd"]]
+    chart_high_errors = [summary["next_bottom_core_high_usd"] - summary["next_bottom_core_usd"]]
+    chart_low_errors = [summary["next_bottom_core_usd"] - summary["next_bottom_core_low_usd"]]
+    chart_colors = ["#B39DDB"]
+    if scenario_valid:
+        scenario_midpoint = (scenario_bottom_low + scenario_bottom_high) / 2.0
+        chart_labels.append("Your scenario")
+        chart_values.append(scenario_midpoint)
+        chart_high_errors.append(scenario_bottom_high - scenario_midpoint)
+        chart_low_errors.append(scenario_midpoint - scenario_bottom_low)
+        chart_colors.append("#72D572")
+    forecast_chart = go.Figure(go.Scatter(
+        x=chart_labels,
+        y=chart_values,
+        mode="markers+text",
+        text=[money(value) for value in chart_values],
+        textposition="top center",
+        marker={"size": 14, "color": chart_colors},
+        error_y={
+            "type": "data",
+            "symmetric": False,
+            "array": chart_high_errors,
+            "arrayminus": chart_low_errors,
+            "thickness": 2,
+            "width": 12,
+        },
+        hovertemplate="%{x}<br>$%{y:,.0f}<extra></extra>",
     ))
-    if scenario_bottom_low <= scenario_bottom_high:
-        forecast_chart.add_hrect(
-            y0=scenario_bottom_low, y1=scenario_bottom_high, fillcolor="#72D572",
-            opacity=0.16, line_width=0, annotation_text="User scenario only",
-        )
     forecast_chart.update_layout(
-        title="Next-bottom internal candidates vs your scenario",
-        xaxis_title="Internal model", yaxis_title="Projected bottom-region price (USD)", height=480,
+        title="2030 bottom: mature-cycle definition range vs your scenario",
+        xaxis_title="", yaxis_title="Projected bottom-region price (USD)", height=430,
     )
     st.plotly_chart(forecast_chart, use_container_width=True, config={"displaylogo": False})
 
@@ -424,7 +459,7 @@ st.caption(
 )
 
 diagnostics = {
-    "diagnostics_schema": "bitcoin-dynamic-settling-copy-block-v2",
+    "diagnostics_schema": "bitcoin-dynamic-settling-copy-block-v3",
     "deployment": {
         "model_version": price_model.MODEL_VERSION,
         "loaded_engine_source": getattr(price_model, "__file__", "UNKNOWN"),
@@ -447,9 +482,15 @@ diagnostics = {
         "method_id", "method", "target_cycle", "target_status", "predicted_multiple",
         "realized_multiple", "median_absolute_log_error", "neutrality_error", "combined_score",
     ]),
-    "candidate_forecasts": compact_records(model.candidate_forecasts, [
-        "model_id", "model", "next_bottom_anchor", "predicted_bottom_usd", "ensemble_weight",
-        "holdouts", "approx_typical_pct_error",
+    "mature_cycle_forecast": compact_records(model.mature_cycle_forecast, [
+        "model_id", "model", "target_date", "mature_start_cycle", "mature_transitions",
+        "includes_forming_current_bottom", "observed_growth_path", "next_growth_multiple", "predicted_bottom_usd",
+        "definition_range_low_usd", "definition_range_high_usd", "definition_stress_low_usd",
+        "definition_stress_high_usd", "definition_variants", "range_definition", "validation_status",
+    ]),
+    "forming_bottom_prior_forecasts": compact_records(model.forming_prior_forecasts, [
+        "model_id", "model", "target_date", "predicted_bottom_usd", "ensemble_weight",
+        "holdouts", "approx_typical_pct_error", "forecast_role",
     ]),
     "bottom_validation_summary": compact_records(model.validation_summary, [
         "model_id", "model", "holdouts", "effective_holdouts", "mean_absolute_log_error",
@@ -469,7 +510,8 @@ diagnostics = {
     "bottom_sensitivity": compact_records(model.bottom_sensitivity, [
         "half_window_days", "cluster_days", "statistic", "available", "forming_region_usd",
         "forming_evidence_weight", "dynamic_current_bottom_usd", "current_foundation_usd",
-        "fair_value_if_multiplier_held_usd", "next_bottom_ensemble_usd",
+        "fair_value_if_multiplier_held_usd", "mature_cycle_next_multiple",
+        "mature_cycle_next_bottom_usd",
     ]),
     "user_scenario_not_training_evidence": {
         "next_peak_anchor": summary["next_peak_anchor"], "peak_low_usd": scenario_peak_low,

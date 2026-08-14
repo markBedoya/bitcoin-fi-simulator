@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.2.1"
-SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v2"
+MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.3.0"
+SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v3"
 GENESIS = pd.Timestamp("2009-01-03")
 BOTTOM_WINDOW_DAYS = 120
 PEAK_WINDOW_DAYS = 90
@@ -51,7 +51,8 @@ class BottomAnchoredModelResult:
     bottom_regions: pd.DataFrame
     peak_regions: pd.DataFrame
     curve: pd.DataFrame
-    candidate_forecasts: pd.DataFrame
+    mature_cycle_forecast: pd.DataFrame
+    forming_prior_forecasts: pd.DataFrame
     validation_summary: pd.DataFrame
     walk_forward: pd.DataFrame
     bottom_sensitivity: pd.DataFrame
@@ -287,6 +288,42 @@ def _ensemble_value(forecasts: pd.DataFrame) -> float:
     weights = valid["ensemble_weight"].to_numpy(dtype=float)
     weights /= weights.sum()
     return float(np.exp(np.sum(weights * np.log(valid["predicted_bottom_usd"].to_numpy(dtype=float)))))
+
+
+def _mature_cycle_decay(bottoms: pd.DataFrame, mature_start_cycle: int = 1) -> dict:
+    """Project the next bottom from decaying mature-cycle growth above 1x.
+
+    Cycle zero is Bitcoin's early micro-cap regime. Starting with the 2015
+    bottom leaves the three later transitions that describe the maturing
+    market structure: 2015→2018, 2018→2022, and 2022→forming 2026.
+    """
+    mature = bottoms[bottoms["cycle"] >= mature_start_cycle].sort_values("cycle")
+    values = mature["region_price_usd"].to_numpy(dtype=float)
+    if len(values) < 4:
+        return {
+            "available": False,
+            "mature_start_cycle": mature_start_cycle,
+            "mature_transitions": max(0, len(values) - 1),
+        }
+    growth = values[1:] / values[:-1]
+    if np.any(~np.isfinite(growth)) or np.any(growth <= 1.0):
+        return {
+            "available": False,
+            "mature_start_cycle": mature_start_cycle,
+            "mature_transitions": int(len(growth)),
+        }
+    x = np.arange(len(growth), dtype=float)
+    slope, intercept = np.polyfit(x, np.log(growth - 1.0), 1)
+    next_growth = 1.0 + float(np.exp(intercept + slope * len(growth)))
+    return {
+        "available": True,
+        "mature_start_cycle": mature_start_cycle,
+        "mature_transitions": int(len(growth)),
+        "growth_multiples": growth.tolist(),
+        "log_excess_decay_slope": float(slope),
+        "next_growth_multiple": next_growth,
+        "predicted_bottom_usd": float(values[-1] * next_growth),
+    }
 
 
 def _forming_evidence_weight(anchor_date: pd.Timestamp, reveal_date: pd.Timestamp, half_window: int) -> float:
@@ -556,7 +593,6 @@ def _dynamic_settling_backtest(
 
 def _bottom_sensitivity(
     data: pd.DataFrame,
-    next_bottom_anchor: pd.Timestamp,
     fair_multiplier: float,
 ) -> pd.DataFrame:
     rows: list[dict] = []
@@ -586,8 +622,7 @@ def _bottom_sensitivity(
                 adjusted = pd.concat([completed, current], ignore_index=True)
                 adjusted.loc[adjusted.index[-1], "region_price_usd"] = dynamic["dynamic_bottom_usd"]
                 adjusted.loc[adjusted.index[-1], "region_date"] = pd.Timestamp(target["anchor_date"])
-                _, validation = _walk_forward(adjusted)
-                forecasts = _forecast_candidates(adjusted, next_bottom_anchor, validation)
+                mature_core = _mature_cycle_decay(adjusted)
                 previous = completed.iloc[-1]
                 current_foundation = _foundation_at(
                     latest, previous["region_date"], previous["region_price_usd"],
@@ -603,8 +638,8 @@ def _bottom_sensitivity(
                     "dynamic_current_bottom_usd": dynamic["dynamic_bottom_usd"],
                     "current_foundation_usd": current_foundation,
                     "fair_value_if_multiplier_held_usd": current_foundation * fair_multiplier,
-                    "next_bottom_ensemble_usd": _ensemble_value(forecasts),
-                    "internal_models_available": int(len(forecasts)),
+                    "mature_cycle_next_multiple": mature_core.get("next_growth_multiple", np.nan),
+                    "mature_cycle_next_bottom_usd": mature_core.get("predicted_bottom_usd", np.nan),
                 })
     return pd.DataFrame(rows)
 
@@ -670,6 +705,8 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     completed_bottoms = observed_bottoms[observed_bottoms["status"] == "completed"].copy()
     _, prior_validation = _walk_forward(completed_bottoms)
     current_observed = observed_bottoms.iloc[-1]
+    forming_prior_forecasts = _forecast_candidates(completed_bottoms, current_anchor, prior_validation)
+    forming_prior_forecasts["forecast_role"] = "pre-observation prior for the forming 2026 bottom"
     current_dynamic = _dynamic_bottom_estimate(
         completed_bottoms, current_observed, latest, prior_validation
     )
@@ -696,9 +733,9 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     fair_multiplier_high = float(current_methods["fair_multiple"].max())
 
     bottom_walk, bottom_validation = _walk_forward(settled_bottoms)
-    forecasts = _forecast_candidates(settled_bottoms, next_bottom_anchor, bottom_validation)
-    next_bottom_central = _ensemble_value(forecasts)
-    forecasts["next_bottom_anchor"] = next_bottom_anchor
+    mature_core = _mature_cycle_decay(settled_bottoms)
+    if not mature_core["available"]:
+        raise ValueError("The mature-cycle bottom projection is not observable yet.")
 
     previous = settled_bottoms.iloc[-2]
     current_foundation = _foundation_at(
@@ -709,13 +746,38 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     current_fair_low = current_foundation * fair_multiplier_low
     current_fair_high = current_foundation * fair_multiplier_high
 
-    sensitivity = _bottom_sensitivity(data, next_bottom_anchor, fair_multiplier)
+    sensitivity = _bottom_sensitivity(data, fair_multiplier)
     available_sensitivity = sensitivity[sensitivity["available"]].copy()
+    mature_sensitivity = available_sensitivity["mature_cycle_next_bottom_usd"].dropna()
+    if mature_sensitivity.empty:
+        raise ValueError("No mature-cycle bottom sensitivity variants are available.")
+    next_bottom_core = float(mature_core["predicted_bottom_usd"])
+    next_bottom_core_low = min(float(mature_sensitivity.quantile(0.10)), next_bottom_core)
+    next_bottom_core_high = max(float(mature_sensitivity.quantile(0.90)), next_bottom_core)
+    observed_growth_path = " → ".join(f"{multiple:.3f}×" for multiple in mature_core["growth_multiples"])
+    mature_forecast = pd.DataFrame([{
+        "model_id": "mature_cycle_excess_decay",
+        "model": "Mature-cycle excess-growth decay",
+        "target_date": next_bottom_anchor,
+        "mature_start_cycle": mature_core["mature_start_cycle"],
+        "mature_transitions": mature_core["mature_transitions"],
+        "includes_forming_current_bottom": True,
+        "observed_growth_path": observed_growth_path,
+        "next_growth_multiple": mature_core["next_growth_multiple"],
+        "predicted_bottom_usd": next_bottom_core,
+        "definition_range_low_usd": next_bottom_core_low,
+        "definition_range_high_usd": next_bottom_core_high,
+        "definition_stress_low_usd": float(mature_sensitivity.min()),
+        "definition_stress_high_usd": float(mature_sensitivity.max()),
+        "definition_variants": int(len(mature_sensitivity)),
+        "range_definition": "10th–90th percentile across available bottom-region definitions",
+        "validation_status": "LOW_EVIDENCE — three mature transitions; current endpoint is forming",
+    }])
     dynamic_paths, dynamic_summary = _dynamic_settling_backtest(data, observed_bottoms, peaks)
 
     curve_dates = pd.date_range(pd.Timestamp(settled_bottoms["region_date"].min()), next_bottom_anchor, freq="D")
     bottom_anchor_dates = settled_bottoms["region_date"].tolist() + [next_bottom_anchor]
-    bottom_anchor_values = settled_bottoms["region_price_usd"].tolist() + [next_bottom_central]
+    bottom_anchor_values = settled_bottoms["region_price_usd"].tolist() + [next_bottom_core]
     bottom_foundation = _log_interpolate(curve_dates, bottom_anchor_dates, bottom_anchor_values)
 
     cycle_multiplier_rows = fair_cycles.merge(
@@ -732,12 +794,14 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     multiplier_dates = [row["date"] for row in cycle_multipliers] + [next_peak_anchor]
     multiplier_values = [row["multiple"] for row in cycle_multipliers] + [fair_multiplier]
     fair_multiplier_curve = _log_interpolate(curve_dates, multiplier_dates, multiplier_values)
+    dynamic_fair_value = bottom_foundation * fair_multiplier_curve
+    dynamic_fair_value[curve_dates > latest] = np.nan
     curve = pd.DataFrame({
         "date": curve_dates,
         "row_type": np.where(curve_dates <= latest, "historical", "projected"),
         "bottom_foundation_usd": bottom_foundation,
         "fair_value_multiple": fair_multiplier_curve,
-        "dynamic_fair_value_usd": bottom_foundation * fair_multiplier_curve,
+        "dynamic_fair_value_usd": dynamic_fair_value,
     })
 
     all_price_curve, all_price_summary = _cycle_balanced_all_price_backbone(data)
@@ -772,24 +836,31 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "expected_bull_days": expected_bull_days,
         "next_peak_anchor": next_peak_anchor,
         "next_bottom_anchor": next_bottom_anchor,
-        "next_bottom_internal_ensemble_usd": next_bottom_central,
-        "next_bottom_candidate_low_usd": float(forecasts["predicted_bottom_usd"].min()),
-        "next_bottom_candidate_high_usd": float(forecasts["predicted_bottom_usd"].max()),
+        "next_bottom_core_usd": next_bottom_core,
+        "next_bottom_core_multiple": mature_core["next_growth_multiple"],
+        "mature_observed_growth_path": observed_growth_path,
+        "next_bottom_core_low_usd": next_bottom_core_low,
+        "next_bottom_core_high_usd": next_bottom_core_high,
+        "next_bottom_core_stress_low_usd": float(mature_sensitivity.min()),
+        "next_bottom_core_stress_high_usd": float(mature_sensitivity.max()),
         "bottom_sensitivity_variants": int(len(available_sensitivity)),
         "bottom_sensitivity_dynamic_low_usd": float(available_sensitivity["dynamic_current_bottom_usd"].min()),
         "bottom_sensitivity_dynamic_high_usd": float(available_sensitivity["dynamic_current_bottom_usd"].max()),
         "bottom_sensitivity_fair_low_usd": float(available_sensitivity["fair_value_if_multiplier_held_usd"].min()),
         "bottom_sensitivity_fair_high_usd": float(available_sensitivity["fair_value_if_multiplier_held_usd"].max()),
         "candidate_weight_method": "internal walk-forward error weighting",
+        "core_forecast_method": "mature-cycle excess-growth decay beginning with the 2015 bottom; 10th–90th percentile definition range",
         "dynamic_settling_method": "pre-observation internal forecast blended with forming bottom evidence by turning-window completion",
         "fair_value_method": "validation-weighted ensemble of four internally derived cycle-neutral definitions",
+        "future_fair_value_status": "deferred until peak-compression behavior is modeled",
     }
     return BottomAnchoredModelResult(
         summary=summary,
         bottom_regions=observed_bottoms,
         peak_regions=peaks,
         curve=curve,
-        candidate_forecasts=forecasts.sort_values("predicted_bottom_usd").reset_index(drop=True),
+        mature_cycle_forecast=mature_forecast,
+        forming_prior_forecasts=forming_prior_forecasts.sort_values("predicted_bottom_usd").reset_index(drop=True),
         validation_summary=bottom_validation.sort_values("ensemble_weight", ascending=False).reset_index(drop=True),
         walk_forward=bottom_walk.sort_values(["target_date", "model"]).reset_index(drop=True),
         bottom_sensitivity=sensitivity,

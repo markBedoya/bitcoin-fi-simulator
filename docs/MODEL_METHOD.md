@@ -23,9 +23,21 @@ Evidence progresses from zero at the start of the turning window to one at its e
 
 For completed historical cycles, the application performs a fake-today test. It fixes a reference date before the turn, reveals later data one month at a time, recomputes the dynamic bottom and fixed-date fair value, and compares them with the values obtained after the full turning window is known. The forming cycle has no final answer yet.
 
-## Internal bottom models
+## Mature-cycle next-bottom projection
 
-Four transparent methods estimate a future bottom region:
+The public projection uses a decay fit beginning with the 2015 bottom. It therefore measures the three later bottom-to-bottom transitions: 2015→2018, 2018→2022, and the dynamically settling 2022→2026 transition. For each transition, growth above `1×` is fitted in log space:
+
+```text
+log(growth_multiple - 1) = intercept + slope × mature_transition_index
+```
+
+The next growth multiple is applied to the dynamic current bottom. The central definition range is the 10th–90th percentile of this result across every currently available window-width, cluster-size, and region-statistic definition. The full minimum and maximum remain available as definition stress values. These ranges measure sensitivity to model definitions; they are not statistical confidence intervals.
+
+The early 2011→2015 transition is excluded from the core projection because Bitcoin's micro-cap growth regime is not treated as representative of mature-cycle growth. This is a structural research choice and is stated explicitly rather than learned from enough independent cycles.
+
+## Pre-observation bottom prior
+
+Before a forming bottom is observed, four transparent methods create a prior estimate:
 
 1. an expanding-history power law fitted only to observed bottom regions;
 2. decay of bottom-to-bottom growth above `1×`, fitted across all available transitions;
@@ -38,11 +50,11 @@ The excess-growth methods fit:
 log(growth_multiple - 1) = intercept + slope × cycle_index
 ```
 
-Each later observable bottom is hidden in turn. Models fit only earlier regions and forecast the hidden target. Ensemble influence is based on weighted absolute log error; the forming cycle supplies partial rather than full evidence. The central result is a validation-weighted geometric mean. The low/high values are model disagreement, not a statistical confidence interval.
+Each later observable bottom is hidden in turn. Models fit only earlier regions and forecast the hidden target. Ensemble influence is based on weighted absolute log error; the forming cycle supplies partial rather than full evidence. This ensemble supplies the pre-observation starting point for dynamic settling. It is not used as four competing paths for the 2030 public projection.
 
 ## Bottom foundation
 
-Completed bottom regions and the dynamically settling current region are joined in log-price space. Beyond the current anchor, the foundation extends to the validation-weighted next-bottom estimate. Projection segments are marked separately from observed history.
+Completed bottom regions and the dynamically settling current region are joined in log-price space. Beyond the current anchor, the foundation extends to the mature-cycle next-bottom estimate. Projection segments are marked separately from observed history.
 
 ## Fair value
 
@@ -55,6 +67,8 @@ The application computes four internally derived cycle-neutral multiples above e
 
 Each method is walked forward into later cycles. Completed-cycle median error and time-above/time-below neutrality determine its validation weight. The incomplete current cycle is diagnostic only and does not determine these weights. Today's fair-value multiple is the validation-weighted geometric mean of the four current estimates.
 
+Fair value is not projected beyond the latest observed date. A future fair-value curve would require a separately validated model of peak compression; until then, only the bottom foundation is extended to the next region.
+
 ## All-price diagnostic
 
 A cycle-balanced regression over all daily prices remains optional inside the Research Lab. It is labeled as a diagnostic rather than fair value because high bull-market prices can pull it above the cycle-neutral level. It does not change any bottom or fair-value estimate.
@@ -65,7 +79,8 @@ A cycle-balanced regression over all daily prices remains optional inside the Re
 - The current bottom region remains incomplete.
 - Turning dates, windows, and cluster statistics are transparent research choices rather than facts of nature.
 - Walk-forward validation has only a few held-out cycles.
-- Future candidate ranges are structural disagreement, not probability intervals.
+- The mature-cycle projection has only three transitions and includes a forming current endpoint.
+- Definition ranges are not probability intervals.
 - User peak and bottom inputs are scenarios only and never become model evidence.
 - The model is `RESEARCH_ONLY` and does not provide investment advice or a guaranteed floor.
 

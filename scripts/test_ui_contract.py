@@ -9,6 +9,8 @@ assert "Research Lab — calibration and evidence" in page
 assert "The current cycle is still settling" in page
 assert "Bottom-definition sensitivity" in page
 assert "Historical fake-today test" in page
+assert "Mature-cycle estimate" in page
+assert "Observed mature bottom growth" in page
 assert "price_model = reload(price_model)" in page
 assert "required_summary_keys" in page
 assert "The page and model engine are from different project versions" in page
@@ -18,9 +20,13 @@ assert guard_position < ratio_position
 assert "price_model.SUMMARY_SCHEMA" not in page
 assert "Your scenario — never used as model evidence" in page
 assert "Copy/paste research diagnostics" in page
-assert "bitcoin-dynamic-settling-copy-block-v2" in page
+assert "bitcoin-dynamic-settling-copy-block-v3" in page
 assert "loaded_engine_source" in page
-assert "candidate_forecasts" in page
+assert "forming_bottom_prior_forecasts" in page
+assert "candidate_forecasts" not in page
+assert "Broader model disagreement" not in page
+assert "future peak compression has not been modeled" in page
+assert "mature_cycle_forecast" in page
 assert "bottom_walk_forward" in page
 assert "dynamic_settling_summary" in page
 assert "bottom_sensitivity" in page

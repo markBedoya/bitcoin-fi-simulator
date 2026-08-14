@@ -28,25 +28,34 @@ def main() -> None:
     result = fit_bottom_anchored_model(synthetic_prices())
     assert len(result.bottom_regions) == 5
     assert len(result.peak_regions) == 4
-    assert len(result.candidate_forecasts) == 4
-    assert np.isclose(result.candidate_forecasts["ensemble_weight"].sum(), 1.0)
+    assert len(result.forming_prior_forecasts) == 4
+    assert np.isclose(result.forming_prior_forecasts["ensemble_weight"].sum(), 1.0)
     assert result.summary["dynamic_fair_value_usd"] > 0
     assert result.summary["summary_schema"] == SUMMARY_SCHEMA
     assert result.summary["dynamic_settled_bottom_estimate_usd"] > 0
     assert 0 <= result.summary["forming_evidence_weight"] <= 1
-    assert result.summary["next_bottom_candidate_low_usd"] > 0
-    assert result.summary["next_bottom_candidate_high_usd"] >= result.summary["next_bottom_candidate_low_usd"]
+    assert result.summary["next_bottom_core_usd"] > 0
+    assert result.summary["next_bottom_core_multiple"] > 1
+    assert result.summary["mature_observed_growth_path"].count("→") == 2
+    assert result.summary["next_bottom_core_low_usd"] <= result.summary["next_bottom_core_usd"]
+    assert result.summary["next_bottom_core_high_usd"] >= result.summary["next_bottom_core_usd"]
     assert result.summary["status"] == "RESEARCH_ONLY"
     assert result.curve["date"].max() == result.summary["next_bottom_anchor"]
-    assert result.curve[[
-        "bottom_foundation_usd",
-        "dynamic_fair_value_usd",
-    ]].gt(0).all().all()
+    assert result.curve["bottom_foundation_usd"].gt(0).all()
+    historical_curve = result.curve[result.curve["row_type"] == "historical"]
+    projected_curve = result.curve[result.curve["row_type"] == "projected"]
+    assert historical_curve["dynamic_fair_value_usd"].gt(0).all()
+    assert projected_curve["dynamic_fair_value_usd"].isna().all()
     assert not result.walk_forward.empty
+    assert len(result.mature_cycle_forecast) == 1
+    assert result.mature_cycle_forecast["mature_transitions"].iloc[0] == 3
     assert not result.fair_value_methods.empty
     assert np.isclose(result.fair_value_methods["ensemble_weight"].sum(), 1.0)
     assert not result.dynamic_settling_summary.empty
     assert result.bottom_sensitivity["available"].any()
+    assert result.bottom_sensitivity.loc[
+        result.bottom_sensitivity["available"], "mature_cycle_next_bottom_usd"
+    ].notna().all()
     assert result.summary["bottom_sensitivity_dynamic_low_usd"] <= result.summary["bottom_sensitivity_dynamic_high_usd"]
     print("Bottom-anchored price-model checks passed.")
 

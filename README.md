@@ -1,6 +1,6 @@
 # Bitcoin Fair Value
 
-Current model: `bottom-anchored-dynamic-settling-v0.2.1`
+Current model: `bottom-anchored-dynamic-settling-v0.3.0`
 
 A single-page Streamlit research application for estimating Bitcoin fair value from bear-market bottom regions that settle gradually as new evidence arrives.
 
@@ -9,8 +9,8 @@ The public page shows:
 - current Bitcoin price;
 - a dynamic bottom-derived fair-value estimate;
 - observed bottom and peak regions;
-- a long-term chart with observed history and clearly marked research projections;
-- a Research Lab with bottom-definition sensitivity, fair-value calibration, dynamic-settling backtests, and competing internal bottom models;
+- a long-term chart with observed history and a mature-cycle decay projection;
+- a Research Lab with bottom-definition sensitivity, fair-value calibration, dynamic-settling backtests, and pre-observation prior validation;
 - a copy-ready JSON diagnostic block for fast model review.
 
 ## Run locally
@@ -38,7 +38,7 @@ The project intentionally contains no FI simulator, multipage router, legacy V2 
 
 ## Research status
 
-The model is explicitly `RESEARCH_ONLY`. Bitcoin has only a few independent completed cycles. Candidate ranges are structural comparisons, not probability intervals or guaranteed floors. The forming bottom remains provisional, and user-entered scenarios never become model evidence.
+The model is explicitly `RESEARCH_ONLY`. Bitcoin has only a few independent completed cycles. The mature-cycle range measures sensitivity to transparent bottom definitions; it is not a probability interval or guaranteed floor. The forming bottom remains provisional, and user-entered scenarios never become model evidence.
 
 ## Data
 
