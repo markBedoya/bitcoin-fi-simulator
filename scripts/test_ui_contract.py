@@ -17,6 +17,12 @@ assert "Original rough anchor" in page
 assert "Learned timing center" in page
 assert "Marginalized forming region" in page
 assert "equal-weight geometric mean" in page
+assert 'column.endswith("_date")' in page
+assert 'column.endswith("_anchor")' in page
+assert "public_model_region_usd" in page
+assert "exact_anchor_region_usd" in page
+assert "Lifecycle boundary" in page
+assert "Automatic promotion" in page
 assert "Ten-year projection readiness" in page
 assert "Recursive bottom" in page
 assert "Leave-one-cycle-out range" in page

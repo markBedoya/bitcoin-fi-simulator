@@ -97,6 +97,12 @@ The current public bottom foundation extends through one future bottom region in
 
 A ten-year fair-value curve requires the recursive bottom foundation plus a separate forward model for the compression or stabilization of cycle-neutral fair-value multiples. Holding today's multiple constant would be a scenario assumption, not an empirically validated result, so it is not drawn as model output.
 
+## Operational lifecycle
+
+Within the current observation window, every newly loaded Bitcoin price can change the anchor-specific regions, marginalized forming endpoint, empirical evidence weight, bottom foundation, current fair value, and sensitivities. The application currently reads its runtime cache until the user requests a refresh or the app restarts.
+
+The current forming window ends 120 days after the October 25 timing center, on February 22, 2027. The model does not yet contain a rolling state transition that freezes the settled 2026 region, adds it to the completed calibration catalog, generates the next expected bottom window, and later discovers the next peak region. Until that transition is implemented and time-travel tested, the project should not be described as permanently maintenance-free.
+
 ## All-price diagnostic
 
 A cycle-balanced regression over all daily prices remains optional inside the Research Lab. It is labeled as a diagnostic rather than fair value because high bull-market prices can pull it above the cycle-neutral level. It does not change any bottom or fair-value estimate.

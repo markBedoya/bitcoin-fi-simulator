@@ -99,6 +99,8 @@ def main() -> None:
         result.summary["dynamic_settled_bottom_estimate_usd"],
     )
     assert result.summary["anchor_marginalization_variants"] == 3
+    assert pd.Timestamp(result.summary["current_cycle_observation_window_end"]) == pd.Timestamp("2027-02-22")
+    assert "rollover" in result.summary["rolling_cycle_status"]
     assert np.isclose(marginalized_region, result.summary["forming_bottom_region_usd"])
     assert np.isclose(
         empirical_timing["forming_evidence_weight"].mean(),

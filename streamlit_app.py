@@ -48,7 +48,7 @@ def compact_records(frame: pd.DataFrame, columns: list[str]) -> list[dict]:
     available = [column for column in columns if column in frame.columns]
     view = frame[available].copy()
     for column in view.columns:
-        if "date" in column or "anchor" in column:
+        if column == "date" or column.endswith("_date") or column.endswith("_anchor"):
             view[column] = pd.to_datetime(view[column], errors="coerce").dt.date.astype(str)
     return copy_safe(view.to_dict(orient="records"))
 
@@ -63,6 +63,7 @@ with st.sidebar:
         "Research model. Turning dates locate broad market regions; exact daily highs and lows can occur "
         "before or after them."
     )
+    st.caption("Bitcoin prices remain cached until **Refresh Bitcoin data** is clicked or the app restarts.")
 
 try:
     prices, meta = load_coinmetrics(refresh=refresh)
@@ -88,6 +89,7 @@ required_summary_keys = {
     "dynamic_fair_value_cycle_low_usd",
     "dynamic_fair_value_cycle_high_usd",
     "current_bottom_anchor",
+    "current_cycle_observation_window_end",
     "anchor_marginalization_method",
     "anchor_marginalization_variants",
     "forming_bottom_region_anchor_low_usd",
@@ -327,6 +329,11 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
         "uses an equal-weight geometric mean of the October 22, 25, and 28 price outputs; the table preserves "
         "the exact-date models."
     )
+    st.info(
+        f"**Lifecycle boundary:** this forming-cycle engine updates as new prices arrive through the full "
+        f"observation window ending **{pd.Timestamp(summary['current_cycle_observation_window_end']).date()}**. "
+        "Automatic promotion of the settled 2026 bottom and rollover to the next forming target are not yet implemented."
+    )
 
     st.subheader("Empirical settling-speed calibration")
     calibration_chart = go.Figure()
@@ -496,15 +503,29 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
     st.subheader("Observed bottom regions")
     bottom_view = model.bottom_regions[[
         "cycle", "label", "anchor_date", "region_date", "region_price_usd",
+        "anchor_marginalized_region_usd",
         "extreme_date", "extreme_price_usd", "bottom_to_bottom_multiple",
         "bottom_to_bottom_cagr", "status",
     ]].copy()
+    bottom_view["public_model_region_usd"] = bottom_view[
+        "anchor_marginalized_region_usd"
+    ].fillna(bottom_view["region_price_usd"])
+    bottom_view = bottom_view.rename(columns={"region_price_usd": "exact_anchor_region_usd"})[[
+        "cycle", "label", "anchor_date", "region_date", "public_model_region_usd",
+        "exact_anchor_region_usd", "extreme_date", "extreme_price_usd",
+        "bottom_to_bottom_multiple", "bottom_to_bottom_cagr", "status",
+    ]]
     st.dataframe(
         bottom_view.style.format({
-            "region_price_usd": "${:,.2f}", "extreme_price_usd": "${:,.2f}",
+            "public_model_region_usd": "${:,.2f}", "exact_anchor_region_usd": "${:,.2f}",
+            "extreme_price_usd": "${:,.2f}",
             "bottom_to_bottom_multiple": "{:.2f}×", "bottom_to_bottom_cagr": "{:.1%}",
         }, na_rep="—"),
         hide_index=True, use_container_width=True,
+    )
+    st.caption(
+        "Completed cycles use the same value in both columns. For the forming 2026 cycle, the public model "
+        "region is marginalized across October 22, 25, and 28; the exact-anchor column shows October 25 only."
     )
 
     st.subheader("Fair-value definitions and validation weights")

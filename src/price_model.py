@@ -6,7 +6,7 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.7.0"
+MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.7.1"
 SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v7"
 GENESIS = pd.Timestamp("2009-01-03")
 BOTTOM_WINDOW_DAYS = 120
@@ -1263,6 +1263,8 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "current_anchor_empirical_early": empirical_anchor_early,
         "current_anchor_empirical_late": empirical_anchor_late,
         "current_anchor_completed_intervals": int(len(mature_cycle_days)),
+        "current_cycle_observation_window_end": current_anchor + pd.Timedelta(days=BOTTOM_WINDOW_DAYS),
+        "rolling_cycle_status": "current 2026 forming cycle updates dynamically; automatic settlement and rollover to the next target are not yet implemented",
         "mature_cycle_days_low": int(np.min(mature_cycle_days)),
         "mature_cycle_days_central": expected_cycle_days,
         "mature_cycle_days_high": int(np.max(mature_cycle_days)),
