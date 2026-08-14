@@ -29,6 +29,12 @@ The median progress across completed cycles is made monotonic. Because only four
 
 Evidence weight is the observed region's influence in the blend. It is not the probability that the market bottom has occurred.
 
+### Dependence on individual cycles
+
+The calibration is rebuilt four times, omitting one completed bottom region in each run. Every reduced-history curve is regularized using the same two linear-prior cycle equivalents, then propagated through today's settling bottom, bottom foundation, fair value, and mature-cycle next-bottom calculation.
+
+The minimum and maximum across those four runs form the leave-one-cycle-out cycle-dependence range. This answers whether one unusual historical cycle is carrying the current result. It is not a bootstrap distribution, probability interval, or 95% confidence interval.
+
 For completed historical cycles, the application performs a fake-today test. It fixes a reference date before the turn, reveals later data one month at a time, recomputes the dynamic bottom and fixed-date fair value, and compares them with the values obtained after the full turning window is known. Each historical target uses a calibration curve built only from earlier completed bottoms. The forming cycle has no final answer yet.
 
 ## Mature-cycle next-bottom projection
@@ -89,6 +95,7 @@ A cycle-balanced regression over all daily prices remains optional inside the Re
 - Walk-forward validation has only a few held-out cycles.
 - The mature-cycle projection has only three transitions and includes a forming current endpoint.
 - The empirical settling curve has only four completed regions and is deliberately regularized toward linear time.
+- The leave-one-cycle-out spread measures single-cycle dependence, not total model uncertainty.
 - Definition ranges are not probability intervals.
 - User peak and bottom inputs are scenarios only and never become model evidence.
 - The model is `RESEARCH_ONLY` and does not provide investment advice or a guaranteed floor.

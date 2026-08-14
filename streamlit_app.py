@@ -15,7 +15,7 @@ import src.price_model as price_model
 # Streamlit reruns the page in a long-lived process. Reloading prevents a newly
 # deployed page from retaining an older price_model module in memory.
 price_model = reload(price_model)
-EXPECTED_SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v4"
+EXPECTED_SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v5"
 
 
 st.set_page_config(
@@ -81,6 +81,14 @@ required_summary_keys = {
     "dynamic_settled_bottom_estimate_usd",
     "linear_window_progress",
     "forming_evidence_weight",
+    "forming_evidence_weight_cycle_low",
+    "forming_evidence_weight_cycle_high",
+    "dynamic_settled_bottom_cycle_low_usd",
+    "dynamic_settled_bottom_cycle_high_usd",
+    "dynamic_fair_value_cycle_low_usd",
+    "dynamic_fair_value_cycle_high_usd",
+    "next_bottom_cycle_low_usd",
+    "next_bottom_cycle_high_usd",
     "next_bottom_core_usd",
     "next_bottom_core_low_usd",
     "next_bottom_core_high_usd",
@@ -92,6 +100,8 @@ missing_result_sections = sorted(
         "mature_cycle_forecast",
         "settling_calibration",
         "settling_calibration_detail",
+        "settling_leave_one_out",
+        "settling_cycle_dependence",
         "fair_value_methods",
         "dynamic_settling",
         "dynamic_settling_summary",
@@ -154,7 +164,9 @@ st.info(
     f"evidence weight is **{summary['forming_evidence_weight']:.1%}**. The observed region is blended "
     f"with the pre-observation estimate of **{money(summary['pre_observation_bottom_forecast_usd'])}**. "
     f"That produces a settling bottom estimate of **{money(summary['dynamic_settled_bottom_estimate_usd'])}** "
-    f"and fair value of **{money(summary['dynamic_fair_value_usd'])}**."
+    f"and fair value of **{money(summary['dynamic_fair_value_usd'])}**. When any one completed cycle is "
+    f"removed, the bottom remains within **{money(summary['dynamic_settled_bottom_cycle_low_usd'])}–"
+    f"{money(summary['dynamic_settled_bottom_cycle_high_usd'])}**."
 )
 
 curve = model.curve
@@ -259,6 +271,20 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
         mode="lines+markers", name="Raw completed-cycle curve",
         line={"color": "#72D572", "dash": "dash"},
     ))
+    cycle_band = model.settling_leave_one_out.groupby("window_fraction", as_index=False).agg(
+        evidence_low=("empirical_evidence_weight", "min"),
+        evidence_high=("empirical_evidence_weight", "max"),
+    )
+    calibration_chart.add_trace(go.Scatter(
+        x=cycle_band["window_fraction"], y=cycle_band["evidence_low"],
+        mode="lines", name="Leave-one-cycle-out lower edge",
+        line={"width": 0}, hoverinfo="skip", showlegend=False,
+    ))
+    calibration_chart.add_trace(go.Scatter(
+        x=cycle_band["window_fraction"], y=cycle_band["evidence_high"],
+        mode="lines", name="Leave-one-cycle-out range",
+        line={"width": 0}, fill="tonexty", fillcolor="rgba(179, 157, 219, 0.20)",
+    ))
     calibration_chart.add_trace(go.Scatter(
         x=model.settling_calibration["window_fraction"],
         y=model.settling_calibration["empirical_evidence_weight"],
@@ -282,7 +308,47 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
     st.caption(
         f"The raw curve uses {summary['settling_calibration_cycles']} completed bottom regions. "
         "Because the sample is small, it is conservatively shrunk toward the old linear schedule using "
-        "two linear-prior cycle equivalents."
+        "two linear-prior cycle equivalents. The shaded band rebuilds the curve after removing each cycle."
+    )
+
+    st.subheader("Dependence on individual completed cycles")
+    u1, u2, u3, u4 = st.columns(4)
+    u1.metric(
+        "Evidence-weight range",
+        f"{summary['forming_evidence_weight_cycle_low']:.1%}–{summary['forming_evidence_weight_cycle_high']:.1%}",
+    )
+    u2.metric(
+        "Settling-bottom range",
+        f"{money(summary['dynamic_settled_bottom_cycle_low_usd'])}–"
+        f"{money(summary['dynamic_settled_bottom_cycle_high_usd'])}",
+    )
+    u3.metric(
+        "Fair-value range",
+        f"{money(summary['dynamic_fair_value_cycle_low_usd'])}–"
+        f"{money(summary['dynamic_fair_value_cycle_high_usd'])}",
+    )
+    u4.metric(
+        "2030 bottom range",
+        f"{money(summary['next_bottom_cycle_low_usd'])}–{money(summary['next_bottom_cycle_high_usd'])}",
+    )
+    dependence_table = model.settling_cycle_dependence.copy()
+    dependence_table["omitted_bottom"] = pd.to_datetime(
+        dependence_table["omitted_anchor"]
+    ).dt.year.astype(str)
+    st.dataframe(
+        dependence_table[[
+            "omitted_bottom", "forming_evidence_weight", "evidence_weight_change",
+            "dynamic_current_bottom_usd", "dynamic_fair_value_usd", "mature_cycle_next_bottom_usd",
+        ]].style.format({
+            "forming_evidence_weight": "{:.1%}", "evidence_weight_change": "{:+.1%}",
+            "dynamic_current_bottom_usd": "${:,.0f}", "dynamic_fair_value_usd": "${:,.0f}",
+            "mature_cycle_next_bottom_usd": "${:,.0f}",
+        }),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        "Each row rebuilds the empirical curve without the listed historical bottom and propagates the "
+        "change through the model. The full spread is a cycle-dependence range, not a 95% confidence interval."
     )
 
     completed_paths = model.dynamic_settling[model.dynamic_settling["target_status"] == "completed"].copy()
@@ -506,7 +572,7 @@ st.caption(
 )
 
 diagnostics = {
-    "diagnostics_schema": "bitcoin-dynamic-settling-copy-block-v4",
+    "diagnostics_schema": "bitcoin-dynamic-settling-copy-block-v5",
     "deployment": {
         "model_version": price_model.MODEL_VERSION,
         "loaded_engine_source": getattr(price_model, "__file__", "UNKNOWN"),
@@ -540,6 +606,17 @@ diagnostics = {
         "partial_bottom_usd", "final_bottom_usd", "absolute_log_error",
         "initial_absolute_log_error", "settling_progress", "within_10_percent",
         "within_20_percent",
+    ]),
+    "settling_leave_one_out": compact_records(model.settling_leave_one_out, [
+        "omitted_cycle", "omitted_anchor", "window_fraction", "completed_cycles",
+        "median_settling_progress", "linear_time_weight", "raw_empirical_weight",
+        "calibration_reliability", "empirical_evidence_weight",
+    ]),
+    "settling_cycle_dependence": compact_records(model.settling_cycle_dependence, [
+        "omitted_cycle", "omitted_anchor", "remaining_cycles", "linear_window_progress",
+        "forming_evidence_weight", "full_calibration_evidence_weight", "evidence_weight_change",
+        "dynamic_current_bottom_usd", "current_foundation_usd", "dynamic_fair_value_usd",
+        "mature_cycle_next_multiple", "mature_cycle_next_bottom_usd",
     ]),
     "mature_cycle_forecast": compact_records(model.mature_cycle_forecast, [
         "model_id", "model", "target_date", "mature_start_cycle", "mature_transitions",

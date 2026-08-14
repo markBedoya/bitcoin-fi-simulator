@@ -60,6 +60,24 @@ def main() -> None:
     assert result.settling_calibration["empirical_evidence_weight"].iloc[0] == 0
     assert result.settling_calibration["empirical_evidence_weight"].iloc[-1] == 1
     assert result.settling_calibration["empirical_evidence_weight"].diff().dropna().ge(0).all()
+    assert not result.settling_leave_one_out.empty
+    assert result.settling_leave_one_out["omitted_cycle"].nunique() == 4
+    assert result.settling_leave_one_out.groupby("omitted_cycle")[
+        "empirical_evidence_weight"
+    ].apply(lambda values: values.diff().dropna().ge(0).all()).all()
+    assert not result.settling_cycle_dependence.empty
+    assert len(result.settling_cycle_dependence) == 4
+    assert result.settling_cycle_dependence["remaining_cycles"].eq(3).all()
+    assert result.summary["forming_evidence_weight_cycle_low"] <= result.summary[
+        "forming_evidence_weight_cycle_high"
+    ]
+    assert result.summary["dynamic_settled_bottom_cycle_low_usd"] <= result.summary[
+        "dynamic_settled_bottom_cycle_high_usd"
+    ]
+    assert result.summary["dynamic_fair_value_cycle_low_usd"] <= result.summary[
+        "dynamic_fair_value_cycle_high_usd"
+    ]
+    assert result.summary["next_bottom_cycle_low_usd"] <= result.summary["next_bottom_cycle_high_usd"]
     assert result.bottom_sensitivity["available"].any()
     assert result.bottom_sensitivity.loc[
         result.bottom_sensitivity["available"], "mature_cycle_next_bottom_usd"

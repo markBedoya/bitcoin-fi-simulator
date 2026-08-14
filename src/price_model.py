@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.4.0"
-SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v4"
+MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.5.0"
+SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v5"
 GENESIS = pd.Timestamp("2009-01-03")
 BOTTOM_WINDOW_DAYS = 120
 PEAK_WINDOW_DAYS = 90
@@ -63,6 +63,8 @@ class BottomAnchoredModelResult:
     fair_value_methods: pd.DataFrame
     settling_calibration: pd.DataFrame
     settling_calibration_detail: pd.DataFrame
+    settling_leave_one_out: pd.DataFrame
+    settling_cycle_dependence: pd.DataFrame
     dynamic_settling: pd.DataFrame
     dynamic_settling_summary: pd.DataFrame
     all_price_curve: pd.DataFrame
@@ -335,6 +337,63 @@ def _window_progress(anchor_date: pd.Timestamp, reveal_date: pd.Timestamp, half_
     return float(np.clip((reveal_date - start).days / (2.0 * half_window), 0.0, 1.0))
 
 
+def _settling_calibration_from_detail(detail: pd.DataFrame) -> pd.DataFrame:
+    """Build a regularized monotonic settling curve from historical replay rows."""
+    if detail.empty:
+        return pd.DataFrame({
+            "window_fraction": [0.0, 1.0],
+            "completed_cycles": [0, 0],
+            "median_settling_progress": [0.0, 1.0],
+            "mean_settling_progress": [0.0, 1.0],
+            "within_10_percent_share": [np.nan, np.nan],
+            "within_20_percent_share": [np.nan, np.nan],
+            "median_partial_log_error": [np.nan, 0.0],
+            "linear_time_weight": [0.0, 1.0],
+            "raw_empirical_weight": [0.0, 1.0],
+            "calibration_reliability": [0.0, 0.0],
+            "empirical_evidence_weight": [0.0, 1.0],
+        })
+
+    calibration = detail.groupby("window_fraction", as_index=False).agg(
+        completed_cycles=("target_cycle", "nunique"),
+        median_settling_progress=("settling_progress", "median"),
+        mean_settling_progress=("settling_progress", "mean"),
+        within_10_percent_share=("within_10_percent", "mean"),
+        within_20_percent_share=("within_20_percent", "mean"),
+        median_partial_log_error=("absolute_log_error", "median"),
+    )
+    calibration = pd.concat([
+        pd.DataFrame({
+            "window_fraction": [0.0],
+            "completed_cycles": [int(detail["target_cycle"].nunique())],
+            "median_settling_progress": [0.0],
+            "mean_settling_progress": [0.0],
+            "within_10_percent_share": [0.0],
+            "within_20_percent_share": [0.0],
+            "median_partial_log_error": [np.nan],
+        }),
+        calibration,
+    ], ignore_index=True).sort_values("window_fraction").reset_index(drop=True)
+    calibration["linear_time_weight"] = calibration["window_fraction"]
+    calibration["raw_empirical_weight"] = np.maximum.accumulate(
+        calibration["median_settling_progress"].to_numpy(dtype=float)
+    )
+    calibration["calibration_reliability"] = (
+        calibration["completed_cycles"]
+        / (calibration["completed_cycles"] + SETTLING_LINEAR_PRIOR_CYCLES)
+    )
+    calibration["empirical_evidence_weight"] = (
+        calibration["calibration_reliability"] * calibration["raw_empirical_weight"]
+        + (1.0 - calibration["calibration_reliability"]) * calibration["linear_time_weight"]
+    )
+    calibration["empirical_evidence_weight"] = np.maximum.accumulate(
+        calibration["empirical_evidence_weight"].to_numpy(dtype=float)
+    )
+    calibration.loc[calibration.index[0], "empirical_evidence_weight"] = 0.0
+    calibration.loc[calibration.index[-1], "empirical_evidence_weight"] = 1.0
+    return calibration
+
+
 def _empirical_settling_calibration(
     data: pd.DataFrame,
     completed_bottoms: pd.DataFrame,
@@ -384,60 +443,22 @@ def _empirical_settling_calibration(
             detail_rows.append(row)
 
     detail = pd.DataFrame(detail_rows)
-    if detail.empty:
-        fallback = pd.DataFrame({
-            "window_fraction": [0.0, 1.0],
-            "completed_cycles": [0, 0],
-            "median_settling_progress": [0.0, 1.0],
-            "mean_settling_progress": [0.0, 1.0],
-            "within_10_percent_share": [np.nan, np.nan],
-            "within_20_percent_share": [np.nan, np.nan],
-            "median_partial_log_error": [np.nan, 0.0],
-            "linear_time_weight": [0.0, 1.0],
-            "raw_empirical_weight": [0.0, 1.0],
-            "calibration_reliability": [0.0, 0.0],
-            "empirical_evidence_weight": [0.0, 1.0],
-        })
-        return detail, fallback
+    return detail, _settling_calibration_from_detail(detail)
 
-    calibration = detail.groupby("window_fraction", as_index=False).agg(
-        completed_cycles=("target_cycle", "nunique"),
-        median_settling_progress=("settling_progress", "median"),
-        mean_settling_progress=("settling_progress", "mean"),
-        within_10_percent_share=("within_10_percent", "mean"),
-        within_20_percent_share=("within_20_percent", "mean"),
-        median_partial_log_error=("absolute_log_error", "median"),
-    )
-    calibration = pd.concat([
-        pd.DataFrame({
-            "window_fraction": [0.0],
-            "completed_cycles": [int(detail["target_cycle"].nunique())],
-            "median_settling_progress": [0.0],
-            "mean_settling_progress": [0.0],
-            "within_10_percent_share": [0.0],
-            "within_20_percent_share": [0.0],
-            "median_partial_log_error": [np.nan],
-        }),
-        calibration,
-    ], ignore_index=True).sort_values("window_fraction").reset_index(drop=True)
-    calibration["linear_time_weight"] = calibration["window_fraction"]
-    calibration["raw_empirical_weight"] = np.maximum.accumulate(
-        calibration["median_settling_progress"].to_numpy(dtype=float)
-    )
-    calibration["calibration_reliability"] = (
-        calibration["completed_cycles"]
-        / (calibration["completed_cycles"] + SETTLING_LINEAR_PRIOR_CYCLES)
-    )
-    calibration["empirical_evidence_weight"] = (
-        calibration["calibration_reliability"] * calibration["raw_empirical_weight"]
-        + (1.0 - calibration["calibration_reliability"]) * calibration["linear_time_weight"]
-    )
-    calibration["empirical_evidence_weight"] = np.maximum.accumulate(
-        calibration["empirical_evidence_weight"].to_numpy(dtype=float)
-    )
-    calibration.loc[calibration.index[0], "empirical_evidence_weight"] = 0.0
-    calibration.loc[calibration.index[-1], "empirical_evidence_weight"] = 1.0
-    return detail, calibration
+
+def _settling_leave_one_out(detail: pd.DataFrame) -> pd.DataFrame:
+    """Rebuild the settling curve after omitting each completed cycle in turn."""
+    if detail.empty or detail["target_cycle"].nunique() < 2:
+        return pd.DataFrame()
+    variants: list[pd.DataFrame] = []
+    anchors = detail.groupby("target_cycle")["target_anchor"].first()
+    for omitted_cycle in sorted(detail["target_cycle"].unique()):
+        subset = detail[detail["target_cycle"] != omitted_cycle].copy()
+        calibration = _settling_calibration_from_detail(subset)
+        calibration.insert(0, "omitted_cycle", int(omitted_cycle))
+        calibration.insert(1, "omitted_anchor", pd.Timestamp(anchors.loc[omitted_cycle]))
+        variants.append(calibration)
+    return pd.concat(variants, ignore_index=True)
 
 
 def _forming_evidence_weight(
@@ -480,6 +501,63 @@ def _dynamic_bottom_estimate(
         "forecast_low_usd": float(forecasts["predicted_bottom_usd"].min()),
         "forecast_high_usd": float(forecasts["predicted_bottom_usd"].max()),
     }
+
+
+def _settling_cycle_dependence(
+    leave_one_out: pd.DataFrame,
+    observed_bottoms: pd.DataFrame,
+    target_row: pd.Series,
+    current_dynamic: dict,
+    latest: pd.Timestamp,
+    current_anchor: pd.Timestamp,
+    fair_multiplier: float,
+) -> pd.DataFrame:
+    """Propagate leave-one-cycle-out settling curves into current and next-bottom estimates."""
+    if leave_one_out.empty:
+        return pd.DataFrame()
+    previous = observed_bottoms.iloc[-2]
+    forecast = float(current_dynamic["forecast_bottom_usd"])
+    observed = float(target_row["region_price_usd"])
+    progress = float(current_dynamic["linear_window_progress"])
+    rows: list[dict] = []
+    for omitted_cycle, calibration in leave_one_out.groupby("omitted_cycle"):
+        calibration = calibration.sort_values("window_fraction")
+        evidence = float(np.interp(
+            progress,
+            calibration["window_fraction"].to_numpy(dtype=float),
+            calibration["empirical_evidence_weight"].to_numpy(dtype=float),
+        ))
+        dynamic_bottom = float(np.exp(
+            (1.0 - evidence) * np.log(forecast) + evidence * np.log(observed)
+        ))
+        current_foundation = _foundation_at(
+            latest, previous["region_date"], previous["region_price_usd"],
+            current_anchor, dynamic_bottom,
+        )
+        variant_bottoms = observed_bottoms.copy()
+        variant_bottoms.loc[variant_bottoms.index[-1], "region_price_usd"] = dynamic_bottom
+        variant_bottoms.loc[variant_bottoms.index[-1], "region_date"] = current_anchor
+        variant_bottoms = _add_bottom_growth(variant_bottoms)
+        mature_variant = _mature_cycle_decay(variant_bottoms)
+        rows.append({
+            "omitted_cycle": int(omitted_cycle),
+            "omitted_anchor": pd.Timestamp(calibration["omitted_anchor"].iloc[0]),
+            "remaining_cycles": int(calibration["completed_cycles"].max()),
+            "linear_window_progress": progress,
+            "forming_evidence_weight": evidence,
+            "full_calibration_evidence_weight": float(current_dynamic["forming_evidence_weight"]),
+            "evidence_weight_change": evidence - float(current_dynamic["forming_evidence_weight"]),
+            "dynamic_current_bottom_usd": dynamic_bottom,
+            "current_foundation_usd": current_foundation,
+            "dynamic_fair_value_usd": current_foundation * fair_multiplier,
+            "mature_cycle_next_multiple": (
+                float(mature_variant["next_growth_multiple"]) if mature_variant.get("available") else np.nan
+            ),
+            "mature_cycle_next_bottom_usd": (
+                float(mature_variant["predicted_bottom_usd"]) if mature_variant.get("available") else np.nan
+            ),
+        })
+    return pd.DataFrame(rows).sort_values("omitted_cycle").reset_index(drop=True)
 
 
 def _add_bottom_growth(bottoms: pd.DataFrame) -> pd.DataFrame:
@@ -847,6 +925,7 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     settling_calibration_detail, settling_calibration = _empirical_settling_calibration(
         data, completed_bottoms
     )
+    settling_leave_one_out = _settling_leave_one_out(settling_calibration_detail)
     _, prior_validation = _walk_forward(completed_bottoms)
     current_observed = observed_bottoms.iloc[-1]
     forming_prior_forecasts = _forecast_candidates(completed_bottoms, current_anchor, prior_validation)
@@ -890,6 +969,16 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     current_fair = current_foundation * fair_multiplier
     current_fair_low = current_foundation * fair_multiplier_low
     current_fair_high = current_foundation * fair_multiplier_high
+
+    settling_cycle_dependence = _settling_cycle_dependence(
+        settling_leave_one_out, observed_bottoms, current_observed, current_dynamic,
+        latest, current_anchor, fair_multiplier,
+    )
+    if settling_cycle_dependence.empty:
+        raise ValueError("Leave-one-cycle-out settling calibration is not observable yet.")
+    settling_next_bottoms = settling_cycle_dependence["mature_cycle_next_bottom_usd"].dropna()
+    if settling_next_bottoms.empty:
+        raise ValueError("Leave-one-cycle-out next-bottom propagation is not observable yet.")
 
     sensitivity = _bottom_sensitivity(data, fair_multiplier, settling_calibration)
     available_sensitivity = sensitivity[sensitivity["available"]].copy()
@@ -968,12 +1057,20 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
             if not settling_calibration_detail.empty else 0
         ),
         "settling_calibration_method": "median normalized log-error convergence across completed bottom regions",
+        "settling_cycle_dependence_method": "full range after omitting each completed bottom cycle in turn",
+        "settling_cycle_dependence_variants": int(len(settling_cycle_dependence)),
+        "forming_evidence_weight_cycle_low": float(settling_cycle_dependence["forming_evidence_weight"].min()),
+        "forming_evidence_weight_cycle_high": float(settling_cycle_dependence["forming_evidence_weight"].max()),
         "pre_observation_bottom_forecast_usd": current_dynamic["forecast_bottom_usd"],
         "dynamic_settled_bottom_estimate_usd": current_dynamic["dynamic_bottom_usd"],
+        "dynamic_settled_bottom_cycle_low_usd": float(settling_cycle_dependence["dynamic_current_bottom_usd"].min()),
+        "dynamic_settled_bottom_cycle_high_usd": float(settling_cycle_dependence["dynamic_current_bottom_usd"].max()),
         "dynamic_bottom_forecast_low_usd": current_dynamic["forecast_low_usd"],
         "dynamic_bottom_forecast_high_usd": current_dynamic["forecast_high_usd"],
         "current_bottom_foundation_usd": current_foundation,
         "dynamic_fair_value_usd": current_fair,
+        "dynamic_fair_value_cycle_low_usd": float(settling_cycle_dependence["dynamic_fair_value_usd"].min()),
+        "dynamic_fair_value_cycle_high_usd": float(settling_cycle_dependence["dynamic_fair_value_usd"].max()),
         "dynamic_fair_value_low_usd": current_fair_low,
         "dynamic_fair_value_high_usd": current_fair_high,
         "price_to_dynamic_fair_value": latest_price / current_fair,
@@ -988,6 +1085,8 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "next_peak_anchor": next_peak_anchor,
         "next_bottom_anchor": next_bottom_anchor,
         "next_bottom_core_usd": next_bottom_core,
+        "next_bottom_cycle_low_usd": float(settling_next_bottoms.min()),
+        "next_bottom_cycle_high_usd": float(settling_next_bottoms.max()),
         "next_bottom_core_multiple": mature_core["next_growth_multiple"],
         "mature_observed_growth_path": observed_growth_path,
         "next_bottom_core_low_usd": next_bottom_core_low,
@@ -1020,6 +1119,8 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         fair_value_methods=current_methods.sort_values("ensemble_weight", ascending=False).reset_index(drop=True),
         settling_calibration=settling_calibration,
         settling_calibration_detail=settling_calibration_detail,
+        settling_leave_one_out=settling_leave_one_out,
+        settling_cycle_dependence=settling_cycle_dependence,
         dynamic_settling=dynamic_paths,
         dynamic_settling_summary=dynamic_summary,
         all_price_curve=all_price_curve,
