@@ -33,7 +33,9 @@ def main() -> None:
     assert result.summary["dynamic_fair_value_usd"] > 0
     assert result.summary["summary_schema"] == SUMMARY_SCHEMA
     assert result.summary["dynamic_settled_bottom_estimate_usd"] > 0
+    assert 0 <= result.summary["linear_window_progress"] <= 1
     assert 0 <= result.summary["forming_evidence_weight"] <= 1
+    assert result.summary["settling_calibration_cycles"] == 4
     assert result.summary["next_bottom_core_usd"] > 0
     assert result.summary["next_bottom_core_multiple"] > 1
     assert result.summary["mature_observed_growth_path"].count("→") == 2
@@ -52,6 +54,12 @@ def main() -> None:
     assert not result.fair_value_methods.empty
     assert np.isclose(result.fair_value_methods["ensemble_weight"].sum(), 1.0)
     assert not result.dynamic_settling_summary.empty
+    assert not result.settling_calibration.empty
+    assert len(result.settling_calibration_detail["target_cycle"].unique()) == 4
+    assert result.settling_calibration["window_fraction"].iloc[0] == 0
+    assert result.settling_calibration["empirical_evidence_weight"].iloc[0] == 0
+    assert result.settling_calibration["empirical_evidence_weight"].iloc[-1] == 1
+    assert result.settling_calibration["empirical_evidence_weight"].diff().dropna().ge(0).all()
     assert result.bottom_sensitivity["available"].any()
     assert result.bottom_sensitivity.loc[
         result.bottom_sensitivity["available"], "mature_cycle_next_bottom_usd"

@@ -6,14 +6,16 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.3.0"
-SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v3"
+MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.4.0"
+SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v4"
 GENESIS = pd.Timestamp("2009-01-03")
 BOTTOM_WINDOW_DAYS = 120
 PEAK_WINDOW_DAYS = 90
 REGION_CLUSTER_DAYS = 7
 VALIDATION_TEMPERATURE = 0.35
 REFERENCE_DAYS_BEFORE_TURN = 56
+SETTLING_GRID = tuple(np.round(np.arange(0.05, 1.001, 0.05), 2))
+SETTLING_LINEAR_PRIOR_CYCLES = 2.0
 
 BOTTOM_TURNING_REGIONS = [
     {"anchor_date": pd.Timestamp("2011-11-18"), "label": "2011 bottom region"},
@@ -59,6 +61,8 @@ class BottomAnchoredModelResult:
     fair_value_cycles: pd.DataFrame
     fair_value_validation: pd.DataFrame
     fair_value_methods: pd.DataFrame
+    settling_calibration: pd.DataFrame
+    settling_calibration_detail: pd.DataFrame
     dynamic_settling: pd.DataFrame
     dynamic_settling_summary: pd.DataFrame
     all_price_curve: pd.DataFrame
@@ -326,9 +330,130 @@ def _mature_cycle_decay(bottoms: pd.DataFrame, mature_start_cycle: int = 1) -> d
     }
 
 
-def _forming_evidence_weight(anchor_date: pd.Timestamp, reveal_date: pd.Timestamp, half_window: int) -> float:
+def _window_progress(anchor_date: pd.Timestamp, reveal_date: pd.Timestamp, half_window: int) -> float:
     start = anchor_date - pd.Timedelta(days=half_window)
     return float(np.clip((reveal_date - start).days / (2.0 * half_window), 0.0, 1.0))
+
+
+def _empirical_settling_calibration(
+    data: pd.DataFrame,
+    completed_bottoms: pd.DataFrame,
+    half_window: int = BOTTOM_WINDOW_DAYS,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Measure how quickly partial historical bottom regions approached their final value."""
+    detail_rows: list[dict] = []
+    for _, target in completed_bottoms.sort_values("cycle").iterrows():
+        cycle = int(target["cycle"])
+        anchor = pd.Timestamp(target["anchor_date"])
+        start = anchor - pd.Timedelta(days=half_window)
+        final_bottom = float(target["region_price_usd"])
+        partial_rows: list[dict] = []
+        for fraction in SETTLING_GRID:
+            reveal_date = start + pd.Timedelta(days=round(fraction * 2 * half_window))
+            partial = _extract_regions(
+                data[data["date"] <= reveal_date],
+                [BOTTOM_TURNING_REGIONS[cycle]],
+                half_window,
+                "bottom",
+            )
+            if partial.empty:
+                continue
+            partial_bottom = float(partial["region_price_usd"].iloc[0])
+            partial_rows.append({
+                "target_cycle": cycle,
+                "target_anchor": anchor,
+                "window_fraction": float(fraction),
+                "reveal_date": reveal_date,
+                "partial_bottom_usd": partial_bottom,
+                "final_bottom_usd": final_bottom,
+                "absolute_log_error": float(abs(np.log(partial_bottom / final_bottom))),
+            })
+        if not partial_rows:
+            continue
+        initial_error = float(partial_rows[0]["absolute_log_error"])
+        for row in partial_rows:
+            error = float(row["absolute_log_error"])
+            if initial_error <= 1e-12:
+                progress = 1.0
+            else:
+                progress = float(np.clip(1.0 - error / initial_error, 0.0, 1.0))
+            row["initial_absolute_log_error"] = initial_error
+            row["settling_progress"] = progress
+            row["within_10_percent"] = bool(error <= np.log(1.10))
+            row["within_20_percent"] = bool(error <= np.log(1.20))
+            detail_rows.append(row)
+
+    detail = pd.DataFrame(detail_rows)
+    if detail.empty:
+        fallback = pd.DataFrame({
+            "window_fraction": [0.0, 1.0],
+            "completed_cycles": [0, 0],
+            "median_settling_progress": [0.0, 1.0],
+            "mean_settling_progress": [0.0, 1.0],
+            "within_10_percent_share": [np.nan, np.nan],
+            "within_20_percent_share": [np.nan, np.nan],
+            "median_partial_log_error": [np.nan, 0.0],
+            "linear_time_weight": [0.0, 1.0],
+            "raw_empirical_weight": [0.0, 1.0],
+            "calibration_reliability": [0.0, 0.0],
+            "empirical_evidence_weight": [0.0, 1.0],
+        })
+        return detail, fallback
+
+    calibration = detail.groupby("window_fraction", as_index=False).agg(
+        completed_cycles=("target_cycle", "nunique"),
+        median_settling_progress=("settling_progress", "median"),
+        mean_settling_progress=("settling_progress", "mean"),
+        within_10_percent_share=("within_10_percent", "mean"),
+        within_20_percent_share=("within_20_percent", "mean"),
+        median_partial_log_error=("absolute_log_error", "median"),
+    )
+    calibration = pd.concat([
+        pd.DataFrame({
+            "window_fraction": [0.0],
+            "completed_cycles": [int(detail["target_cycle"].nunique())],
+            "median_settling_progress": [0.0],
+            "mean_settling_progress": [0.0],
+            "within_10_percent_share": [0.0],
+            "within_20_percent_share": [0.0],
+            "median_partial_log_error": [np.nan],
+        }),
+        calibration,
+    ], ignore_index=True).sort_values("window_fraction").reset_index(drop=True)
+    calibration["linear_time_weight"] = calibration["window_fraction"]
+    calibration["raw_empirical_weight"] = np.maximum.accumulate(
+        calibration["median_settling_progress"].to_numpy(dtype=float)
+    )
+    calibration["calibration_reliability"] = (
+        calibration["completed_cycles"]
+        / (calibration["completed_cycles"] + SETTLING_LINEAR_PRIOR_CYCLES)
+    )
+    calibration["empirical_evidence_weight"] = (
+        calibration["calibration_reliability"] * calibration["raw_empirical_weight"]
+        + (1.0 - calibration["calibration_reliability"]) * calibration["linear_time_weight"]
+    )
+    calibration["empirical_evidence_weight"] = np.maximum.accumulate(
+        calibration["empirical_evidence_weight"].to_numpy(dtype=float)
+    )
+    calibration.loc[calibration.index[0], "empirical_evidence_weight"] = 0.0
+    calibration.loc[calibration.index[-1], "empirical_evidence_weight"] = 1.0
+    return detail, calibration
+
+
+def _forming_evidence_weight(
+    anchor_date: pd.Timestamp,
+    reveal_date: pd.Timestamp,
+    half_window: int,
+    calibration: pd.DataFrame | None = None,
+) -> float:
+    progress = _window_progress(anchor_date, reveal_date, half_window)
+    if calibration is None or calibration.empty:
+        return progress
+    return float(np.interp(
+        progress,
+        calibration["window_fraction"].to_numpy(dtype=float),
+        calibration["empirical_evidence_weight"].to_numpy(dtype=float),
+    ))
 
 
 def _dynamic_bottom_estimate(
@@ -337,17 +462,20 @@ def _dynamic_bottom_estimate(
     reveal_date: pd.Timestamp,
     validation: pd.DataFrame | None = None,
     half_window: int = BOTTOM_WINDOW_DAYS,
+    settling_calibration: pd.DataFrame | None = None,
 ) -> dict:
     anchor = pd.Timestamp(target_row["anchor_date"])
     forecasts = _forecast_candidates(prior_bottoms, anchor, validation)
     forecast = _ensemble_value(forecasts)
     observed = float(target_row["region_price_usd"])
-    evidence = _forming_evidence_weight(anchor, reveal_date, half_window)
+    linear_progress = _window_progress(anchor, reveal_date, half_window)
+    evidence = _forming_evidence_weight(anchor, reveal_date, half_window, settling_calibration)
     dynamic = float(np.exp((1.0 - evidence) * np.log(forecast) + evidence * np.log(observed)))
     return {
         "forecast_bottom_usd": forecast,
         "observed_forming_bottom_usd": observed,
         "forming_evidence_weight": evidence,
+        "linear_window_progress": linear_progress,
         "dynamic_bottom_usd": dynamic,
         "forecast_low_usd": float(forecasts["predicted_bottom_usd"].min()),
         "forecast_high_usd": float(forecasts["predicted_bottom_usd"].max()),
@@ -512,6 +640,7 @@ def _dynamic_settling_backtest(
         if reveal_end < reference_date:
             continue
         _, prior_validation = _walk_forward(prior)
+        _, prior_settling_calibration = _empirical_settling_calibration(data, prior)
         reveal_dates = list(pd.date_range(reference_date, reveal_end, freq="30D"))
         if reveal_dates[-1] != reveal_end:
             reveal_dates.append(reveal_end)
@@ -538,10 +667,14 @@ def _dynamic_settling_backtest(
             if partial_target.empty:
                 observed = np.nan
                 evidence = 0.0
+                linear_progress = _window_progress(anchor, reveal_date, BOTTOM_WINDOW_DAYS)
                 dynamic_bottom = forecast
             else:
                 observed = float(partial_target["region_price_usd"].iloc[0])
-                evidence = _forming_evidence_weight(anchor, reveal_date, BOTTOM_WINDOW_DAYS)
+                linear_progress = _window_progress(anchor, reveal_date, BOTTOM_WINDOW_DAYS)
+                evidence = _forming_evidence_weight(
+                    anchor, reveal_date, BOTTOM_WINDOW_DAYS, prior_settling_calibration
+                )
                 dynamic_bottom = float(np.exp((1.0 - evidence) * np.log(forecast) + evidence * np.log(observed)))
             reference_foundation = _foundation_at(
                 reference_date, left["region_date"], left["region_price_usd"], anchor, dynamic_bottom
@@ -559,6 +692,7 @@ def _dynamic_settling_backtest(
                 "reveal_date": reveal_date,
                 "forecast_bottom_usd": forecast,
                 "forming_bottom_usd": observed,
+                "linear_window_progress": linear_progress,
                 "forming_evidence_weight": evidence,
                 "dynamic_bottom_usd": dynamic_bottom,
                 "settled_bottom_usd": settled_bottom if target["status"] == "completed" else np.nan,
@@ -577,6 +711,10 @@ def _dynamic_settling_backtest(
             "target_status": target["status"],
             "target_anchor": anchor,
             "reference_date": reference_date,
+            "first_linear_window_progress": float(first["linear_window_progress"]),
+            "first_empirical_evidence_weight": float(first["forming_evidence_weight"]),
+            "latest_linear_window_progress": float(last["linear_window_progress"]),
+            "latest_empirical_evidence_weight": float(last["forming_evidence_weight"]),
             "first_dynamic_bottom_usd": float(first["dynamic_bottom_usd"]),
             "latest_dynamic_bottom_usd": float(last["dynamic_bottom_usd"]),
             "settled_bottom_usd": settled_bottom if target["status"] == "completed" else np.nan,
@@ -594,6 +732,7 @@ def _dynamic_settling_backtest(
 def _bottom_sensitivity(
     data: pd.DataFrame,
     fair_multiplier: float,
+    settling_calibration: pd.DataFrame,
 ) -> pd.DataFrame:
     rows: list[dict] = []
     latest = pd.Timestamp(data["date"].max())
@@ -617,7 +756,8 @@ def _bottom_sensitivity(
                 _, prior_validation = _walk_forward(completed)
                 target = current.iloc[0]
                 dynamic = _dynamic_bottom_estimate(
-                    completed, target, latest, prior_validation, half_window=half_window
+                    completed, target, latest, prior_validation, half_window=half_window,
+                    settling_calibration=settling_calibration,
                 )
                 adjusted = pd.concat([completed, current], ignore_index=True)
                 adjusted.loc[adjusted.index[-1], "region_price_usd"] = dynamic["dynamic_bottom_usd"]
@@ -635,6 +775,7 @@ def _bottom_sensitivity(
                     "available": True,
                     "forming_region_usd": float(target["region_price_usd"]),
                     "forming_evidence_weight": dynamic["forming_evidence_weight"],
+                    "linear_window_progress": dynamic["linear_window_progress"],
                     "dynamic_current_bottom_usd": dynamic["dynamic_bottom_usd"],
                     "current_foundation_usd": current_foundation,
                     "fair_value_if_multiplier_held_usd": current_foundation * fair_multiplier,
@@ -703,12 +844,16 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     next_peak_anchor = current_anchor + pd.Timedelta(days=expected_bull_days)
 
     completed_bottoms = observed_bottoms[observed_bottoms["status"] == "completed"].copy()
+    settling_calibration_detail, settling_calibration = _empirical_settling_calibration(
+        data, completed_bottoms
+    )
     _, prior_validation = _walk_forward(completed_bottoms)
     current_observed = observed_bottoms.iloc[-1]
     forming_prior_forecasts = _forecast_candidates(completed_bottoms, current_anchor, prior_validation)
     forming_prior_forecasts["forecast_role"] = "pre-observation prior for the forming 2026 bottom"
     current_dynamic = _dynamic_bottom_estimate(
-        completed_bottoms, current_observed, latest, prior_validation
+        completed_bottoms, current_observed, latest, prior_validation,
+        settling_calibration=settling_calibration,
     )
 
     settled_bottoms = observed_bottoms.copy()
@@ -746,7 +891,7 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     current_fair_low = current_foundation * fair_multiplier_low
     current_fair_high = current_foundation * fair_multiplier_high
 
-    sensitivity = _bottom_sensitivity(data, fair_multiplier)
+    sensitivity = _bottom_sensitivity(data, fair_multiplier, settling_calibration)
     available_sensitivity = sensitivity[sensitivity["available"]].copy()
     mature_sensitivity = available_sensitivity["mature_cycle_next_bottom_usd"].dropna()
     if mature_sensitivity.empty:
@@ -816,7 +961,13 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "latest_price_usd": latest_price,
         "forming_bottom_region_usd": float(current_observed["region_price_usd"]),
         "forming_bottom_extreme_usd": float(current_observed["extreme_price_usd"]),
+        "linear_window_progress": current_dynamic["linear_window_progress"],
         "forming_evidence_weight": current_dynamic["forming_evidence_weight"],
+        "settling_calibration_cycles": (
+            int(settling_calibration_detail["target_cycle"].nunique())
+            if not settling_calibration_detail.empty else 0
+        ),
+        "settling_calibration_method": "median normalized log-error convergence across completed bottom regions",
         "pre_observation_bottom_forecast_usd": current_dynamic["forecast_bottom_usd"],
         "dynamic_settled_bottom_estimate_usd": current_dynamic["dynamic_bottom_usd"],
         "dynamic_bottom_forecast_low_usd": current_dynamic["forecast_low_usd"],
@@ -850,7 +1001,7 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "bottom_sensitivity_fair_high_usd": float(available_sensitivity["fair_value_if_multiplier_held_usd"].max()),
         "candidate_weight_method": "internal walk-forward error weighting",
         "core_forecast_method": "mature-cycle excess-growth decay beginning with the 2015 bottom; 10th–90th percentile definition range",
-        "dynamic_settling_method": "pre-observation internal forecast blended with forming bottom evidence by turning-window completion",
+        "dynamic_settling_method": "pre-observation internal forecast blended with forming bottom evidence using an empirical historical settling curve",
         "fair_value_method": "validation-weighted ensemble of four internally derived cycle-neutral definitions",
         "future_fair_value_status": "deferred until peak-compression behavior is modeled",
     }
@@ -867,6 +1018,8 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         fair_value_cycles=fair_cycles,
         fair_value_validation=fair_walk,
         fair_value_methods=current_methods.sort_values("ensemble_weight", ascending=False).reset_index(drop=True),
+        settling_calibration=settling_calibration,
+        settling_calibration_detail=settling_calibration_detail,
         dynamic_settling=dynamic_paths,
         dynamic_settling_summary=dynamic_summary,
         all_price_curve=all_price_curve,

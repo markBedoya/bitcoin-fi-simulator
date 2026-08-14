@@ -15,13 +15,21 @@ The exact extreme and its date remain visible. Sensitivity tests repeat the calc
 The current turning region is not assumed to be complete. Before observing it, four internal models estimate its eventual level from earlier completed bottoms. The pre-observation ensemble is blended with the forming observed region in log space:
 
 ```text
-evidence = elapsed_fraction_of_turning_window
+evidence = calibrated_historical_settling_weight
 dynamic_bottom = exp((1 - evidence) × log(forecast) + evidence × log(observed_region))
 ```
 
-Evidence progresses from zero at the start of the turning window to one at its end. This makes the estimated bottom—and therefore the historical fair-value curve—settle gradually as later prices reveal the full region.
+The evidence schedule is calibrated by replaying the 2011, 2015, 2018, and 2022 bottom windows in 5% increments. At every increment, the partial region's remaining absolute log error is compared with its error at the beginning of the window:
 
-For completed historical cycles, the application performs a fake-today test. It fixes a reference date before the turn, reveals later data one month at a time, recomputes the dynamic bottom and fixed-date fair value, and compares them with the values obtained after the full turning window is known. The forming cycle has no final answer yet.
+```text
+settling_progress = 1 - current_partial_log_error / initial_partial_log_error
+```
+
+The median progress across completed cycles is made monotonic. Because only four cycles are available, the raw empirical curve is shrunk toward the original linear-time schedule using two linear-prior cycle equivalents. The resulting weight begins at zero and reaches one at the end of the window.
+
+Evidence weight is the observed region's influence in the blend. It is not the probability that the market bottom has occurred.
+
+For completed historical cycles, the application performs a fake-today test. It fixes a reference date before the turn, reveals later data one month at a time, recomputes the dynamic bottom and fixed-date fair value, and compares them with the values obtained after the full turning window is known. Each historical target uses a calibration curve built only from earlier completed bottoms. The forming cycle has no final answer yet.
 
 ## Mature-cycle next-bottom projection
 
@@ -80,6 +88,7 @@ A cycle-balanced regression over all daily prices remains optional inside the Re
 - Turning dates, windows, and cluster statistics are transparent research choices rather than facts of nature.
 - Walk-forward validation has only a few held-out cycles.
 - The mature-cycle projection has only three transitions and includes a forming current endpoint.
+- The empirical settling curve has only four completed regions and is deliberately regularized toward linear time.
 - Definition ranges are not probability intervals.
 - User peak and bottom inputs are scenarios only and never become model evidence.
 - The model is `RESEARCH_ONLY` and does not provide investment advice or a guaranteed floor.

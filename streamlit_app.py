@@ -15,7 +15,7 @@ import src.price_model as price_model
 # Streamlit reruns the page in a long-lived process. Reloading prevents a newly
 # deployed page from retaining an older price_model module in memory.
 price_model = reload(price_model)
-EXPECTED_SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v3"
+EXPECTED_SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v4"
 
 
 st.set_page_config(
@@ -79,6 +79,8 @@ required_summary_keys = {
     "price_to_dynamic_fair_value",
     "dynamic_fair_value_usd",
     "dynamic_settled_bottom_estimate_usd",
+    "linear_window_progress",
+    "forming_evidence_weight",
     "next_bottom_core_usd",
     "next_bottom_core_low_usd",
     "next_bottom_core_high_usd",
@@ -88,6 +90,8 @@ missing_result_sections = sorted(
     section for section in (
         "bottom_sensitivity",
         "mature_cycle_forecast",
+        "settling_calibration",
+        "settling_calibration_detail",
         "fair_value_methods",
         "dynamic_settling",
         "dynamic_settling_summary",
@@ -146,7 +150,8 @@ m5.metric("Valuation", valuation_label)
 
 st.info(
     f"The forming bottom region is **{money(summary['forming_bottom_region_usd'])}**. "
-    f"With **{summary['forming_evidence_weight']:.1%}** of its turning window elapsed, it is blended "
+    f"The window is **{summary['linear_window_progress']:.1%}** complete, while the calibrated historical "
+    f"evidence weight is **{summary['forming_evidence_weight']:.1%}**. The observed region is blended "
     f"with the pre-observation estimate of **{money(summary['pre_observation_bottom_forecast_usd'])}**. "
     f"That produces a settling bottom estimate of **{money(summary['dynamic_settled_bottom_estimate_usd'])}** "
     f"and fair value of **{money(summary['dynamic_fair_value_usd'])}**."
@@ -217,7 +222,7 @@ with st.expander("How the model works", expanded=False):
     st.markdown(
         """
 1. **Bottom regions:** each turning area is represented by a cluster of low daily closes, so one wick does not define the model.
-2. **Dynamic settling:** an internal forecast made before the turning window is blended with the observed forming region as evidence accumulates.
+2. **Dynamic settling:** an internal forecast is blended with the observed forming region using an empirical settling-speed curve learned from completed bottoms.
 3. **Bottom foundation:** settled regions are joined in log-price space, creating the structural curve beneath market cycles.
 4. **Fair value:** four cycle-neutral definitions are tested on earlier completed cycles and combined using walk-forward validation weights.
 5. **Mature-cycle projection:** decaying bottom growth across the 2015→2018, 2018→2022, and forming 2022→2026 transitions produces the core next-bottom estimate.
@@ -228,14 +233,56 @@ with st.expander("How the model works", expanded=False):
 
 with st.expander("Research Lab — calibration and evidence", expanded=True):
     st.subheader("The current cycle is still settling")
-    c1, c2, c3, c4 = st.columns(4)
+    c1, c2, c3, c4, c5 = st.columns(5)
     c1.metric("Pre-observation estimate", money(summary["pre_observation_bottom_forecast_usd"]))
     c2.metric("Forming observed region", money(summary["forming_bottom_region_usd"]))
-    c3.metric("Evidence weight", f"{summary['forming_evidence_weight']:.1%}")
-    c4.metric("Dynamic settled estimate", money(summary["dynamic_settled_bottom_estimate_usd"]))
+    c3.metric("Linear window progress", f"{summary['linear_window_progress']:.1%}")
+    c4.metric("Empirical evidence", f"{summary['forming_evidence_weight']:.1%}")
+    c5.metric("Dynamic settled estimate", money(summary["dynamic_settled_bottom_estimate_usd"]))
     st.caption(
         "The estimate is allowed to move while the current turning window is incomplete. It is not treated "
-        "as a finished $60K bottom merely because that is the lowest region observed so far."
+        "as a finished $60K bottom merely because that is the lowest region observed so far. Evidence weight "
+        "describes blending influence, not the probability that the market bottom has occurred."
+    )
+
+    st.subheader("Empirical settling-speed calibration")
+    calibration_chart = go.Figure()
+    calibration_chart.add_trace(go.Scatter(
+        x=model.settling_calibration["window_fraction"],
+        y=model.settling_calibration["linear_time_weight"],
+        mode="lines", name="Old linear schedule",
+        line={"color": "#9E9E9E", "dash": "dot"},
+    ))
+    calibration_chart.add_trace(go.Scatter(
+        x=model.settling_calibration["window_fraction"],
+        y=model.settling_calibration["raw_empirical_weight"],
+        mode="lines+markers", name="Raw completed-cycle curve",
+        line={"color": "#72D572", "dash": "dash"},
+    ))
+    calibration_chart.add_trace(go.Scatter(
+        x=model.settling_calibration["window_fraction"],
+        y=model.settling_calibration["empirical_evidence_weight"],
+        mode="lines+markers", name="Conservative calibrated curve",
+        line={"color": "#B39DDB", "width": 3},
+    ))
+    calibration_chart.add_trace(go.Scatter(
+        x=[summary["linear_window_progress"]],
+        y=[summary["forming_evidence_weight"]],
+        mode="markers+text", name="Today",
+        text=[f"Today: {summary['forming_evidence_weight']:.1%}"],
+        textposition="top center", marker={"size": 13, "color": "#F7931A"},
+    ))
+    calibration_chart.update_layout(
+        title="How quickly historical bottom regions settled",
+        xaxis_title="Fraction of turning window elapsed",
+        yaxis_title="Evidence weight", xaxis_tickformat=".0%", yaxis_tickformat=".0%",
+        yaxis_range=[0, 1.05], height=450, hovermode="x unified",
+    )
+    st.plotly_chart(calibration_chart, use_container_width=True, config={"displaylogo": False})
+    st.caption(
+        f"The raw curve uses {summary['settling_calibration_cycles']} completed bottom regions. "
+        "Because the sample is small, it is conservatively shrunk toward the old linear schedule using "
+        "two linear-prior cycle equivalents."
     )
 
     completed_paths = model.dynamic_settling[model.dynamic_settling["target_status"] == "completed"].copy()
@@ -459,7 +506,7 @@ st.caption(
 )
 
 diagnostics = {
-    "diagnostics_schema": "bitcoin-dynamic-settling-copy-block-v3",
+    "diagnostics_schema": "bitcoin-dynamic-settling-copy-block-v4",
     "deployment": {
         "model_version": price_model.MODEL_VERSION,
         "loaded_engine_source": getattr(price_model, "__file__", "UNKNOWN"),
@@ -482,6 +529,18 @@ diagnostics = {
         "method_id", "method", "target_cycle", "target_status", "predicted_multiple",
         "realized_multiple", "median_absolute_log_error", "neutrality_error", "combined_score",
     ]),
+    "settling_calibration": compact_records(model.settling_calibration, [
+        "window_fraction", "completed_cycles", "median_settling_progress",
+        "mean_settling_progress", "within_10_percent_share", "within_20_percent_share",
+        "median_partial_log_error", "linear_time_weight", "raw_empirical_weight",
+        "calibration_reliability", "empirical_evidence_weight",
+    ]),
+    "settling_calibration_detail": compact_records(model.settling_calibration_detail, [
+        "target_cycle", "target_anchor", "window_fraction", "reveal_date",
+        "partial_bottom_usd", "final_bottom_usd", "absolute_log_error",
+        "initial_absolute_log_error", "settling_progress", "within_10_percent",
+        "within_20_percent",
+    ]),
     "mature_cycle_forecast": compact_records(model.mature_cycle_forecast, [
         "model_id", "model", "target_date", "mature_start_cycle", "mature_transitions",
         "includes_forming_current_bottom", "observed_growth_path", "next_growth_multiple", "predicted_bottom_usd",
@@ -502,6 +561,8 @@ diagnostics = {
     ]),
     "dynamic_settling_summary": compact_records(model.dynamic_settling_summary, [
         "target_cycle", "target_status", "target_anchor", "reference_date",
+        "first_linear_window_progress", "first_empirical_evidence_weight",
+        "latest_linear_window_progress", "latest_empirical_evidence_weight",
         "first_dynamic_bottom_usd", "latest_dynamic_bottom_usd", "settled_bottom_usd",
         "first_reference_fair_value_usd", "latest_reference_fair_value_usd",
         "settled_reference_fair_value_usd", "first_bottom_error_pct", "latest_bottom_error_pct",
@@ -509,7 +570,7 @@ diagnostics = {
     ]),
     "bottom_sensitivity": compact_records(model.bottom_sensitivity, [
         "half_window_days", "cluster_days", "statistic", "available", "forming_region_usd",
-        "forming_evidence_weight", "dynamic_current_bottom_usd", "current_foundation_usd",
+        "linear_window_progress", "forming_evidence_weight", "dynamic_current_bottom_usd", "current_foundation_usd",
         "fair_value_if_multiplier_held_usd", "mature_cycle_next_multiple",
         "mature_cycle_next_bottom_usd",
     ]),
