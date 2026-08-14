@@ -12,6 +12,11 @@ assert "Historical fake-today test" in page
 assert "Empirical settling-speed calibration" in page
 assert "Conservative calibrated curve" in page
 assert "Dependence on individual completed cycles" in page
+assert "Current bottom-anchor timing" in page
+assert "Original rough anchor" in page
+assert "Learned central anchor" in page
+assert "Ten-year projection readiness" in page
+assert "Recursive bottom" in page
 assert "Leave-one-cycle-out range" in page
 assert "not a 95% confidence interval" in page
 assert "Mature-cycle estimate" in page
@@ -25,16 +30,18 @@ assert guard_position < ratio_position
 assert "price_model.SUMMARY_SCHEMA" not in page
 assert "Your scenario — never used as model evidence" in page
 assert "Copy/paste research diagnostics" in page
-assert "bitcoin-dynamic-settling-copy-block-v5" in page
+assert "bitcoin-dynamic-settling-copy-block-v6" in page
 assert "loaded_engine_source" in page
 assert "forming_bottom_prior_forecasts" in page
 assert "candidate_forecasts" not in page
 assert "Broader model disagreement" not in page
-assert "future peak compression has not been modeled" in page
+assert "future peak compression has not " in page
+assert "been modeled" in page
 assert "mature_cycle_forecast" in page
 assert "settling_calibration_detail" in page
 assert "settling_leave_one_out" in page
 assert "settling_cycle_dependence" in page
+assert "anchor_timing_sensitivity" in page
 assert "bottom_walk_forward" in page
 assert "dynamic_settling_summary" in page
 assert "bottom_sensitivity" in page

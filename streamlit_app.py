@@ -15,7 +15,7 @@ import src.price_model as price_model
 # Streamlit reruns the page in a long-lived process. Reloading prevents a newly
 # deployed page from retaining an older price_model module in memory.
 price_model = reload(price_model)
-EXPECTED_SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v5"
+EXPECTED_SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v6"
 
 
 st.set_page_config(
@@ -87,6 +87,13 @@ required_summary_keys = {
     "dynamic_settled_bottom_cycle_high_usd",
     "dynamic_fair_value_cycle_low_usd",
     "dynamic_fair_value_cycle_high_usd",
+    "current_bottom_anchor",
+    "current_anchor_empirical_early",
+    "current_anchor_empirical_late",
+    "anchor_timing_empirical_bottom_low_usd",
+    "anchor_timing_empirical_bottom_high_usd",
+    "anchor_timing_empirical_fair_low_usd",
+    "anchor_timing_empirical_fair_high_usd",
     "next_bottom_cycle_low_usd",
     "next_bottom_cycle_high_usd",
     "next_bottom_core_usd",
@@ -102,6 +109,7 @@ missing_result_sections = sorted(
         "settling_calibration_detail",
         "settling_leave_one_out",
         "settling_cycle_dependence",
+        "anchor_timing_sensitivity",
         "fair_value_methods",
         "dynamic_settling",
         "dynamic_settling_summary",
@@ -159,7 +167,8 @@ m4.metric("Settling bottom estimate", money(summary["dynamic_settled_bottom_esti
 m5.metric("Valuation", valuation_label)
 
 st.info(
-    f"The forming bottom region is **{money(summary['forming_bottom_region_usd'])}**. "
+    f"The forming bottom region is **{money(summary['forming_bottom_region_usd'])}** around the empirically "
+    f"timed **{pd.Timestamp(summary['current_bottom_anchor']).date()}** anchor. "
     f"The window is **{summary['linear_window_progress']:.1%}** complete, while the calibrated historical "
     f"evidence weight is **{summary['forming_evidence_weight']:.1%}**. The observed region is blended "
     f"with the pre-observation estimate of **{money(summary['pre_observation_bottom_forecast_usd'])}**. "
@@ -226,20 +235,22 @@ p2.metric(
 )
 p3.metric("Projected bottom growth", f"{summary['next_bottom_core_multiple']:.3f}×")
 st.caption(
-    "The dashed green line extends the mature-cycle bottom estimate. Fair value stops at today because "
-    "future peak compression has not been modeled. The definition range is not a confidence interval."
+    "The dashed green line extends only to the next mature-cycle bottom—not yet ten years. Recursive bottom "
+    "projection has not been validated, and fair value stops at today because future peak compression has not "
+    "been modeled. The definition range is not a confidence interval."
 )
 
 with st.expander("How the model works", expanded=False):
     st.markdown(
         """
 1. **Bottom regions:** each turning area is represented by a cluster of low daily closes, so one wick does not define the model.
-2. **Dynamic settling:** an internal forecast is blended with the observed forming region using an empirical settling-speed curve learned from completed bottoms.
-3. **Bottom foundation:** settled regions are joined in log-price space, creating the structural curve beneath market cycles.
-4. **Fair value:** four cycle-neutral definitions are tested on earlier completed cycles and combined using walk-forward validation weights.
-5. **Mature-cycle projection:** decaying bottom growth across the 2015→2018, 2018→2022, and forming 2022→2026 transitions produces the core next-bottom estimate.
-6. **Pre-observation prior:** several internal rules create a forecast before a forming bottom is observed. They help the 2026 estimate settle but are not presented as 2030 paths.
-7. **Scenario separation:** user-entered future prices remain scenarios and never become training evidence.
+2. **Anchor timing:** the forming 2026 anchor is derived from completed mature bottom-to-bottom intervals and tested across early and late dates.
+3. **Dynamic settling:** an internal forecast is blended with the observed forming region using an empirical settling-speed curve learned from completed bottoms.
+4. **Bottom foundation:** settled regions are joined in log-price space, creating the structural curve beneath market cycles.
+5. **Fair value:** four cycle-neutral definitions are tested on earlier completed cycles and combined using walk-forward validation weights.
+6. **Mature-cycle projection:** decaying bottom growth across the 2015→2018, 2018→2022, and forming 2022→2026 transitions produces the core next-bottom estimate.
+7. **Pre-observation prior:** several internal rules create a forecast before a forming bottom is observed. They help the 2026 estimate settle but are not presented as 2030 paths.
+8. **Scenario separation:** user-entered future prices remain scenarios and never become training evidence.
         """
     )
 
@@ -255,6 +266,60 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
         "The estimate is allowed to move while the current turning window is incomplete. It is not treated "
         "as a finished $60K bottom merely because that is the lowest region observed so far. Evidence weight "
         "describes blending influence, not the probability that the market bottom has occurred."
+    )
+
+    st.subheader("Current bottom-anchor timing")
+    t1, t2, t3, t4 = st.columns(4)
+    t1.metric(
+        "Original rough anchor",
+        str(pd.Timestamp(summary["original_rough_current_bottom_anchor"]).date()),
+    )
+    t2.metric("Learned central anchor", str(pd.Timestamp(summary["current_bottom_anchor"]).date()))
+    t3.metric(
+        "Completed-cycle range",
+        f"{pd.Timestamp(summary['current_anchor_empirical_early']).date()}–"
+        f"{pd.Timestamp(summary['current_anchor_empirical_late']).date()}",
+    )
+    t4.metric("Completed timing intervals", str(summary["current_anchor_completed_intervals"]))
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric(
+        "Empirical evidence range",
+        f"{summary['anchor_timing_empirical_evidence_low']:.1%}–"
+        f"{summary['anchor_timing_empirical_evidence_high']:.1%}",
+    )
+    a2.metric(
+        "Empirical bottom range",
+        f"{money(summary['anchor_timing_empirical_bottom_low_usd'])}–"
+        f"{money(summary['anchor_timing_empirical_bottom_high_usd'])}",
+    )
+    a3.metric(
+        "Empirical fair-value range",
+        f"{money(summary['anchor_timing_empirical_fair_low_usd'])}–"
+        f"{money(summary['anchor_timing_empirical_fair_high_usd'])}",
+    )
+    a4.metric(
+        "Empirical 2030-bottom range",
+        f"{money(summary['anchor_timing_empirical_next_bottom_low_usd'])}–"
+        f"{money(summary['anchor_timing_empirical_next_bottom_high_usd'])}",
+    )
+    anchor_view = model.anchor_timing_sensitivity.copy()
+    st.dataframe(
+        anchor_view[[
+            "timing_role", "anchor_date", "offset_from_empirical_days", "implied_cycle_days",
+            "forming_region_usd", "linear_window_progress", "forming_evidence_weight",
+            "dynamic_current_bottom_usd", "dynamic_fair_value_usd", "mature_cycle_next_bottom_usd",
+        ]].style.format({
+            "anchor_date": lambda value: str(pd.Timestamp(value).date()),
+            "forming_region_usd": "${:,.0f}", "linear_window_progress": "{:.1%}",
+            "forming_evidence_weight": "{:.1%}", "dynamic_current_bottom_usd": "${:,.0f}",
+            "dynamic_fair_value_usd": "${:,.0f}", "mature_cycle_next_bottom_usd": "${:,.0f}",
+        }),
+        use_container_width=True, hide_index=True,
+    )
+    st.caption(
+        "The completed mature intervals were 1,431 and 1,437 days, pointing to October 25. October 7 is "
+        "retained as an early stress case, with an equally distant November 12 late stress case. The narrow "
+        "October 22–28 range is empirical but rests on only two completed mature intervals."
     )
 
     st.subheader("Empirical settling-speed calibration")
@@ -482,6 +547,21 @@ with st.expander("Research Lab — calibration and evidence", expanded=True):
         "and region-statistic definitions. It is a definition-sensitivity range, not a probability interval."
     )
 
+    st.subheader("Ten-year projection readiness")
+    r1, r2 = st.columns(2)
+    r1.warning(
+        "**Bottom foundation: not yet.** The model currently supports one future bottom through 2030. "
+        "A ten-year line requires recursive mature-cycle decay and historical recursive backtesting."
+    )
+    r2.warning(
+        "**Fair value: not yet.** A future fair-value line requires a validated model for the continued "
+        "compression or stabilization of cycle-neutral fair-value multiples."
+    )
+    st.caption(
+        "Once those two pieces are tested separately, both lines can be extended on the main graph without "
+        "quietly treating an unsupported assumption as model evidence."
+    )
+
     st.subheader("Your scenario — never used as model evidence")
     u1, u2, u3, u4 = st.columns(4)
     scenario_bottom_low = u1.number_input("2030 bottom low", 1_000.0, 10_000_000.0, 100_000.0, 5_000.0)
@@ -572,7 +652,7 @@ st.caption(
 )
 
 diagnostics = {
-    "diagnostics_schema": "bitcoin-dynamic-settling-copy-block-v5",
+    "diagnostics_schema": "bitcoin-dynamic-settling-copy-block-v6",
     "deployment": {
         "model_version": price_model.MODEL_VERSION,
         "loaded_engine_source": getattr(price_model, "__file__", "UNKNOWN"),
@@ -617,6 +697,13 @@ diagnostics = {
         "forming_evidence_weight", "full_calibration_evidence_weight", "evidence_weight_change",
         "dynamic_current_bottom_usd", "current_foundation_usd", "dynamic_fair_value_usd",
         "mature_cycle_next_multiple", "mature_cycle_next_bottom_usd",
+    ]),
+    "anchor_timing_sensitivity": compact_records(model.anchor_timing_sensitivity, [
+        "anchor_date", "timing_role", "available", "offset_from_empirical_days",
+        "implied_cycle_days", "forming_region_usd", "linear_window_progress",
+        "forming_evidence_weight", "pre_observation_bottom_forecast_usd",
+        "dynamic_current_bottom_usd", "current_foundation_usd", "dynamic_fair_value_usd",
+        "mature_cycle_next_multiple", "mature_cycle_next_bottom_usd", "next_bottom_anchor",
     ]),
     "mature_cycle_forecast": compact_records(model.mature_cycle_forecast, [
         "model_id", "model", "target_date", "mature_start_cycle", "mature_transitions",

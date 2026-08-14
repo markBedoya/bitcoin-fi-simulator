@@ -10,6 +10,12 @@ Turning dates identify broad market-regime transitions, not exact extrema. The p
 
 The exact extreme and its date remain visible. Sensitivity tests repeat the calculation using half-windows of 60, 90, 120, and 180 days; clusters of 3, 7, 14, and 30 closes; and both median and geometric-mean region prices. Unavailable combinations are recorded rather than silently filled.
 
+## Current anchor timing
+
+The original October 7, 2026 date was a rough estimate based on an earlier cycle-start convention. The bottom-region model instead uses November 21, 2022 as its preceding completed anchor. The two completed mature intervals were 1,431 days from 2015 to 2018 and 1,437 days from 2018 to 2022. Their midpoint gives a 1,434-day central interval and an October 25, 2026 anchor, with October 22–28 as the directly observed mature-cycle timing range.
+
+Only two independent mature timing intervals exist, so the narrow six-day range must not be mistaken for strong statistical certainty. The application also retains October 7 as an early stress date and adds an equally distant November 12 late stress date. Every timing variant re-extracts the forming region and recomputes its window progress, evidence weight, dynamic bottom, current fair value, and next-bottom projection.
+
 ## Dynamic settling
 
 The current turning region is not assumed to be complete. Before observing it, four internal models estimate its eventual level from earlier completed bottoms. The pre-observation ensemble is blended with the forming observed region in log space:
@@ -83,6 +89,12 @@ Each method is walked forward into later cycles. Completed-cycle median error an
 
 Fair value is not projected beyond the latest observed date. A future fair-value curve would require a separately validated model of peak compression; until then, only the bottom foundation is extended to the next region.
 
+## Projection horizon
+
+The current public bottom foundation extends through one future bottom region in 2030. Extending it ten years would require recursively applying mature-cycle decay into at least the following bottom and validating that recursive procedure on historical fake-today forecasts. That work has not yet been completed.
+
+A ten-year fair-value curve requires the recursive bottom foundation plus a separate forward model for the compression or stabilization of cycle-neutral fair-value multiples. Holding today's multiple constant would be a scenario assumption, not an empirically validated result, so it is not drawn as model output.
+
 ## All-price diagnostic
 
 A cycle-balanced regression over all daily prices remains optional inside the Research Lab. It is labeled as a diagnostic rather than fair value because high bull-market prices can pull it above the cycle-neutral level. It does not change any bottom or fair-value estimate.
@@ -91,6 +103,7 @@ A cycle-balanced regression over all daily prices remains optional inside the Re
 
 - Bitcoin supplies very few independent market cycles.
 - The current bottom region remains incomplete.
+- The current anchor is based on only two completed mature timing intervals.
 - Turning dates, windows, and cluster statistics are transparent research choices rather than facts of nature.
 - Walk-forward validation has only a few held-out cycles.
 - The mature-cycle projection has only three transitions and includes a forming current endpoint.
@@ -100,4 +113,4 @@ A cycle-balanced regression over all daily prices remains optional inside the Re
 - User peak and bottom inputs are scenarios only and never become model evidence.
 - The model is `RESEARCH_ONLY` and does not provide investment advice or a guaranteed floor.
 
-The next priority is to collect later forming-cycle observations and watch whether the current estimate settles in the same way the historical fake-today tests did.
+The next projection priority is to validate recursive mature-cycle bottom forecasts before extending the public foundation beyond 2030. Future fair value remains a separate later step.

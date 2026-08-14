@@ -6,8 +6,8 @@ import numpy as np
 import pandas as pd
 
 
-MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.5.0"
-SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v5"
+MODEL_VERSION = "bottom-anchored-dynamic-settling-v0.6.0"
+SUMMARY_SCHEMA = "bitcoin-dynamic-settling-summary-v6"
 GENESIS = pd.Timestamp("2009-01-03")
 BOTTOM_WINDOW_DAYS = 120
 PEAK_WINDOW_DAYS = 90
@@ -16,13 +16,14 @@ VALIDATION_TEMPERATURE = 0.35
 REFERENCE_DAYS_BEFORE_TURN = 56
 SETTLING_GRID = tuple(np.round(np.arange(0.05, 1.001, 0.05), 2))
 SETTLING_LINEAR_PRIOR_CYCLES = 2.0
+ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR = pd.Timestamp("2026-10-07")
 
 BOTTOM_TURNING_REGIONS = [
     {"anchor_date": pd.Timestamp("2011-11-18"), "label": "2011 bottom region"},
     {"anchor_date": pd.Timestamp("2015-01-14"), "label": "2015 bottom region"},
     {"anchor_date": pd.Timestamp("2018-12-15"), "label": "2018 bottom region"},
     {"anchor_date": pd.Timestamp("2022-11-21"), "label": "2022 bottom region"},
-    {"anchor_date": pd.Timestamp("2026-10-07"), "label": "2026 forming bottom region"},
+    {"anchor_date": pd.Timestamp("2026-10-25"), "label": "2026 forming bottom region"},
 ]
 
 PEAK_TURNING_REGIONS = [
@@ -65,6 +66,7 @@ class BottomAnchoredModelResult:
     settling_calibration_detail: pd.DataFrame
     settling_leave_one_out: pd.DataFrame
     settling_cycle_dependence: pd.DataFrame
+    anchor_timing_sensitivity: pd.DataFrame
     dynamic_settling: pd.DataFrame
     dynamic_settling_summary: pd.DataFrame
     all_price_curve: pd.DataFrame
@@ -863,6 +865,77 @@ def _bottom_sensitivity(
     return pd.DataFrame(rows)
 
 
+def _anchor_timing_sensitivity(
+    data: pd.DataFrame,
+    completed_bottoms: pd.DataFrame,
+    prior_validation: pd.DataFrame,
+    settling_calibration: pd.DataFrame,
+    fair_multiplier: float,
+    empirical_anchor: pd.Timestamp,
+    empirical_early: pd.Timestamp,
+    empirical_late: pd.Timestamp,
+    expected_cycle_days: int,
+) -> pd.DataFrame:
+    """Recompute the forming cycle across empirical and conservative anchor dates."""
+    latest = pd.Timestamp(data["date"].max())
+    stress_days = abs((empirical_anchor - ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR).days)
+    late_stress = empirical_anchor + pd.Timedelta(days=stress_days)
+    variants = [
+        (ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR, "original rough date / early stress"),
+        (empirical_early, "completed-cycle early"),
+        (empirical_anchor, "completed-cycle central"),
+        (empirical_late, "completed-cycle late"),
+        (late_stress, "symmetric late stress"),
+    ]
+    rows: list[dict] = []
+    previous = completed_bottoms.sort_values("cycle").iloc[-1]
+    current_cycle = int(completed_bottoms["cycle"].max()) + 1
+    for anchor, role in variants:
+        current = _extract_regions(
+            data,
+            [{"anchor_date": pd.Timestamp(anchor), "label": "2026 forming bottom region"}],
+            BOTTOM_WINDOW_DAYS,
+            "bottom",
+        )
+        if current.empty:
+            rows.append({"anchor_date": pd.Timestamp(anchor), "timing_role": role, "available": False})
+            continue
+        current.loc[current.index[0], "cycle"] = current_cycle
+        target = current.iloc[0]
+        dynamic = _dynamic_bottom_estimate(
+            completed_bottoms, target, latest, prior_validation,
+            settling_calibration=settling_calibration,
+        )
+        adjusted = pd.concat([completed_bottoms, current], ignore_index=True)
+        adjusted.loc[adjusted.index[-1], "cycle"] = current_cycle
+        adjusted.loc[adjusted.index[-1], "region_price_usd"] = dynamic["dynamic_bottom_usd"]
+        adjusted.loc[adjusted.index[-1], "region_date"] = pd.Timestamp(anchor)
+        adjusted = _add_bottom_growth(adjusted)
+        mature_variant = _mature_cycle_decay(adjusted)
+        current_foundation = _foundation_at(
+            latest, previous["region_date"], previous["region_price_usd"],
+            anchor, dynamic["dynamic_bottom_usd"],
+        )
+        rows.append({
+            "anchor_date": pd.Timestamp(anchor),
+            "timing_role": role,
+            "available": True,
+            "offset_from_empirical_days": int((pd.Timestamp(anchor) - empirical_anchor).days),
+            "implied_cycle_days": int((pd.Timestamp(anchor) - pd.Timestamp(previous["anchor_date"])).days),
+            "forming_region_usd": float(target["region_price_usd"]),
+            "linear_window_progress": dynamic["linear_window_progress"],
+            "forming_evidence_weight": dynamic["forming_evidence_weight"],
+            "pre_observation_bottom_forecast_usd": dynamic["forecast_bottom_usd"],
+            "dynamic_current_bottom_usd": dynamic["dynamic_bottom_usd"],
+            "current_foundation_usd": current_foundation,
+            "dynamic_fair_value_usd": current_foundation * fair_multiplier,
+            "mature_cycle_next_multiple": mature_variant.get("next_growth_multiple", np.nan),
+            "mature_cycle_next_bottom_usd": mature_variant.get("predicted_bottom_usd", np.nan),
+            "next_bottom_anchor": pd.Timestamp(anchor) + pd.Timedelta(days=expected_cycle_days),
+        })
+    return pd.DataFrame(rows).sort_values("anchor_date").reset_index(drop=True)
+
+
 def _cycle_balanced_all_price_backbone(data: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     complete_cycles = [
         (pd.Timestamp("2011-02-14"), pd.Timestamp("2015-01-14")),
@@ -909,10 +982,22 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     if len(observed_bottoms) < 5 or len(peaks) < 4:
         raise ValueError("The complete bottom/peak research catalog is not observable yet.")
 
-    mature_anchor_dates = [pd.Timestamp(item["anchor_date"]) for item in BOTTOM_TURNING_REGIONS[1:]]
-    mature_cycle_days = np.diff(pd.DatetimeIndex(mature_anchor_dates).asi8) / (24 * 60 * 60 * 1e9)
+    completed_mature_anchor_dates = [
+        pd.Timestamp(item["anchor_date"]) for item in BOTTOM_TURNING_REGIONS[1:-1]
+    ]
+    mature_cycle_days = (
+        np.diff(pd.DatetimeIndex(completed_mature_anchor_dates).asi8) / (24 * 60 * 60 * 1e9)
+    )
     expected_cycle_days = int(round(float(np.median(mature_cycle_days))))
-    current_anchor = pd.Timestamp(BOTTOM_TURNING_REGIONS[-1]["anchor_date"])
+    current_anchor = completed_mature_anchor_dates[-1] + pd.Timedelta(days=expected_cycle_days)
+    empirical_anchor_early = completed_mature_anchor_dates[-1] + pd.Timedelta(
+        days=int(np.min(mature_cycle_days))
+    )
+    empirical_anchor_late = completed_mature_anchor_dates[-1] + pd.Timedelta(
+        days=int(np.max(mature_cycle_days))
+    )
+    if current_anchor != pd.Timestamp(BOTTOM_TURNING_REGIONS[-1]["anchor_date"]):
+        raise ValueError("The current bottom anchor specification does not match mature-cycle timing.")
     next_bottom_anchor = current_anchor + pd.Timedelta(days=expected_cycle_days)
     mature_bull_days = [
         (pd.Timestamp(PEAK_TURNING_REGIONS[index]["anchor_date"]) - pd.Timestamp(BOTTOM_TURNING_REGIONS[index]["anchor_date"])).days
@@ -979,6 +1064,17 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
     settling_next_bottoms = settling_cycle_dependence["mature_cycle_next_bottom_usd"].dropna()
     if settling_next_bottoms.empty:
         raise ValueError("Leave-one-cycle-out next-bottom propagation is not observable yet.")
+
+    anchor_timing_sensitivity = _anchor_timing_sensitivity(
+        data, completed_bottoms, prior_validation, settling_calibration, fair_multiplier,
+        current_anchor, empirical_anchor_early, empirical_anchor_late, expected_cycle_days,
+    )
+    available_anchor_timing = anchor_timing_sensitivity[anchor_timing_sensitivity["available"]].copy()
+    empirical_anchor_timing = available_anchor_timing[
+        available_anchor_timing["timing_role"].str.startswith("completed-cycle")
+    ].copy()
+    if len(empirical_anchor_timing) != 3:
+        raise ValueError("The empirical anchor-timing sensitivity range is not observable yet.")
 
     sensitivity = _bottom_sensitivity(data, fair_multiplier, settling_calibration)
     available_sensitivity = sensitivity[sensitivity["available"]].copy()
@@ -1077,6 +1173,30 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "fair_value_multiple": fair_multiplier,
         "fair_value_method_leader": selected_method,
         "fair_value_completed_holdouts": int(fair_methods["completed_holdouts"].max()),
+        "current_bottom_anchor": current_anchor,
+        "current_bottom_anchor_method": "previous completed bottom plus the median of completed mature-cycle lengths",
+        "original_rough_current_bottom_anchor": ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR,
+        "current_anchor_shift_from_rough_days": int((current_anchor - ORIGINAL_ROUGH_CURRENT_BOTTOM_ANCHOR).days),
+        "current_anchor_empirical_early": empirical_anchor_early,
+        "current_anchor_empirical_late": empirical_anchor_late,
+        "current_anchor_completed_intervals": int(len(mature_cycle_days)),
+        "mature_cycle_days_low": int(np.min(mature_cycle_days)),
+        "mature_cycle_days_central": expected_cycle_days,
+        "mature_cycle_days_high": int(np.max(mature_cycle_days)),
+        "anchor_timing_empirical_evidence_low": float(empirical_anchor_timing["forming_evidence_weight"].min()),
+        "anchor_timing_empirical_evidence_high": float(empirical_anchor_timing["forming_evidence_weight"].max()),
+        "anchor_timing_empirical_bottom_low_usd": float(empirical_anchor_timing["dynamic_current_bottom_usd"].min()),
+        "anchor_timing_empirical_bottom_high_usd": float(empirical_anchor_timing["dynamic_current_bottom_usd"].max()),
+        "anchor_timing_empirical_fair_low_usd": float(empirical_anchor_timing["dynamic_fair_value_usd"].min()),
+        "anchor_timing_empirical_fair_high_usd": float(empirical_anchor_timing["dynamic_fair_value_usd"].max()),
+        "anchor_timing_empirical_next_bottom_low_usd": float(empirical_anchor_timing["mature_cycle_next_bottom_usd"].min()),
+        "anchor_timing_empirical_next_bottom_high_usd": float(empirical_anchor_timing["mature_cycle_next_bottom_usd"].max()),
+        "anchor_timing_stress_bottom_low_usd": float(available_anchor_timing["dynamic_current_bottom_usd"].min()),
+        "anchor_timing_stress_bottom_high_usd": float(available_anchor_timing["dynamic_current_bottom_usd"].max()),
+        "anchor_timing_stress_fair_low_usd": float(available_anchor_timing["dynamic_fair_value_usd"].min()),
+        "anchor_timing_stress_fair_high_usd": float(available_anchor_timing["dynamic_fair_value_usd"].max()),
+        "anchor_timing_stress_next_bottom_low_usd": float(available_anchor_timing["mature_cycle_next_bottom_usd"].min()),
+        "anchor_timing_stress_next_bottom_high_usd": float(available_anchor_timing["mature_cycle_next_bottom_usd"].max()),
         "all_price_backbone_usd": all_price_summary["latest_backbone_usd"],
         "all_price_backbone_exponent": all_price_summary["exponent"],
         "all_price_open_cycle_weight": all_price_summary["open_cycle_evidence_weight"],
@@ -1102,7 +1222,8 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         "core_forecast_method": "mature-cycle excess-growth decay beginning with the 2015 bottom; 10th–90th percentile definition range",
         "dynamic_settling_method": "pre-observation internal forecast blended with forming bottom evidence using an empirical historical settling curve",
         "fair_value_method": "validation-weighted ensemble of four internally derived cycle-neutral definitions",
-        "future_fair_value_status": "deferred until peak-compression behavior is modeled",
+        "bottom_projection_horizon_status": "one future bottom region through 2030; recursive 10-year projection not yet validated",
+        "future_fair_value_status": "stops at today; a 10-year fair-value path requires a validated peak-compression model",
     }
     return BottomAnchoredModelResult(
         summary=summary,
@@ -1121,6 +1242,7 @@ def fit_bottom_anchored_model(prices: pd.DataFrame) -> BottomAnchoredModelResult
         settling_calibration_detail=settling_calibration_detail,
         settling_leave_one_out=settling_leave_one_out,
         settling_cycle_dependence=settling_cycle_dependence,
+        anchor_timing_sensitivity=anchor_timing_sensitivity,
         dynamic_settling=dynamic_paths,
         dynamic_settling_summary=dynamic_summary,
         all_price_curve=all_price_curve,

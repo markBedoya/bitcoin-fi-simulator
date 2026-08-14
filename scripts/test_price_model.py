@@ -38,6 +38,9 @@ def main() -> None:
     assert result.summary["settling_calibration_cycles"] == 4
     assert result.summary["next_bottom_core_usd"] > 0
     assert result.summary["next_bottom_core_multiple"] > 1
+    assert pd.Timestamp(result.summary["current_bottom_anchor"]) == pd.Timestamp("2026-10-25")
+    assert result.summary["current_anchor_shift_from_rough_days"] == 18
+    assert result.summary["expected_cycle_days"] == 1434
     assert result.summary["mature_observed_growth_path"].count("→") == 2
     assert result.summary["next_bottom_core_low_usd"] <= result.summary["next_bottom_core_usd"]
     assert result.summary["next_bottom_core_high_usd"] >= result.summary["next_bottom_core_usd"]
@@ -78,6 +81,21 @@ def main() -> None:
         "dynamic_fair_value_cycle_high_usd"
     ]
     assert result.summary["next_bottom_cycle_low_usd"] <= result.summary["next_bottom_cycle_high_usd"]
+    assert not result.anchor_timing_sensitivity.empty
+    assert len(result.anchor_timing_sensitivity) == 5
+    assert result.anchor_timing_sensitivity["available"].all()
+    assert result.anchor_timing_sensitivity["timing_role"].str.startswith("completed-cycle").sum() == 3
+    central_timing = result.anchor_timing_sensitivity[
+        result.anchor_timing_sensitivity["timing_role"] == "completed-cycle central"
+    ].iloc[0]
+    assert np.isclose(
+        central_timing["dynamic_current_bottom_usd"],
+        result.summary["dynamic_settled_bottom_estimate_usd"],
+    )
+    assert result.summary["anchor_timing_empirical_bottom_low_usd"] <= result.summary[
+        "anchor_timing_empirical_bottom_high_usd"
+    ]
+    assert "not yet validated" in result.summary["bottom_projection_horizon_status"]
     assert result.bottom_sensitivity["available"].any()
     assert result.bottom_sensitivity.loc[
         result.bottom_sensitivity["available"], "mature_cycle_next_bottom_usd"
